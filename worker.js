@@ -390,18 +390,33 @@ function blurPlane(src, w, h, sigma) {
 }
 
 /* Spectral dispersion: wavelength bands, per-channel sensitivity weights, Cauchy-like index curve */
-function spectralBands(N, balance) {
-  const lam = [], e = [], wt = [[], [], []], ebar = [0, 0, 0];
+/*
+ * Spectral dispersion.
+ *  achromat: secondary spectrum of a corrected doublet — magnification vs wavelength is parabolic,
+ *            red and blue land together and green separates -> green/magenta fringes (most real lenses).
+ *  singlet:  uncorrected lens, monotonic Cauchy dispersion -> blue/yellow or red/cyan fringes.
+ *  prism:    monotonic dispersion seen through narrow filters -> visible rainbow.
+ * achromat and singlet are integrated with broad, overlapping Bayer-filter sensitivities.
+ */
+function spectralBands(N, balance, type) {
+  type = type || 'achromat';
+  const e = [], wt = [[], [], []], ebar = [0, 0, 0];
   const g = (l, c, s) => Math.exp(-0.5 * ((l - c) / s) * ((l - c) / s));
   const inv = (l) => 1 / (l * l);
   const l0 = balance || 550, norm = inv(400) - inv(550);
   for (let b = 0; b < N; b++) {
     const l = 400 + 300 * (b + 0.5) / N;
-    lam.push(l);
-    e.push((inv(l) - inv(l0)) / norm);
-    wt[0].push(g(l, 600, 45) + 0.12 * g(l, 445, 20));
-    wt[1].push(g(l, 545, 40));
-    wt[2].push(g(l, 450, 28));
+    if (type === 'achromat') { const t = (l - l0) / 150; e.push(t * t - 1 / 3); }
+    else e.push((inv(l) - inv(l0)) / norm);
+    if (type === 'prism') {
+      wt[0].push(g(l, 600, 45) + 0.12 * g(l, 445, 20));
+      wt[1].push(g(l, 545, 40));
+      wt[2].push(g(l, 450, 28));
+    } else {
+      wt[0].push(g(l, 605, 48) + 0.06 * g(l, 440, 25) + 0.08 * g(l, 530, 40));
+      wt[1].push(g(l, 538, 50) + 0.06 * g(l, 610, 40));
+      wt[2].push(g(l, 462, 38) + 0.08 * g(l, 520, 35));
+    }
   }
   for (let c = 0; c < 3; c++) {
     // drop bands that contribute < 4% of the channel's peak (speed), then normalise
@@ -411,6 +426,67 @@ function spectralBands(N, balance) {
     for (let b = 0; b < N; b++) { wt[c][b] /= s; ebar[c] += wt[c][b] * e[b]; }
   }
   return { e, wt, ebar };
+}
+
+/* Bayer re-mosaic + demosaic (Malvar-He-Cutler or bilinear) on float planes */
+function bayerRoundtrip(P, w, h, pattern, method) {
+  const pat = (pattern || 'RGGB').toUpperCase(), idx = { R: 0, G: 1, B: 2 };
+  const cfa = [idx[pat[0]], idx[pat[1]], idx[pat[2]], idx[pat[3]]];
+  const col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
+  const N = w * h, M = new Float32Array(N);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) M[y * w + x] = P[col(x, y)][y * w + x];
+  // mirror-reflect so the CFA phase is preserved at the borders
+  const rx = (x) => (x < 0 ? -x : x >= w ? 2 * w - 2 - x : x), ry = (y) => (y < 0 ? -y : y >= h ? 2 * h - 2 - y : y);
+  const m = (x, y) => M[ry(y) * w + rx(x)];
+  const mhc = method !== 'bilinear';
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const c = col(x, y), C = m(x, y), p = y * w + x;
+      const out = [0, 0, 0];
+      out[c] = C;
+      if (c !== 1) {
+        const o = 2 - c; // the other of R/B
+        if (mhc) {
+          out[1] = (4 * C + 2 * (m(x - 1, y) + m(x + 1, y) + m(x, y - 1) + m(x, y + 1)) -
+                    (m(x - 2, y) + m(x + 2, y) + m(x, y - 2) + m(x, y + 2))) / 8;
+          out[o] = (6 * C + 2 * (m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1)) -
+                    1.5 * (m(x - 2, y) + m(x + 2, y) + m(x, y - 2) + m(x, y + 2))) / 8;
+        } else {
+          out[1] = (m(x - 1, y) + m(x + 1, y) + m(x, y - 1) + m(x, y + 1)) / 4;
+          out[o] = (m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1)) / 4;
+        }
+      } else {
+        const hc = col(x + 1, y), vc = col(x, y + 1); // colour found horizontally / vertically
+        if (mhc) {
+          const diag = m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1);
+          out[hc] = (5 * C + 4 * (m(x - 1, y) + m(x + 1, y)) - (m(x - 2, y) + m(x + 2, y)) - diag +
+                     0.5 * (m(x, y - 2) + m(x, y + 2))) / 8;
+          out[vc] = (5 * C + 4 * (m(x, y - 1) + m(x, y + 1)) - (m(x, y - 2) + m(x, y + 2)) - diag +
+                     0.5 * (m(x - 2, y) + m(x + 2, y))) / 8;
+        } else {
+          out[hc] = (m(x - 1, y) + m(x + 1, y)) / 2;
+          out[vc] = (m(x, y - 1) + m(x, y + 1)) / 2;
+        }
+      }
+      P[0][p] = out[0] < 0 ? 0 : out[0]; P[1][p] = out[1] < 0 ? 0 : out[1]; P[2][p] = out[2] < 0 ? 0 : out[2];
+    }
+  }
+}
+
+/* 16-bit LUT linear(0..1) -> sRGB(0..255) */
+let ENC_LUT = null;
+function encLut() {
+  if (ENC_LUT) return ENC_LUT;
+  ENC_LUT = new Float32Array(65537);
+  for (let i = 0; i <= 65536; i++) ENC_LUT[i] = enc(i / 65536) * 255;
+  return ENC_LUT;
+}
+function encPx(v) { // v: linear 0..255 scale
+  let t = v * (65536 / 255);
+  if (!(t > 0)) return 0;
+  if (t >= 65536) return 255;
+  const i = t | 0, f = t - i, L = ENC_LUT;
+  return L[i] + (L[i + 1] - L[i]) * f;
 }
 
 function hsvRgb(hDeg, s, v) {
@@ -444,13 +520,24 @@ function resample(data, w, h, L, A, id) {
   const ecOn = !!EC.on && (+EC.count || 0) >= 1 && (+EC.decay || 0) > 0;
   const clOn = !!CL.on && ['cbx', 'cby', 'crx', 'cry', 'bleed', 'soft'].some(k => (+CL[k] || 0) !== 0);
   const pfOn = !!PF.on && (+PF.amount || 0) > 0;
-  const postOn = axOn || smOn || ecOn || clOn || pfOn;
+  const byOn = !!(A.bayer && A.bayer.on);
+  const postOn = axOn || smOn || ecOn || clOn || pfOn || byOn;
 
   const lensOn = k1 !== 0 || k2 !== 0;
   const caOn = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || postOn;
   let z = userZoom;
   if (lensOn && L.autofill) z *= autoZoom(w, h, cx, cy, k1, k2);
   if (!lensOn && !caOn && z === 1) return data.slice();
+  // mix in linear light when any CA effect is active (how fringes form optically and on the sensor)
+  const linOn = caOn && A.linear !== false;
+  let src = data;
+  if (linOn) {
+    encLut();
+    src = new Float32Array(data.length);
+    for (let i = 0; i < data.length; i += 4) {
+      src[i] = LIN[data[i]] * 255; src[i + 1] = LIN[data[i + 1]] * 255; src[i + 2] = LIN[data[i + 2]] * 255;
+    }
+  }
 
   const sample = L.interp === 'bilinear' ? bil : bic;
   const R = Math.sqrt(w * w + h * h) / 2, invR = 1 / R, iz = 1 / z;
@@ -490,7 +577,7 @@ function resample(data, w, h, L, A, id) {
 
   // spectral bands
   let SB = null, NB = 0;
-  if (D !== 0) { NB = Math.max(3, Math.min(32, Math.round(+DS.bands || 12))); SB = spectralBands(NB, +DS.balance || 550); }
+  if (D !== 0) { NB = Math.max(3, Math.min(32, Math.round(+DS.bands || 12))); SB = spectralBands(NB, +DS.balance || 550, DS.lens || 'achromat'); }
 
   // irregular displacement field on a coarse grid
   let IG = null, ist = 1, igw = 0;
@@ -549,7 +636,7 @@ function resample(data, w, h, L, A, id) {
         if (irrOn) { bx -= IRX[c]; by -= IRY[c]; }
         if (D === 0) {
           const d = scl[c] * gg * R;
-          V[c] = sample(data, w, h, bx - ux * d, by - uy * d, c);
+          V[c] = sample(src, w, h, bx - ux * d, by - uy * d, c);
         } else {
           const wt = SB.wt[c], e = SB.e;
           let acc = 0;
@@ -557,13 +644,14 @@ function resample(data, w, h, L, A, id) {
             const wb = wt[b];
             if (wb === 0) continue;
             const d = (scl[c] + D * e[b]) * gg * R;
-            acc += wb * bil(data, w, h, bx - ux * d, by - uy * d, c);
+            acc += wb * bil(src, w, h, bx - ux * d, by - uy * d, c);
           }
           V[c] = acc;
         }
       }
       const p = y * w + x;
       if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; }
+      else if (linOn) { const o = p * 4; out[o] = encPx(V[0]); out[o + 1] = encPx(V[1]); out[o + 2] = encPx(V[2]); out[o + 3] = 255; }
       else { const o = p * 4; out[o] = V[0]; out[o + 1] = V[1]; out[o + 2] = V[2]; out[o + 3] = 255; }
     }
     if (id != null && (y & 31) === 0) { const t = performance.now(); if (t - last > 100) { last = t; progress(id, 'Lens / CA', 0.3 + 0.4 * y / h); } }
@@ -643,6 +731,16 @@ function resample(data, w, h, L, A, id) {
       }
     }
   }
+
+  // ---- sensor: Bayer re-mosaic + demosaic (on linear data, like a raw pipeline) ----
+  if (byOn) {
+    if (id != null) progress(id, 'Bayer demosaic', 0.88);
+    const aa = +A.bayer.aa || 0;
+    if (aa > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, aa); // optical low-pass (AA) filter
+    bayerRoundtrip(P, w, h, A.bayer.pattern, A.bayer.method);
+  }
+  // back to gamma-encoded values for the display-space effects below
+  if (linOn) for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
 
   // ---- chroma vs luma shift (YCbCr, BT.709) ----
   if (clOn) {
@@ -1336,4 +1434,4 @@ function depattern(d, w, h, Q, id) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { blurPlane, spectralBands, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
+if (typeof module !== 'undefined') module.exports = { blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };

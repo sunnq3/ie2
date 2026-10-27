@@ -13,15 +13,17 @@ const DEFAULTS = {
   carve: { dw: 0, dh: 0, energy: 'forward' },
   lens: { k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'bicubic' },
   ca: {
+    linear: true,
     rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0, gs: 0, bs: 0,
     fall: { curve: 'power', exp: 1, start: 0, width: 30, aspect: 0, shifts: false },
-    disp: { on: false, amount: 0.3, bands: 10, balance: 550 },
+    disp: { on: false, lens: 'achromat', amount: 0.3, bands: 10, balance: 550 },
     irr: { on: false, amount: 0.5, scale: 80, detail: 2, lockg: true, fall: false, seed: 1 },
     axial: { on: false, r: 0, g: 0, b: 0.6, edge: 0 },
     smear: { on: false, dir: 'radial', angle: 0, r: 0.8, g: 0, b: -0.8, mode: 'trail', follow: true },
     echo: { on: false, count: 2, decay: 0.45, spacing: 1 },
     cl: { on: false, cbx: 0.6, cby: 0, crx: -0.6, cry: 0, bleed: 0, soft: 0 },
     pf: { on: false, amount: 50, thr: 215, width: 2, bias: 0.6, hue: 285, edge: 40 },
+    bayer: { on: false, pattern: 'RGGB', method: 'mhc', aa: 0.4 },
   },
   color: {
     iterations: 1,
@@ -74,6 +76,7 @@ const SCHEMA = [
     note: 'Lateral shift/scale per channel, shaped by the radial falloff curve. Each effect below has its own switch; they all run in the same resample as the lens warp.',
     controls: [
       { type: 'head', label: 'Lateral' },
+      { k: 'ca.linear', label: 'Mix in linear light (camera-like)', type: 'check' },
       { k: 'ca.rx', label: 'Red X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
       { k: 'ca.ry', label: 'Red Y', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
       { k: 'ca.gx', label: 'Green X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
@@ -92,7 +95,8 @@ const SCHEMA = [
       { k: 'ca.fall.aspect', label: 'Aspect', type: 'range', min: -60, max: 60, step: 0.1, unit: '%' },
       { k: 'ca.fall.shifts', label: 'Falloff also scales X/Y shifts', type: 'check' },
 
-      { k: 'ca.disp.on', label: 'Spectral dispersion (rainbow fringes)', type: 'check', group: 'start' },
+      { k: 'ca.disp.on', label: 'Spectral dispersion', type: 'check', group: 'start' },
+      { k: 'ca.disp.lens', label: 'Lens', type: 'select', sub: true, options: [['achromat', 'Achromat (green/magenta)'], ['singlet', 'Simple lens (blue/yellow)'], ['prism', 'Prism (rainbow)']] },
       { k: 'ca.disp.amount', label: 'Amount', type: 'range', min: -2, max: 2, step: 0.001, unit: '%', sub: true },
       { k: 'ca.disp.bands', label: 'Bands', type: 'range', min: 3, max: 32, step: 1, sub: true },
       { k: 'ca.disp.balance', label: 'Neutral λ', type: 'range', min: 430, max: 680, step: 1, unit: 'nm', sub: true },
@@ -140,6 +144,11 @@ const SCHEMA = [
       { k: 'ca.pf.bias', label: 'Outward', type: 'range', min: -6, max: 6, step: 0.01, unit: 'px', sub: true },
       { k: 'ca.pf.hue', label: 'Hue', type: 'range', min: 0, max: 360, step: 0.5, unit: '°', sub: true },
       { k: 'ca.pf.edge', label: 'Edge weight', type: 'range', min: 0, max: 100, step: 0.1, unit: '%', sub: true },
+
+      { k: 'ca.bayer.on', label: 'Sensor: Bayer mosaic → demosaic', type: 'check', group: 'start' },
+      { k: 'ca.bayer.aa', label: 'AA filter', type: 'range', min: 0, max: 1.5, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.bayer.pattern', label: 'Pattern', type: 'select', sub: true, options: [['RGGB', 'RGGB'], ['BGGR', 'BGGR'], ['GRBG', 'GRBG'], ['GBRG', 'GBRG']] },
+      { k: 'ca.bayer.method', label: 'Demosaic', type: 'select', sub: true, options: [['mhc', 'Malvar-He-Cutler (in-camera)'], ['bilinear', 'Bilinear (soft, more zipper)']] },
     ],
   },
   {
