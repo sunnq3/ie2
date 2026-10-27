@@ -23,7 +23,6 @@ const DEFAULTS = {
     echo: { on: false, count: 2, decay: 0.45, spacing: 1 },
     cl: { on: false, cbx: 0.6, cby: 0, crx: -0.6, cry: 0, bleed: 0, soft: 0 },
     pf: { on: false, amount: 50, thr: 215, width: 2, bias: 0.6, hue: 285, edge: 40 },
-    bayer: { on: false, pattern: 'RGGB', method: 'mhc', aa: 0.4 },
   },
   color: {
     iterations: 1,
@@ -37,7 +36,8 @@ const DEFAULTS = {
   scale: { up: 1, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   noise: { amount: 0, type: 'gaussian', density: 100, chroma: 0, grain: 1, irregular: 0, irrScale: 32, seed: 1, scope: 'all' },
   brush: { size: 24, hard: 50, opacity: 100, mode: 'add', display: 'outline' },
-  out: { quality: 92, name: '' },
+  sensor: { on: false, shot: 0.05, read: 0.02, rgain: 30, bgain: 50, chromaNR: 60, aa: 0.3, demosaic: 'mhc', pattern: 'RGGB', seed: 1, useMask: false },
+  out: { quality: 92, sub: '444', hf: 30, dither: 60, name: '' },
 };
 const NOPROCESS = ['out.', 'brush.'];
 
@@ -144,11 +144,6 @@ const SCHEMA = [
       { k: 'ca.pf.bias', label: 'Outward', type: 'range', min: -6, max: 6, step: 0.01, unit: 'px', sub: true },
       { k: 'ca.pf.hue', label: 'Hue', type: 'range', min: 0, max: 360, step: 0.5, unit: '°', sub: true },
       { k: 'ca.pf.edge', label: 'Edge weight', type: 'range', min: 0, max: 100, step: 0.1, unit: '%', sub: true },
-
-      { k: 'ca.bayer.on', label: 'Sensor: Bayer mosaic → demosaic', type: 'check', group: 'start' },
-      { k: 'ca.bayer.aa', label: 'AA filter', type: 'range', min: 0, max: 1.5, step: 0.01, unit: 'px', sub: true },
-      { k: 'ca.bayer.pattern', label: 'Pattern', type: 'select', sub: true, options: [['RGGB', 'RGGB'], ['BGGR', 'BGGR'], ['GRBG', 'GRBG'], ['GBRG', 'GBRG']] },
-      { k: 'ca.bayer.method', label: 'Demosaic', type: 'select', sub: true, options: [['mhc', 'Malvar-He-Cutler (in-camera)'], ['bilinear', 'Bilinear (soft, more zipper)']] },
     ],
   },
   {
@@ -218,9 +213,30 @@ const SCHEMA = [
     ],
   },
   {
+    id: 'sensor', title: '7 · Sensor grain (raw camera look)',
+    note: 'Runs last. Rebuilds the image like a camera: linear light → AA filter → Bayer colour filter → photon (shot) + read noise per photosite → demosaic → in-camera chroma noise reduction. The grain comes out correlated over ~2 px like real camera noise, which survives JPEG far better than 1-px noise.',
+    controls: [
+      { k: 'sensor.on', label: 'Simulate camera sensor', type: 'check' },
+      { k: 'sensor.shot', label: 'Shot noise', type: 'range', min: 0, max: 0.5, step: 0.001, sub: true },
+      { k: 'sensor.read', label: 'Read noise', type: 'range', min: 0, max: 0.3, step: 0.001, sub: true },
+      { k: 'sensor.rgain', label: 'Red sites +', type: 'range', min: 0, max: 150, step: 1, unit: '%', sub: true },
+      { k: 'sensor.bgain', label: 'Blue sites +', type: 'range', min: 0, max: 150, step: 1, unit: '%', sub: true },
+      { k: 'sensor.chromaNR', label: 'Chroma NR', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
+      { k: 'sensor.aa', label: 'AA filter', type: 'range', min: 0, max: 1.5, step: 0.01, unit: 'px', sub: true },
+      { k: 'sensor.demosaic', label: 'Demosaic', type: 'select', sub: true, options: [['mhc', 'Malvar-He-Cutler (in-camera)'], ['bilinear', 'Bilinear (softer)'], ['none', 'None (1-px noise, no CFA)']] },
+      { k: 'sensor.pattern', label: 'Pattern', type: 'select', sub: true, options: [['RGGB', 'RGGB'], ['BGGR', 'BGGR'], ['GRBG', 'GRBG'], ['GBRG', 'GBRG']] },
+      { k: 'sensor.seed', label: 'Seed', type: 'range', min: 1, max: 9999, step: 1, extra: 'seed', sub: true },
+      { k: 'sensor.useMask', label: 'Only where the noise mask allows (section 6)', type: 'check', sub: true },
+    ],
+  },
+  {
     id: 'out', title: 'Export',
+    note: 'Built-in JPEG encoder. 4:4:4 keeps full colour (browsers use 4:2:0). "Grain keep" lowers high-frequency quantisation; "Dithered rounding" lets small detail survive instead of rounding to zero. Check the JPEG view to see exactly what the file will look like.',
     controls: [
       { k: 'out.quality', label: 'JPEG quality', type: 'range', min: 1, max: 100, step: 0.5, unit: '%' },
+      { k: 'out.sub', label: 'Chroma', type: 'select', options: [['444', '4:4:4 (full colour)'], ['422', '4:2:2'], ['420', '4:2:0 (browser default)']] },
+      { k: 'out.hf', label: 'Grain keep', type: 'range', min: 0, max: 90, step: 1, unit: '%' },
+      { k: 'out.dither', label: 'Dithered round', type: 'range', min: 0, max: 100, step: 1, unit: '%' },
       { k: 'out.name', label: 'Filename', type: 'text', placeholder: 'auto' },
     ],
   },
@@ -396,6 +412,7 @@ function update(k, v) {
   saveParams();
   if (k === 'noise.irregular' || k === 'ca.fall.curve' || k === 'ca.smear.dir') syncSubs();
   if (k === 'brush.display') requestOverlay(true);
+  if (k.startsWith('out.') && k !== 'out.name' && viewMode === 'jpeg') { clearTimeout(pvTimer); pvTimer = setTimeout(render, 200); }
   if (!NOPROCESS.some(p => k.startsWith(p))) schedule();
 }
 
@@ -454,6 +471,7 @@ function onWorkerMessage(e) {
     workerCarveKey = m.carveKey;
     if (m.mask) mask = new Uint8Array(m.mask);
     result = new ImageData(new Uint8ClampedArray(m.buffer), m.w, m.h);
+    resultVer++;
     inflight = null; hideBar();
     render();
     updateMeta(m.ms);
@@ -500,6 +518,10 @@ function render() {
   const mode = holding ? 'original' : (paintMode ? 'result' : viewMode);
   if (mode === 'original') img = orig;
   else if (mode === 'diff') { img = diffImage(); if (!img) note = 'Diff needs equal dimensions — seam carving changed the size. Showing result.'; }
+  else if (mode === 'jpeg' && result) {
+    if (jpegPreview && jpegPreview.key === encKey() && jpegPreview.img) { img = jpegPreview.img; note = 'JPEG view: decoded export file'; }
+    else { note = 'Encoding JPEG preview…'; refreshJpegPreview(); }
+  }
   else if (mode === 'seams') { img = seamImage(); if (!mask || !mask.some(v => v)) note = 'No seams yet — set a width/height Δ.'; }
   if (!img) img = result || orig;
   if (view.width !== img.width || view.height !== img.height) { view.width = img.width; view.height = img.height; }
@@ -759,22 +781,101 @@ async function loadFile(file) {
 
 /* ---------------- export ---------------- */
 
-function exportJpg() {
+let encWorker = null, encSeq = 0, encCache = null, encPending = null, jpegPreview = null, pvTimer = 0, resultVer = 0;
+const encWaiters = new Map();
+function getEncWorker() {
+  if (!encWorker) {
+    encWorker = new Worker('worker.js');
+    encWorker.onmessage = (e) => {
+      const m = e.data, r = encWaiters.get(m.id);
+      if (!r) return;
+      encWaiters.delete(m.id);
+      if (m.type === 'encoded') r.res(new Uint8Array(m.buffer)); else r.rej(new Error(m.message || 'encode failed'));
+    };
+  }
+  return encWorker;
+}
+function encOpts() { return { quality: +params.out.quality || 92, sub: params.out.sub || '444', hf: +params.out.hf || 0, dither: +params.out.dither || 0 }; }
+function encKey() { return resultVer + '|' + JSON.stringify(encOpts()); }
+function fmtSize(n) { return n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB'; }
+
+function getEncoded() {
+  const key = encKey();
+  if (encCache && encCache.key === key) return Promise.resolve(encCache);
+  if (encPending && encPending.key === key) return encPending.p;
+  const img = result, id = ++encSeq, copy = img.data.slice();
+  const p = new Promise((res, rej) => {
+    encWaiters.set(id, { res, rej });
+    getEncWorker().postMessage({ type: 'encode', id, w: img.width, h: img.height, buffer: copy.buffer, opts: encOpts() }, [copy.buffer]);
+  }).then((bytes) => {
+    const r = { key, bytes, src: img, img: null, kept: null };
+    if (encKey() === key) encCache = r;
+    if (encPending && encPending.key === key) encPending = null;
+    return r;
+  });
+  encPending = { key, p };
+  return p;
+}
+
+// share of the image's fine (high-frequency) luma detail that is still present after encoding
+function detailKept(a, b) {
+  const w = a.width, h = a.height, A = a.data, B = b.data;
+  const L = (d, p) => 0.299 * d[p * 4] + 0.587 * d[p * 4 + 1] + 0.114 * d[p * 4 + 2];
+  let num = 0, den = 0;
+  const step = w * h > 4e6 ? 2 : 1;
+  for (let y = 1; y < h - 1; y += step) for (let x = 1; x < w - 1; x += step) {
+    const p = y * w + x;
+    const ha = L(A, p) - (L(A, p - 1) + L(A, p + 1) + L(A, p - w) + L(A, p + w)) / 4;
+    const hb = L(B, p) - (L(B, p - 1) + L(B, p + 1) + L(B, p - w) + L(B, p + w)) / 4;
+    num += ha * hb; den += ha * ha;
+  }
+  return den > 0 ? Math.max(0, Math.min(100, 100 * num / den)) : 100;
+}
+
+let pvBusy = false;
+async function refreshJpegPreview() {
+  if (!result || pvBusy) return;
+  pvBusy = true;
+  try {
+    const key = encKey();
+    const enc = await getEncoded();
+    if (!enc.img) {
+      const bmp = await createImageBitmap(new Blob([enc.bytes], { type: 'image/jpeg' }));
+      const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+      const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(bmp, 0, 0);
+      enc.img = x.getImageData(0, 0, c.width, c.height);
+      enc.kept = detailKept(enc.src, enc.img);
+    }
+    jpegPreview = enc;
+    if (viewMode === 'jpeg') {
+      setStatus(`JPEG · ${fmtSize(enc.bytes.length)} · fine detail kept ${enc.kept.toFixed(1)}%`);
+      if (key === encKey()) render();
+    }
+  } catch (err) {
+    setStatus('JPEG preview failed: ' + (err.message || err), true);
+  } finally {
+    pvBusy = false;
+    if (viewMode === 'jpeg' && result && (!jpegPreview || jpegPreview.key !== encKey())) setTimeout(render, 0);
+  }
+}
+
+async function exportJpg() {
   if (!result) return;
-  const c = document.createElement('canvas');
-  c.width = result.width; c.height = result.height;
-  c.getContext('2d').putImageData(result, 0, 0);
   let name = (params.out.name || '').trim() || (origName + '_ie2.jpg');
   if (!/\.jpe?g$/i.test(name)) name += '.jpg';
-  const q = Math.min(1, Math.max(0.01, (+params.out.quality || 92) / 100));
-  c.toBlob((blob) => {
-    if (!blob) { setStatus('Export failed.', true); return; }
+  setStatus('Encoding JPEG…');
+  try {
+    const enc = await getEncoded();
+    const blob = new Blob([enc.bytes], { type: 'image/jpeg' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = name;
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    setStatus(`Exported ${name} · ${result.width}×${result.height} · ${(blob.size / 1024).toFixed(1)} KB · q ${Math.round(q * 1000) / 10}`);
-  }, 'image/jpeg', q);
+    const o = encOpts();
+    setStatus(`Exported ${name} · ${enc.src.width}×${enc.src.height} · ${fmtSize(blob.size)} · q${o.quality} ${o.sub.split('').join(':')}`);
+  } catch (err) {
+    setStatus('Export failed: ' + (err.message || err), true);
+  }
 }
 
 /* ---------------- wiring ---------------- */

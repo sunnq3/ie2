@@ -21,7 +21,6 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
    - *Echo passes*: ghost copies at multiples of each channel's own displacement, with decay and spacing.
    - *Chroma vs luma shift*: Cb/Cr shifted against Y, plus horizontal chroma bleed and chroma blur.
    - *Purple fringing*: tinted halo around bright high-contrast edges (threshold, width, outward offset, hue, edge weighting).
-   - *Sensor*: optical AA low-pass, Bayer re-mosaic (RGGB/BGGR/GRBG/GBRG) and demosaic (Malvar-He-Cutler or bilinear) on linear data, like a raw pipeline.
 3. **Elastic warp / lens distortion** — radial `r·(1 + k1·r² + k2·r⁴)` model (barrel / pincushion), movable centre, scale, auto-fill, bicubic or bilinear resampling. Distortion and CA share one resampling pass to avoid double interpolation.
 4. **Colour-space roundtrip** — sRGB↔linear, sRGB↔Display P3, sRGB↔CIE Lab, RGB↔HSV, RGB↔HSL, RGB↔YCbCr (BT.601/709/2020, full/limited range, 4:4:4/4:2:2/4:2:0), each with adjustable intermediate precision (4–16 bits, fractional) and 1–10 passes.
 
@@ -29,7 +28,13 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
 
 6. **Noise distribution** — Gaussian, uniform, Laplacian, impulse (± specks) or shot (brightness-dependent) noise. Amount in 8-bit levels (0.01 steps), density, colour vs. mono, grain size, irregularity (patchy low-frequency modulation with adjustable patch size) and a seed. Apply it to the whole image, only to painted areas, or everywhere except painted areas. Paint the mask on the image with a soft brush (size, hardness, opacity), erase with Alt-drag or the Erase tool, Undo / Clear. The mask is shown as a thin outline (or tinted, or hidden) so the result underneath stays visible. Shortcuts: B paint, E erase, [ ] brush size (Shift for fine), Ctrl/⌘+Z undo, Esc stop painting.
 
-Then **Export JPG** with adjustable quality.
+7. **Sensor grain (raw camera look)** — runs last. Linear light → optical AA filter → Bayer mosaic (RGGB/BGGR/GRBG/GBRG) → per-photosite shot (signal-dependent) + read noise, extra noise on red/blue sites → demosaic (Malvar-He-Cutler, bilinear, or none) → in-camera chroma noise reduction. Optionally limited by the noise mask. The demosaic correlates the grain over ~2 px like real camera noise, so it survives compression.
+
+**Export JPG** uses a built-in baseline encoder (optimized Huffman tables):
+- Quality 1–100 (IJG scaling), chroma 4:4:4 / 4:2:2 / 4:2:0 — browsers' own export is 4:2:0, which halves colour resolution.
+- *Grain keep*: flattens the quantisation tables toward high frequencies.
+- *Dithered rounding*: stochastic rounding of AC coefficients so small detail survives in proportion to its size instead of rounding to zero.
+- The **JPEG** view shows the decoded export file, its size and how much of the fine detail survived.
 
 ## Viewer
 

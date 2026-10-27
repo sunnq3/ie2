@@ -14,6 +14,11 @@ self.onmessage = (e) => {
   if (m.type === 'load') {
     SRC = { w: m.w, h: m.h, data: new Uint8ClampedArray(m.buffer) };
     CACHE = null; PRE = null; CLEAN = null;
+  } else if (m.type === 'encode') {
+    try {
+      const bytes = encodeJPEG(new Uint8ClampedArray(m.buffer), m.w, m.h, m.opts || {});
+      self.postMessage({ type: 'encoded', id: m.id, buffer: bytes.buffer }, [bytes.buffer]);
+    } catch (err) { self.postMessage({ type: 'encode-error', id: m.id, message: (err && err.message) || String(err) }); }
   } else if (m.type === 'process') {
     try { runJob(m.id, m.params); }
     catch (err) { self.postMessage({ type: 'error', id: m.id, message: (err && err.message) || String(err) }); }
@@ -55,6 +60,7 @@ function runJob(id, P) {
   }
   const outData = PRE.data.slice();
   addNoise(outData, PRE.w, PRE.h, P.noise, id);
+  sensorSim(outData, PRE.w, PRE.h, P.sensor, P.noise, id);
   const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: outData.buffer, ms: performance.now() - t0, carveKey: key };
   const transfer = [outData.buffer];
   if (recarved) { const mk = CACHE.mask.slice(); msg.mask = mk.buffer; transfer.push(mk.buffer); }
@@ -429,46 +435,52 @@ function spectralBands(N, balance, type) {
 }
 
 /* Bayer re-mosaic + demosaic (Malvar-He-Cutler or bilinear) on float planes */
-function bayerRoundtrip(P, w, h, pattern, method) {
+function bayerRoundtrip(P, w, h, pattern, method, onMosaic) {
   const pat = (pattern || 'RGGB').toUpperCase(), idx = { R: 0, G: 1, B: 2 };
   const cfa = [idx[pat[0]], idx[pat[1]], idx[pat[2]], idx[pat[3]]];
   const col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
   const N = w * h, M = new Float32Array(N);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) M[y * w + x] = P[col(x, y)][y * w + x];
-  // mirror-reflect so the CFA phase is preserved at the borders
+  if (onMosaic) onMosaic(M, col);
+  // 2-px mirror-padded copy (reflection keeps the CFA phase at the borders)
+  const W2 = w + 4, H2 = h + 4, Q = new Float32Array(W2 * H2);
   const rx = (x) => (x < 0 ? -x : x >= w ? 2 * w - 2 - x : x), ry = (y) => (y < 0 ? -y : y >= h ? 2 * h - 2 - y : y);
-  const m = (x, y) => M[ry(y) * w + rx(x)];
+  for (let y = -2; y < h + 2; y++) {
+    const sy = Math.min(h - 1, Math.max(0, ry(y))), row = (y + 2) * W2;
+    for (let x = -2; x < w + 2; x++) Q[row + x + 2] = M[sy * w + Math.min(w - 1, Math.max(0, rx(x)))];
+  }
   const mhc = method !== 'bilinear';
+  const P0 = P[0], P1 = P[1], P2 = P[2], out = [0, 0, 0];
+  const W1 = W2, Wd = 2 * W2;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const c = col(x, y), C = m(x, y), p = y * w + x;
-      const out = [0, 0, 0];
+      const c = cfa[((y & 1) << 1) | (x & 1)], q = (y + 2) * W2 + x + 2, C = Q[q], p = y * w + x;
+      out[0] = out[1] = out[2] = 0;
       out[c] = C;
+      const l = Q[q - 1], r = Q[q + 1], u = Q[q - W1], d = Q[q + W1];
       if (c !== 1) {
-        const o = 2 - c; // the other of R/B
+        const o = 2 - c, dg = Q[q - W1 - 1] + Q[q - W1 + 1] + Q[q + W1 - 1] + Q[q + W1 + 1];
         if (mhc) {
-          out[1] = (4 * C + 2 * (m(x - 1, y) + m(x + 1, y) + m(x, y - 1) + m(x, y + 1)) -
-                    (m(x - 2, y) + m(x + 2, y) + m(x, y - 2) + m(x, y + 2))) / 8;
-          out[o] = (6 * C + 2 * (m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1)) -
-                    1.5 * (m(x - 2, y) + m(x + 2, y) + m(x, y - 2) + m(x, y + 2))) / 8;
+          const far = Q[q - 2] + Q[q + 2] + Q[q - Wd] + Q[q + Wd];
+          out[1] = (4 * C + 2 * (l + r + u + d) - far) / 8;
+          out[o] = (6 * C + 2 * dg - 1.5 * far) / 8;
         } else {
-          out[1] = (m(x - 1, y) + m(x + 1, y) + m(x, y - 1) + m(x, y + 1)) / 4;
-          out[o] = (m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1)) / 4;
+          out[1] = (l + r + u + d) / 4;
+          out[o] = dg / 4;
         }
       } else {
-        const hc = col(x + 1, y), vc = col(x, y + 1); // colour found horizontally / vertically
+        const hc = cfa[((y & 1) << 1) | ((x + 1) & 1)], vc = cfa[(((y + 1) & 1) << 1) | (x & 1)];
         if (mhc) {
-          const diag = m(x - 1, y - 1) + m(x + 1, y - 1) + m(x - 1, y + 1) + m(x + 1, y + 1);
-          out[hc] = (5 * C + 4 * (m(x - 1, y) + m(x + 1, y)) - (m(x - 2, y) + m(x + 2, y)) - diag +
-                     0.5 * (m(x, y - 2) + m(x, y + 2))) / 8;
-          out[vc] = (5 * C + 4 * (m(x, y - 1) + m(x, y + 1)) - (m(x, y - 2) + m(x, y + 2)) - diag +
-                     0.5 * (m(x - 2, y) + m(x + 2, y))) / 8;
+          const dg = Q[q - W1 - 1] + Q[q - W1 + 1] + Q[q + W1 - 1] + Q[q + W1 + 1];
+          const fh = Q[q - 2] + Q[q + 2], fv = Q[q - Wd] + Q[q + Wd];
+          out[hc] = (5 * C + 4 * (l + r) - fh - dg + 0.5 * fv) / 8;
+          out[vc] = (5 * C + 4 * (u + d) - fv - dg + 0.5 * fh) / 8;
         } else {
-          out[hc] = (m(x - 1, y) + m(x + 1, y)) / 2;
-          out[vc] = (m(x, y - 1) + m(x, y + 1)) / 2;
+          out[hc] = (l + r) / 2;
+          out[vc] = (u + d) / 2;
         }
       }
-      P[0][p] = out[0] < 0 ? 0 : out[0]; P[1][p] = out[1] < 0 ? 0 : out[1]; P[2][p] = out[2] < 0 ? 0 : out[2];
+      P0[p] = out[0] < 0 ? 0 : out[0]; P1[p] = out[1] < 0 ? 0 : out[1]; P2[p] = out[2] < 0 ? 0 : out[2];
     }
   }
 }
@@ -1433,5 +1445,273 @@ function depattern(d, w, h, Q, id) {
   for (let p = 0, i = 0; p < w * h; p++, i += 4) { d[i] = out[p * 3]; d[i + 1] = out[p * 3 + 1]; d[i + 2] = out[p * 3 + 2]; }
 }
 
+/* ------------------------------------------------------------------ */
+/* 7. Sensor simulation: raw-domain noise + demosaic                    */
+/* ------------------------------------------------------------------ */
+/* Runs last. Converts to linear light, optional optical low-pass (AA), builds the Bayer mosaic,
+   adds photon (shot, signal-dependent) + read noise per photosite, demosaics like a camera and
+   applies in-camera chroma noise reduction. The demosaic correlates the noise over ~2 px, which is
+   what real camera grain looks like and why it survives JPEG much better than 1-px white noise. */
+function sensorSim(d, w, h, S, NZ, id) {
+  if (!S || !S.on) return;
+  if (id != null) progress(id, 'Sensor', 0.9);
+  encLut();
+  const N = w * h;
+  const P = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+  for (let p = 0, i = 0; p < N; p++, i += 4) { P[0][p] = LIN[d[i]] * 255; P[1][p] = LIN[d[i + 1]] * 255; P[2][p] = LIN[d[i + 2]] * 255; }
+  const aa = +S.aa || 0;
+  if (aa > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, aa);
+
+  const shot = Math.max(0, +S.shot || 0), read = Math.max(0, +S.read || 0);
+  const gainB = [1 + (+S.rgain || 0) / 100, 1, 1 + (+S.bgain || 0) / 100]; // red/blue photosites get less light -> more noise
+  let mask = null;
+  if (S.useMask && NZ && NZ.scope !== 'all') {
+    mask = rasterMask(NZ.strokes || [], w, h);
+    if (NZ.scope === 'outside') for (let i = 0; i < N; i++) mask[i] = 1 - mask[i];
+  }
+  const rnd = mulberry32(((Math.round(+S.seed || 1) * 2654435761) ^ 0x9e3779b9) >>> 0);
+  let spare = null;
+  const gauss = () => {
+    if (spare !== null) { const v = spare; spare = null; return v; }
+    let u = rnd(); if (u < 1e-12) u = 1e-12;
+    const v = rnd(), r = Math.sqrt(-2 * Math.log(u));
+    spare = r * Math.sin(6.283185307179586 * v);
+    return r * Math.cos(6.283185307179586 * v);
+  };
+  const addNoiseMosaic = (M, col) => {
+    if (!(shot > 0 || read > 0)) return;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = y * w + x, n = gauss();
+      if (mask && mask[p] <= 0) continue;
+      const v = M[p], g = gainB[col(x, y)];
+      const sd = Math.sqrt(shot * shot * g * (v > 0 ? v : 0) + read * read * g * g);
+      M[p] = v + n * sd * (mask ? mask[p] : 1);
+    }
+  };
+  if (S.demosaic === 'none') {
+    // noise only, no CFA: per-channel independent noise (white, 1 px)
+    for (let c = 0; c < 3; c++) addNoiseMosaic(P[c], () => c);
+  } else {
+    bayerRoundtrip(P, w, h, S.pattern, S.demosaic, addNoiseMosaic);
+  }
+  for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
+
+  // in-camera chroma noise reduction (YCbCr, blur the chroma only)
+  const nr = Math.min(1, Math.max(0, (+S.chromaNR || 0) / 100));
+  if (nr > 0) {
+    const Kr = 0.299, Kb = 0.114, Kg = 1 - Kr - Kb;
+    const Y = new Float32Array(N), Cb = new Float32Array(N), Cr = new Float32Array(N);
+    for (let p = 0; p < N; p++) {
+      const yy = Kr * P[0][p] + Kg * P[1][p] + Kb * P[2][p];
+      Y[p] = yy; Cb[p] = P[2][p] - yy; Cr[p] = P[0][p] - yy;
+    }
+    const sig = 0.6 + 2.4 * nr;
+    const Cb2 = blurPlane(Cb, w, h, sig), Cr2 = blurPlane(Cr, w, h, sig);
+    for (let p = 0; p < N; p++) {
+      const cb = Cb[p] + (Cb2[p] - Cb[p]) * nr, cr = Cr[p] + (Cr2[p] - Cr[p]) * nr, yy = Y[p];
+      const r = yy + cr, b = yy + cb;
+      P[0][p] = r; P[2][p] = b; P[1][p] = (yy - Kr * r - Kb * b) / Kg;
+    }
+  }
+  for (let p = 0, i = 0; p < N; p++, i += 4) { d[i] = P[0][p]; d[i + 1] = P[1][p]; d[i + 2] = P[2][p]; d[i + 3] = 255; }
+}
+
+/* ------------------------------------------------------------------ */
+/* JPEG encoder (baseline, optimized Huffman)                           */
+/* ------------------------------------------------------------------ */
+/* Options: quality 1-100, sub '444' | '422' | '420', hf 0-100 (flatten the quant tables toward
+   high frequencies so fine grain is kept), dither 0-100 (stochastic rounding of AC coefficients:
+   small coefficients survive in proportion to their size instead of all rounding to zero). */
+const ZZ = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+  35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63];
+const QL = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+  18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99];
+const QC = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99,
+  99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99];
+
+function quantTable(base, quality, hf) {
+  const q = Math.min(100, Math.max(1, quality));
+  const sc = q < 50 ? 5000 / q : 200 - 2 * q;
+  const t = new Int32Array(64);
+  for (let i = 0; i < 64; i++) {
+    let v = Math.floor((base[i] * sc + 50) / 100);
+    const u = i & 7, vv = i >> 3, wgt = Math.min(1, (u + vv) / 7);
+    v = Math.round(v * (1 - hf * wgt));
+    t[i] = Math.min(255, Math.max(1, v));
+  }
+  return t;
+}
+
+const DCT_T = (() => {
+  const T = new Float64Array(64);
+  for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) T[u * 8 + x] = (u === 0 ? Math.SQRT1_2 : 1) / 2 * Math.cos((2 * x + 1) * u * Math.PI / 16);
+  return T;
+})();
+function fdct(blk, out, tmp) {
+  for (let y = 0; y < 8; y++) for (let u = 0; u < 8; u++) {
+    let s = 0; for (let x = 0; x < 8; x++) s += DCT_T[u * 8 + x] * blk[y * 8 + x];
+    tmp[y * 8 + u] = s;
+  }
+  for (let u = 0; u < 8; u++) for (let v = 0; v < 8; v++) {
+    let s = 0; for (let y = 0; y < 8; y++) s += DCT_T[v * 8 + y] * tmp[y * 8 + u];
+    out[v * 8 + u] = s;
+  }
+}
+
+function huffTable(freq) {
+  // JPEG Annex K.2 length-limited Huffman code (as libjpeg's jpeg_gen_optimal_table)
+  const f = freq.slice(); f[256] = 1;
+  const codesize = new Int32Array(257), others = new Int32Array(257).fill(-1);
+  for (;;) {
+    let c1 = -1, c2 = -1, v = 1e18;
+    for (let i = 0; i <= 256; i++) if (f[i] && f[i] <= v) { v = f[i]; c1 = i; }
+    v = 1e18;
+    for (let i = 0; i <= 256; i++) if (f[i] && f[i] <= v && i !== c1) { v = f[i]; c2 = i; }
+    if (c2 < 0) break;
+    f[c1] += f[c2]; f[c2] = 0;
+    codesize[c1]++;
+    while (others[c1] >= 0) { c1 = others[c1]; codesize[c1]++; }
+    others[c1] = c2;
+    codesize[c2]++;
+    while (others[c2] >= 0) { c2 = others[c2]; codesize[c2]++; }
+  }
+  const bits = new Int32Array(33);
+  for (let i = 0; i <= 256; i++) if (codesize[i]) bits[codesize[i]]++;
+  for (let i = 32; i > 16; i--) {
+    while (bits[i] > 0) {
+      let j = i - 2; while (bits[j] === 0) j--;
+      bits[i] -= 2; bits[i - 1]++; bits[j + 1] += 2; bits[j]--;
+    }
+  }
+  let i = 16; while (bits[i] === 0) i--; bits[i]--;
+  const vals = [];
+  for (let len = 1; len <= 32; len++) for (let s = 0; s < 256; s++) if (codesize[s] === len) vals.push(s);
+  // canonical codes
+  const code = new Int32Array(256), size = new Int32Array(256);
+  let c = 0, k = 0;
+  for (let len = 1; len <= 16; len++) {
+    for (let n = 0; n < bits[len]; n++) { code[vals[k]] = c; size[vals[k]] = len; c++; k++; }
+    c <<= 1;
+  }
+  return { bits: Array.from(bits.subarray(1, 17)), vals, code, size };
+}
+
+function bitLen(v) { v = v < 0 ? -v : v; let n = 0; while (v) { n++; v >>= 1; } return n; }
+
+function encodeJPEG(rgba, w, h, opts) {
+  const quality = +opts.quality || 92, sub = opts.sub || '444';
+  const hf = Math.min(0.95, Math.max(0, (+opts.hf || 0) / 100)), dith = Math.min(1, Math.max(0, (+opts.dither || 0) / 100));
+  const qY = quantTable(QL, quality, hf), qC = quantTable(QC, quality, hf);
+  const H = sub === '444' ? 1 : 2, V = sub === '420' ? 2 : 1;
+  const N = w * h;
+  const Yp = new Float32Array(N), Cbp = new Float32Array(N), Crp = new Float32Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+    Yp[p] = 0.299 * r + 0.587 * g + 0.114 * b - 128;
+    Cbp[p] = -0.168736 * r - 0.331264 * g + 0.5 * b;
+    Crp[p] = 0.5 * r - 0.418688 * g - 0.081312 * b;
+  }
+  let cw = w, ch = h, Cb = Cbp, Cr = Crp;
+  if (H > 1 || V > 1) {
+    cw = Math.ceil(w / H); ch = Math.ceil(h / V);
+    Cb = new Float32Array(cw * ch); Cr = new Float32Array(cw * ch);
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      let sb = 0, sr = 0, n = 0;
+      for (let dy = 0; dy < V; dy++) for (let dx = 0; dx < H; dx++) {
+        const sx = Math.min(w - 1, x * H + dx), sy = Math.min(h - 1, y * V + dy), p = sy * w + sx;
+        sb += Cbp[p]; sr += Crp[p]; n++;
+      }
+      Cb[y * cw + x] = sb / n; Cr[y * cw + x] = sr / n;
+    }
+  }
+  const mcuX = Math.ceil(w / (8 * H)), mcuY = Math.ceil(h / (8 * V));
+  const perMcu = H * V + 2, nBlocks = mcuX * mcuY * perMcu;
+  const coef = new Int16Array(nBlocks * 64);
+  const rnd = mulberry32(0x51f15e);
+  const blk = new Float64Array(64), F = new Float64Array(64), tmp = new Float64Array(64);
+  const take = (plane, pw, ph, bx, by) => {
+    for (let y = 0; y < 8; y++) {
+      const sy = Math.min(ph - 1, by + y);
+      for (let x = 0; x < 8; x++) blk[y * 8 + x] = plane[sy * pw + Math.min(pw - 1, bx + x)];
+    }
+  };
+  const quant = (q, o) => {
+    fdct(blk, F, tmp);
+    for (let k = 0; k < 64; k++) {
+      const n = ZZ[k], c = F[n] / q[n];
+      let v;
+      if (k === 0 || dith === 0) v = Math.round(c);
+      else v = Math.floor(c + 0.5 + dith * (rnd() - 0.5));
+      const lim = k === 0 ? 2047 : 1023;
+      coef[o + k] = v > lim ? lim : v < -lim ? -lim : v;
+    }
+  };
+  let o = 0;
+  for (let my = 0; my < mcuY; my++) for (let mx = 0; mx < mcuX; mx++) {
+    for (let v = 0; v < V; v++) for (let hh = 0; hh < H; hh++) {
+      take(Yp, w, h, (mx * H + hh) * 8, (my * V + v) * 8); quant(qY, o); o += 64;
+    }
+    take(Cb, cw, ch, mx * 8, my * 8); quant(qC, o); o += 64;
+    take(Cr, cw, ch, mx * 8, my * 8); quant(qC, o); o += 64;
+  }
+  // block -> component index
+  const compOf = (b) => { const r = b % perMcu; return r < H * V ? 0 : r === H * V ? 1 : 2; };
+
+  // pass 1: symbol statistics
+  const fDC = [new Float64Array(257), new Float64Array(257)], fAC = [new Float64Array(257), new Float64Array(257)];
+  const walk = (emitDC, emitAC) => {
+    const pred = [0, 0, 0];
+    for (let b = 0; b < nBlocks; b++) {
+      const c = compOf(b), t = c === 0 ? 0 : 1, base = b * 64;
+      const diff = coef[base] - pred[c]; pred[c] = coef[base];
+      emitDC(t, diff);
+      let run = 0;
+      for (let k = 1; k < 64; k++) {
+        const v = coef[base + k];
+        if (v === 0) { run++; continue; }
+        while (run > 15) { emitAC(t, 0xF0, 0); run -= 16; }
+        emitAC(t, (run << 4) | bitLen(v), v); run = 0;
+      }
+      if (run > 0) emitAC(t, 0x00, 0);
+    }
+  };
+  walk((t, diff) => { fDC[t][bitLen(diff)]++; }, (t, sym) => { fAC[t][sym]++; });
+  const hDC = [huffTable(fDC[0]), huffTable(fDC[1])], hAC = [huffTable(fAC[0]), huffTable(fAC[1])];
+
+  // output buffer
+  let buf = new Uint8Array(Math.max(1 << 16, N)), len = 0;
+  const byte = (v) => { if (len >= buf.length) { const nb = new Uint8Array(buf.length * 2); nb.set(buf); buf = nb; } buf[len++] = v; };
+  const word = (v) => { byte((v >> 8) & 255); byte(v & 255); };
+  // headers
+  word(0xFFD8);
+  word(0xFFE0); word(16); [0x4A, 0x46, 0x49, 0x46, 0].forEach(byte); byte(1); byte(1); byte(0); word(1); word(1); byte(0); byte(0);
+  word(0xFFDB); word(2 + 65 * 2);
+  byte(0); for (let k = 0; k < 64; k++) byte(qY[ZZ[k]]);
+  byte(1); for (let k = 0; k < 64; k++) byte(qC[ZZ[k]]);
+  word(0xFFC0); word(17); byte(8); word(h); word(w); byte(3);
+  byte(1); byte((H << 4) | V); byte(0);
+  byte(2); byte(0x11); byte(1);
+  byte(3); byte(0x11); byte(1);
+  const tabs = [[0x00, hDC[0]], [0x10, hAC[0]], [0x01, hDC[1]], [0x11, hAC[1]]];
+  word(0xFFC4); word(2 + tabs.reduce((a, [, t]) => a + 17 + t.vals.length, 0));
+  for (const [cls, t] of tabs) { byte(cls); t.bits.forEach(byte); t.vals.forEach(byte); }
+  word(0xFFDA); word(12); byte(3); byte(1); byte(0x00); byte(2); byte(0x11); byte(3); byte(0x11); byte(0); byte(63); byte(0);
+  // entropy-coded data
+  let acc = 0, nb = 0;
+  const put = (code, size) => {
+    acc = (acc << size) | (code & ((1 << size) - 1)); nb += size;
+    while (nb >= 8) {
+      const b = (acc >> (nb - 8)) & 255; byte(b); if (b === 255) byte(0);
+      nb -= 8; acc &= (1 << nb) - 1;
+    }
+  };
+  const putVal = (v, s) => { if (s) put(v < 0 ? v + (1 << s) - 1 : v, s); };
+  walk((t, diff) => { const s = bitLen(diff); put(hDC[t].code[s], hDC[t].size[s]); putVal(diff, s); },
+       (t, sym, v) => { put(hAC[t].code[sym], hAC[t].size[sym]); putVal(v, sym & 15); });
+  if (nb > 0) put((1 << (8 - nb)) - 1, 8 - nb);
+  word(0xFFD9);
+  return buf.slice(0, len);
+}
+
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
+if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
