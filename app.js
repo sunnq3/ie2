@@ -16,6 +16,7 @@ const DEFAULTS = {
     hsl: { on: false, bits: 8 },
     ycc: { on: false, bits: 8, matrix: '601', range: 'full', sub: '444' },
   },
+  scale: { up: 1, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   out: { quality: 92, name: '' },
 };
 
@@ -77,6 +78,17 @@ const SCHEMA = [
       { k: 'color.ycc.matrix', label: 'Matrix', type: 'select', sub: true, options: [['601', 'BT.601'], ['709', 'BT.709'], ['2020', 'BT.2020']] },
       { k: 'color.ycc.range', label: 'Range', type: 'select', sub: true, options: [['full', 'Full (0–255)'], ['limited', 'Limited (16–235)']] },
       { k: 'color.ycc.sub', label: 'Chroma', type: 'select', sub: true, options: [['444', '4:4:4'], ['422', '4:2:2'], ['420', '4:2:0']] },
+    ],
+  },
+  {
+    id: 'scale', title: '5 · Upscale → downscale',
+    note: 'Enlarges the image by the factor, then shrinks it to the final size (100 % = same size as before this step). Runs last, right before export.',
+    controls: [
+      { k: 'scale.up', label: 'Upscale', type: 'range', min: 1, max: 6, step: 0.01, unit: '×' },
+      { k: 'scale.upMethod', label: 'Up filter', type: 'select', options: [['bicubic', 'Bicubic'], ['lanczos3', 'Lanczos 3'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['nearest', 'Nearest']] },
+      { k: 'scale.final', label: 'Final size', type: 'range', min: 25, max: 200, step: 0.01, unit: '%' },
+      { k: 'scale.downMethod', label: 'Down filter', type: 'select', options: [['lanczos3', 'Lanczos 3'], ['bicubic', 'Bicubic'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['box', 'Box (area)'], ['nearest', 'Nearest']] },
+      { k: 'scale.quant', label: 'Store the upscaled image at 8-bit', type: 'check' },
     ],
   },
   {
@@ -445,6 +457,8 @@ function exportJpg() {
 /* ---------------- wiring ---------------- */
 
 buildPanel();
+CTRL['scale.up'].setRange(1, 6, 1, 6);
+CTRL['scale.final'].setRange(25, 200, 1, 600);
 
 $('#file').addEventListener('change', (e) => { loadFile(e.target.files[0]); e.target.value = ''; });
 $('#drop').addEventListener('click', () => $('#file').click());

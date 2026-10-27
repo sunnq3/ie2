@@ -36,8 +36,9 @@ function runJob(id, P) {
   progress(id, 'Resampling', 0.5);
   const out = resample(CACHE.data, w, h, P.lens, P.ca);
   colorRoundtrip(out, w, h, P.color, id);
-  const msg = { type: 'result', id, w, h, buffer: out.buffer, ms: performance.now() - t0, carveKey: key };
-  const transfer = [out.buffer];
+  const fin = rescale(out, w, h, P.scale, id);
+  const msg = { type: 'result', id, w: fin.w, h: fin.h, buffer: fin.data.buffer, ms: performance.now() - t0, carveKey: key };
+  const transfer = [fin.data.buffer];
   if (recarved) { const mk = CACHE.mask.slice(); msg.mask = mk.buffer; transfer.push(mk.buffer); }
   self.postMessage(msg, transfer);
 }
@@ -502,5 +503,110 @@ function colorRoundtrip(d, w, h, C, id) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 5. Upscale -> downscale roundtrip                                    */
+/* ------------------------------------------------------------------ */
+/* Separable: each axis is upscaled, optionally stored at 8-bit, then
+   downscaled. Because the per-axis filters commute, this matches a full
+   2D upscale/downscale without holding the (up to 36x) enlarged image. */
+
+function sinc(x) { if (x === 0) return 1; const p = Math.PI * x; return Math.sin(p) / p; }
+const KERNELS = {
+  nearest: { r: 0.5, f: x => (x >= -0.5 && x < 0.5 ? 1 : 0) },
+  box: { r: 0.5, f: x => (x >= -0.5 && x < 0.5 ? 1 : 0) },
+  bilinear: { r: 1, f: x => { x = Math.abs(x); return x < 1 ? 1 - x : 0; } },
+  bicubic: { r: 2, f: x => { // Catmull-Rom
+    x = Math.abs(x);
+    if (x < 1) return 1.5 * x * x * x - 2.5 * x * x + 1;
+    if (x < 2) return -0.5 * x * x * x + 2.5 * x * x - 4 * x + 2;
+    return 0;
+  } },
+  mitchell: { r: 2, f: x => { // B = C = 1/3
+    x = Math.abs(x); const B = 1 / 3, C = 1 / 3;
+    if (x < 1) return ((12 - 9 * B - 6 * C) * x * x * x + (-18 + 12 * B + 6 * C) * x * x + (6 - 2 * B)) / 6;
+    if (x < 2) return ((-B - 6 * C) * x * x * x + (6 * B + 30 * C) * x * x + (-12 * B - 48 * C) * x + (8 * B + 24 * C)) / 6;
+    return 0;
+  } },
+  lanczos3: { r: 3, f: x => (Math.abs(x) < 3 ? sinc(x) * sinc(x / 3) : 0) },
+};
+
+function contribs(n, m, kernel) {
+  const K = KERNELS[kernel] || KERNELS.bicubic;
+  const scale = m / n;
+  const fs = scale < 1 ? 1 / scale : 1;
+  const support = K.r * fs;
+  const taps = Math.ceil(support * 2) + 2;
+  const start = new Int32Array(m), cnt = new Int32Array(m), wt = new Float32Array(m * taps);
+  for (let i = 0; i < m; i++) {
+    const center = (i + 0.5) / scale;
+    if (kernel === 'nearest') {
+      const j = Math.min(n - 1, Math.max(0, Math.floor(center)));
+      start[i] = j; cnt[i] = 1; wt[i * taps] = 1; continue;
+    }
+    const lo = Math.max(0, Math.floor(center - support)), hi = Math.min(n - 1, Math.ceil(center + support));
+    let sum = 0;
+    for (let j = lo; j <= hi; j++) { const v = K.f((j + 0.5 - center) / fs); wt[i * taps + (j - lo)] = v; sum += v; }
+    start[i] = lo; cnt[i] = hi - lo + 1;
+    if (Math.abs(sum) < 1e-9) {
+      const j = Math.min(n - 1, Math.max(0, Math.floor(center)));
+      wt.fill(0, i * taps, i * taps + taps); start[i] = j; cnt[i] = 1; wt[i * taps] = 1;
+    } else for (let k = 0; k < cnt[i]; k++) wt[i * taps + k] /= sum;
+  }
+  return { m, taps, start, cnt, wt };
+}
+
+// line: Float32 (n*3 interleaved) -> out Float32 (m*3)
+function apply1d(line, out, C) {
+  const { m, taps, start, cnt, wt } = C;
+  for (let i = 0; i < m; i++) {
+    let r = 0, g = 0, b = 0, p = start[i] * 3;
+    const wo = i * taps, c = cnt[i];
+    for (let k = 0; k < c; k++, p += 3) { const w = wt[wo + k]; r += line[p] * w; g += line[p + 1] * w; b += line[p + 2] * w; }
+    out[i * 3] = r; out[i * 3 + 1] = g; out[i * 3 + 2] = b;
+  }
+}
+
+function quant8(a) { for (let i = 0; i < a.length; i++) { let v = Math.round(a[i]); a[i] = v < 0 ? 0 : v > 255 ? 255 : v; } }
+
+function rescale(d, w, h, S, id) {
+  S = S || {};
+  const up = Math.max(1, +S.up || 1);
+  const fin = Math.max(0.0001, (+S.final || 100) / 100);
+  const fw = Math.max(1, Math.round(w * fin)), fh = Math.max(1, Math.round(h * fin));
+  if (up === 1 && fw === w && fh === h) return { data: d, w, h };
+  const uw = Math.max(1, Math.round(w * up)), uh = Math.max(1, Math.round(h * up));
+  const q = S.quant !== false;
+  const cHu = contribs(w, uw, S.upMethod), cHd = contribs(uw, fw, S.downMethod);
+  const cVu = contribs(h, uh, S.upMethod), cVd = contribs(uh, fh, S.downMethod);
+
+  let last = 0;
+  const tick = (f) => { const t = performance.now(); if (t - last > 80) { last = t; progress(id, `Upscale ×${up} → downscale`, f); } };
+
+  // horizontal pass: (w x h) -> (fw x h)
+  const mid = new Float32Array(fw * h * 3);
+  const line = new Float32Array(w * 3), upL = new Float32Array(uw * 3), dn = new Float32Array(fw * 3);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0, p = y * w * 4; x < w; x++, p += 4) { line[x * 3] = d[p]; line[x * 3 + 1] = d[p + 1]; line[x * 3 + 2] = d[p + 2]; }
+    apply1d(line, upL, cHu);
+    if (q) quant8(upL);
+    apply1d(upL, dn, cHd);
+    mid.set(dn, y * fw * 3);
+    if ((y & 31) === 0) tick(0.5 * y / h);
+  }
+
+  // vertical pass: (fw x h) -> (fw x fh)
+  const out = new Uint8ClampedArray(fw * fh * 4);
+  const col = new Float32Array(h * 3), upC = new Float32Array(uh * 3), dc = new Float32Array(fh * 3);
+  for (let x = 0; x < fw; x++) {
+    for (let y = 0; y < h; y++) { const s = (y * fw + x) * 3; col[y * 3] = mid[s]; col[y * 3 + 1] = mid[s + 1]; col[y * 3 + 2] = mid[s + 2]; }
+    apply1d(col, upC, cVu);
+    if (q) quant8(upC);
+    apply1d(upC, dc, cVd);
+    for (let y = 0; y < fh; y++) { const o = (y * fw + x) * 4; out[o] = dc[y * 3]; out[o + 1] = dc[y * 3 + 1]; out[o + 2] = dc[y * 3 + 2]; out[o + 3] = 255; }
+    if ((x & 31) === 0) tick(0.5 + 0.5 * x / fw);
+  }
+  return { data: out, w: fw, h: fh };
+}
+
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom };
+if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale };

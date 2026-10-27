@@ -11,6 +11,8 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
 3. **Elastic warp / lens distortion** — radial `r·(1 + k1·r² + k2·r⁴)` model (barrel / pincushion), movable centre, scale, auto-fill, bicubic or bilinear resampling. Distortion and CA share one resampling pass to avoid double interpolation.
 4. **Colour-space roundtrip** — sRGB↔linear, sRGB↔Display P3, sRGB↔CIE Lab, RGB↔HSV, RGB↔HSL, RGB↔YCbCr (BT.601/709/2020, full/limited range, 4:4:4/4:2:2/4:2:0), each with adjustable intermediate precision (4–16 bits, fractional) and 1–10 passes.
 
+5. **Upscale → downscale** — enlarge up to 6× (0.01 steps; bicubic, Lanczos 3, Mitchell, bilinear, nearest), optionally store the enlarged image at 8-bit, then shrink to a final size (100 % = same size; 1–600 %) with Lanczos 3, bicubic, Mitchell, bilinear, box or nearest.
+
 Then **Export JPG** with adjustable quality.
 
 ## Viewer
