@@ -17,8 +17,11 @@ const DEFAULTS = {
     ycc: { on: false, bits: 8, matrix: '601', range: 'full', sub: '444' },
   },
   scale: { up: 1, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
+  noise: { amount: 0, type: 'gaussian', density: 100, chroma: 0, grain: 1, irregular: 0, irrScale: 32, seed: 1, scope: 'all' },
+  brush: { size: 24, hard: 50, opacity: 100, mode: 'add', show: true },
   out: { quality: 92, name: '' },
 };
+const NOPROCESS = ['out.', 'brush.'];
 
 const SCHEMA = [
   {
@@ -92,6 +95,26 @@ const SCHEMA = [
     ],
   },
   {
+    id: 'noise', title: '6 · Noise distribution',
+    note: 'Amount is the noise strength in 8-bit levels. Paint where it goes with the brush below, or apply it to the whole image.',
+    controls: [
+      { k: 'noise.amount', label: 'Amount', type: 'range', min: 0, max: 10, step: 0.01, unit: 'lvl', nmax: 255 },
+      { k: 'noise.type', label: 'Distribution', type: 'select', options: [['gaussian', 'Gaussian'], ['uniform', 'Uniform'], ['laplacian', 'Laplacian (spiky)'], ['impulse', 'Impulse (± specks)'], ['shot', 'Shot (brightness-dependent)']] },
+      { k: 'noise.density', label: 'Density', type: 'range', min: 0, max: 100, step: 0.01, unit: '%' },
+      { k: 'noise.chroma', label: 'Colour', type: 'range', min: 0, max: 100, step: 0.1, unit: '%' },
+      { k: 'noise.grain', label: 'Grain size', type: 'range', min: 1, max: 8, step: 0.01, unit: 'px' },
+      { k: 'noise.irregular', label: 'Irregularity', type: 'range', min: 0, max: 100, step: 0.1, unit: '%' },
+      { k: 'noise.irrScale', label: 'Patch size', type: 'range', min: 2, max: 400, step: 1, unit: 'px', sub: true },
+      { k: 'noise.seed', label: 'Seed', type: 'range', min: 1, max: 9999, step: 1, extra: 'seed' },
+      { k: 'noise.scope', label: 'Apply to', type: 'select', options: [['all', 'Whole image'], ['inside', 'Painted areas only'], ['outside', 'Everywhere except painted']] },
+      { type: 'buttons', group: 'start', buttons: [['paint', 'Paint mask'], ['erase', 'Erase'], ['undo', 'Undo'], ['clear', 'Clear']] },
+      { k: 'brush.size', label: 'Brush size', type: 'range', min: 1, max: 300, step: 0.5, unit: 'px', nmax: 5000 },
+      { k: 'brush.hard', label: 'Hardness', type: 'range', min: 0, max: 100, step: 1, unit: '%' },
+      { k: 'brush.opacity', label: 'Opacity', type: 'range', min: 1, max: 100, step: 0.1, unit: '%' },
+      { k: 'brush.show', label: 'Show painted mask', type: 'check' },
+    ],
+  },
+  {
     id: 'out', title: 'Export',
     controls: [
       { k: 'out.quality', label: 'JPEG quality', type: 'range', min: 1, max: 100, step: 0.5, unit: '%' },
@@ -111,6 +134,9 @@ let viewMode = 'result';
 let holding = false;
 let diffAmp = 16;
 let zoomMode = 'fit';
+let paintMode = false;
+let strokes = [];        // noise mask strokes, normalised to output size
+let curStroke = null;
 const CTRL = {};
 
 function getPath(o, k) { return k.split('.').reduce((a, p) => (a == null ? a : a[p]), o); }
@@ -138,7 +164,7 @@ function fmt(v, step) { return (+v).toFixed(decimals(step)); }
 function makeControl(c) {
   const row = document.createElement('div');
   row.className = 'ctl ' + c.type + (c.sub ? ' sub' : '') + (c.group === 'start' ? ' group' : '');
-  const def = getPath(DEFAULTS, c.k);
+  const def = c.k ? getPath(DEFAULTS, c.k) : undefined;
 
   if (c.type === 'range') {
     const lab = document.createElement('label');
@@ -160,6 +186,14 @@ function makeControl(c) {
     });
     n.addEventListener('change', () => { const v = parseFloat(n.value); set(Number.isFinite(v) ? v : def, true); });
     lab.addEventListener('dblclick', () => set(def, true));
+    if (c.nmax != null) n.max = c.nmax;
+    if (c.extra === 'seed') {
+      u.textContent = '';
+      const dice = document.createElement('button');
+      dice.type = 'button'; dice.className = 'mini dice'; dice.textContent = '⟳'; dice.title = 'New random seed';
+      dice.addEventListener('click', () => set(1 + Math.floor(Math.random() * 9999), true));
+      u.append(dice);
+    }
     row.append(lab, r, n, u);
     CTRL[c.k] = {
       set: (v) => set(v, false),
@@ -185,6 +219,14 @@ function makeControl(c) {
     t.addEventListener('input', () => update(c.k, t.value));
     row.append(lab, t);
     CTRL[c.k] = { set: (v) => { t.value = v; }, el: t };
+  } else if (c.type === 'buttons') {
+    for (const [act, text] of c.buttons) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'btn small tool'; b.textContent = text; b.dataset.act = act;
+      b.addEventListener('click', () => maskAction(act));
+      row.append(b);
+    }
+    return row;
   }
   row.dataset.k = c.k;
   return row;
@@ -222,21 +264,29 @@ function syncSubs() {
     const on = params.color[s].on;
     document.querySelectorAll(`.ctl.sub[data-k^="color.${s}."]`).forEach(el => el.classList.toggle('off', !on));
   }
+  const irr = document.querySelector('.ctl[data-k="noise.irrScale"]');
+  if (irr) irr.classList.toggle('off', !(+params.noise.irregular > 0));
+  document.querySelectorAll('.tool').forEach(b => {
+    b.classList.toggle('on', (b.dataset.act === 'paint' && paintMode && params.brush.mode === 'add') || (b.dataset.act === 'erase' && paintMode && params.brush.mode === 'erase'));
+  });
 }
 
 function resetSection(sec) {
   for (const c of sec.controls) {
-    if (c.k === 'out.name') continue;
+    if (!c.k || c.k === 'out.name') continue;
     setPath(params, c.k, clone(getPath(DEFAULTS, c.k)));
   }
   syncUI(); saveParams();
   if (sec.id !== 'out') schedule();
+  renderOverlay();
 }
 
 function update(k, v) {
   setPath(params, k, v);
   saveParams();
-  if (!k.startsWith('out.')) schedule();
+  if (k === 'noise.irregular') syncSubs();
+  if (k === 'brush.show') renderOverlay();
+  if (!NOPROCESS.some(p => k.startsWith(p))) schedule();
 }
 
 /* ---------------- worker ---------------- */
@@ -265,6 +315,8 @@ function schedule() {
 function dispatch() {
   if (!orig) return;
   const p = clone(params);
+  delete p.brush; delete p.out;
+  p.noise.strokes = strokes;
   const key = carveKeyOf(p);
   if (inflight) {
     if (inflight.needsCarve && inflight.key !== key) { makeWorker(); inflight = null; }
@@ -330,15 +382,18 @@ function seamImage() {
 function render() {
   if (!orig) return;
   let img = null, note = '';
-  const mode = holding ? 'original' : viewMode;
+  const mode = holding ? 'original' : (paintMode ? 'result' : viewMode);
   if (mode === 'original') img = orig;
   else if (mode === 'diff') { img = diffImage(); if (!img) note = 'Diff needs equal dimensions — seam carving changed the size. Showing result.'; }
   else if (mode === 'seams') { img = seamImage(); if (!mask || !mask.some(v => v)) note = 'No seams yet — set a width/height Δ.'; }
   if (!img) img = result || orig;
   if (view.width !== img.width || view.height !== img.height) { view.width = img.width; view.height = img.height; }
   vctx.putImageData(img, 0, 0);
+  if (!note && +params.noise.amount > 0 && params.noise.scope === 'inside' && !strokes.length)
+    note = 'Noise is set to painted areas only — paint on the image to place it.';
   $('#viewnote').textContent = note;
   applyZoom();
+  renderOverlay();
 }
 
 function applyZoom() {
@@ -348,11 +403,110 @@ function applyZoom() {
     const cw = stage.clientWidth - 24, ch = stage.clientHeight - 24;
     z = Math.min(cw / view.width, ch / view.height);
   } else z = +zoomMode;
-  view.style.width = Math.max(1, Math.round(view.width * z)) + 'px';
-  view.style.height = Math.max(1, Math.round(view.height * z)) + 'px';
+  const cssW = Math.max(1, Math.round(view.width * z)) + 'px', cssH = Math.max(1, Math.round(view.height * z)) + 'px';
+  view.style.width = overlay.style.width = cssW;
+  view.style.height = overlay.style.height = cssH;
   view.classList.toggle('pixelated', z >= 2);
   stage.classList.toggle('fit', zoomMode === 'fit');
 }
+
+/* ---------------- noise mask painting ---------------- */
+
+const overlay = $('#overlay');
+const octx = overlay.getContext('2d');
+const brushRing = $('#brushring');
+const wrap = $('#wrap');
+
+function drawStroke(s, from) {
+  const W = overlay.width, H = overlay.height, p = s.pts;
+  octx.save();
+  octx.globalCompositeOperation = s.mode === 'erase' ? 'destination-out' : 'source-over';
+  octx.strokeStyle = octx.fillStyle = '#ff2bd6';
+  octx.globalAlpha = s.mode === 'erase' ? 1 : Math.max(0.15, s.o);
+  const lw = Math.max(1, s.r * W * 2);
+  octx.lineWidth = lw; octx.lineCap = 'round'; octx.lineJoin = 'round';
+  if (p.length <= 2 || from === 0 && p.length <= 2) {
+    octx.beginPath(); octx.arc(p[0] * W, p[1] * H, lw / 2, 0, Math.PI * 2); octx.fill();
+  } else {
+    const st = Math.max(0, (from || 0) - 2);
+    octx.beginPath(); octx.moveTo(p[st] * W, p[st + 1] * H);
+    for (let k = st + 2; k + 1 < p.length; k += 2) octx.lineTo(p[k] * W, p[k + 1] * H);
+    octx.stroke();
+  }
+  octx.restore();
+}
+
+function renderOverlay() {
+  const show = !!result && (paintMode || params.brush.show) && !holding;
+  overlay.hidden = !show;
+  if (!show) return;
+  if (overlay.width !== view.width || overlay.height !== view.height) { overlay.width = view.width; overlay.height = view.height; }
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  for (const s of strokes) drawStroke(s, 0);
+  if (curStroke) drawStroke(curStroke, 0);
+}
+
+function setPaint(on, mode) {
+  paintMode = on;
+  if (mode) { params.brush.mode = mode; saveParams(); }
+  wrap.classList.toggle('painting', paintMode);
+  brushRing.hidden = true;
+  syncSubs();
+  render();
+}
+
+function maskAction(act) {
+  if (act === 'paint') setPaint(!(paintMode && params.brush.mode === 'add'), 'add');
+  else if (act === 'erase') setPaint(!(paintMode && params.brush.mode === 'erase'), 'erase');
+  else if (act === 'undo') { if (strokes.length) { strokes.pop(); renderOverlay(); schedule(); } }
+  else if (act === 'clear') { if (strokes.length) { strokes = []; renderOverlay(); schedule(); } }
+}
+
+function evToNorm(e) {
+  const r = view.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r];
+}
+
+function moveRing(e) {
+  if (!paintMode || !result) { brushRing.hidden = true; return; }
+  const r = view.getBoundingClientRect();
+  const d = Math.max(2, params.brush.size * (r.width / view.width));
+  const wr = wrap.getBoundingClientRect();
+  brushRing.hidden = false;
+  brushRing.style.width = brushRing.style.height = d + 'px';
+  brushRing.style.left = (e.clientX - wr.left - d / 2) + 'px';
+  brushRing.style.top = (e.clientY - wr.top - d / 2) + 'px';
+  brushRing.classList.toggle('erase', params.brush.mode === 'erase' || e.altKey);
+}
+
+wrap.addEventListener('pointerdown', (e) => {
+  if (!paintMode || !result || e.button !== 0) return;
+  e.preventDefault();
+  wrap.setPointerCapture(e.pointerId);
+  const [nx, ny] = evToNorm(e);
+  if (params.noise.scope === 'all') { params.noise.scope = 'inside'; CTRL['noise.scope'].set('inside'); saveParams(); }
+  const mode = e.altKey ? (params.brush.mode === 'erase' ? 'add' : 'erase') : params.brush.mode;
+  curStroke = { mode, r: params.brush.size / 2 / view.width, h: params.brush.hard / 100, o: params.brush.opacity / 100, pts: [nx, ny] };
+  renderOverlay();
+});
+wrap.addEventListener('pointermove', (e) => {
+  moveRing(e);
+  if (!curStroke) return;
+  const [nx, ny, r] = evToNorm(e);
+  const p = curStroke.pts, lx = p[p.length - 2], ly = p[p.length - 1];
+  const distPx = Math.hypot((nx - lx) * view.width, (ny - ly) * view.height);
+  if (distPx < 0.25 && r) return;
+  p.push(nx, ny);
+  drawStroke(curStroke, p.length - 2);
+});
+const endStroke = () => {
+  if (!curStroke) return;
+  strokes.push(curStroke); curStroke = null;
+  renderOverlay(); schedule();
+};
+wrap.addEventListener('pointerup', endStroke);
+wrap.addEventListener('pointercancel', endStroke);
+wrap.addEventListener('pointerleave', () => { brushRing.hidden = true; });
 
 /* ---------------- status ---------------- */
 
@@ -419,7 +573,7 @@ async function loadFile(file) {
     } else x.drawImage(srcImg, 0, 0);
     orig = x.getImageData(0, 0, W, H);
     origName = (file.name || 'image').replace(/\.[^.]+$/, '') || 'image';
-    result = null; mask = null;
+    result = null; mask = null; strokes = []; curStroke = null;
     $('#drop').classList.add('hidden');
     const cw = Math.max(10, Math.min(400, Math.round(W * 0.25))), ch = Math.max(10, Math.min(400, Math.round(H * 0.25)));
     CTRL['carve.dw'].setRange(-cw, cw, -(W - 2), W * 4);
@@ -471,6 +625,7 @@ $('#resetall').addEventListener('click', () => {
 
 document.querySelectorAll('#views button').forEach(b => b.addEventListener('click', () => {
   viewMode = b.dataset.view;
+  if (paintMode) { paintMode = false; wrap.classList.remove('painting'); syncSubs(); }
   document.querySelectorAll('#views button').forEach(x => x.classList.toggle('on', x === b));
   $('#ampwrap').hidden = viewMode !== 'diff';
   render();
@@ -485,7 +640,18 @@ const holdOff = () => { if (holding) { holding = false; render(); } };
 hold.addEventListener('pointerdown', holdOn);
 ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => hold.addEventListener(t, holdOff));
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) holdOn(e);
+  if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  if (e.code === 'Space') holdOn(e);
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); maskAction('undo'); }
+  else if (e.ctrlKey || e.metaKey || e.altKey) return;
+  else if (e.key === 'b' || e.key === 'B') maskAction('paint');
+  else if (e.key === 'e' || e.key === 'E') maskAction('erase');
+  else if (e.key === 'Escape' && paintMode) setPaint(false);
+  else if (e.key === '[' || e.key === ']') {
+    const s = params.brush.size, f = e.shiftKey ? 1.02 : 1.15;
+    const v = Math.min(5000, Math.max(1, Math.round((e.key === ']' ? s * f + 0.5 : s / f) * 2) / 2));
+    params.brush.size = v; CTRL['brush.size'].set(v); saveParams();
+  }
 });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') holdOff(); });
 

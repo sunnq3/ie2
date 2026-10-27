@@ -71,6 +71,17 @@ select {
     #0f1014;
 }
 .stage.fit { display: grid; place-items: center; overflow: hidden; }
+.wrap { position: relative; line-height: 0; }
+.wrap.painting { cursor: none; touch-action: none; }
+.overlay { position: absolute; left: 0; top: 0; pointer-events: none; opacity: .42; }
+.brushring {
+  position: absolute; pointer-events: none; border-radius: 50%;
+  border: 1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.7), inset 0 0 0 1px rgba(0,0,0,.4);
+}
+.brushring.erase { border-style: dashed; }
+.ctl.buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.btn.tool.on { background: #ff2bd6; color: #1a0016; border-color: transparent; font-weight: 600; }
+.mini.dice { font-size: 13px; padding: 0 5px; line-height: 18px; }
 #view { display: block; box-shadow: 0 0 0 1px var(--line), 0 10px 40px rgba(0,0,0,.5); }
 #view[width="0"] { display: none; }
 #view.pixelated { image-rendering: pixelated; }

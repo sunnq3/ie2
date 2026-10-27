@@ -13,6 +13,8 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
 
 5. **Upscale → downscale** — enlarge up to 6× (0.01 steps; bicubic, Lanczos 3, Mitchell, bilinear, nearest), optionally store the enlarged image at 8-bit, then shrink to a final size (100 % = same size; 1–600 %) with Lanczos 3, bicubic, Mitchell, bilinear, box or nearest.
 
+6. **Noise distribution** — Gaussian, uniform, Laplacian, impulse (± specks) or shot (brightness-dependent) noise. Amount in 8-bit levels (0.01 steps), density, colour vs. mono, grain size, irregularity (patchy low-frequency modulation with adjustable patch size) and a seed. Apply it to the whole image, only to painted areas, or everywhere except painted areas. Paint the mask on the image with a soft brush (size, hardness, opacity), erase with Alt-drag or the Erase tool, Undo / Clear. Shortcuts: B paint, E erase, [ ] brush size (Shift for fine), Ctrl/⌘+Z undo, Esc stop painting.
+
 Then **Export JPG** with adjustable quality.
 
 ## Viewer

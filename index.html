@@ -42,7 +42,11 @@
       </select>
     </div>
     <div id="stage" class="stage fit">
-      <canvas id="view" width="0" height="0"></canvas>
+      <div id="wrap" class="wrap">
+        <canvas id="view" width="0" height="0"></canvas>
+        <canvas id="overlay" class="overlay" hidden></canvas>
+        <div id="brushring" class="brushring" hidden></div>
+      </div>
       <button id="drop" class="drop" type="button">
         <strong>Drop, paste or click to open an image</strong>
         <span>JPG · PNG · WebP · AVIF · GIF · BMP · SVG · HEIC · TIFF — processed locally, nothing is uploaded</span>

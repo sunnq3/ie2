@@ -6,12 +6,13 @@
 
 let SRC = null;   // { w, h, data: Uint8ClampedArray RGBA }
 let CACHE = null; // { key, w, h, data, mask }
+let PRE = null;   // output of everything before the noise stage { key, data, w, h }
 
 self.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'load') {
     SRC = { w: m.w, h: m.h, data: new Uint8ClampedArray(m.buffer) };
-    CACHE = null;
+    CACHE = null; PRE = null;
   } else if (m.type === 'process') {
     try { runJob(m.id, m.params); }
     catch (err) { self.postMessage({ type: 'error', id: m.id, message: (err && err.message) || String(err) }); }
@@ -32,13 +33,19 @@ function runJob(id, P) {
     CACHE.key = key;
     recarved = true;
   }
-  const { w, h } = CACHE;
-  progress(id, 'Resampling', 0.5);
-  const out = resample(CACHE.data, w, h, P.lens, P.ca);
-  colorRoundtrip(out, w, h, P.color, id);
-  const fin = rescale(out, w, h, P.scale, id);
-  const msg = { type: 'result', id, w: fin.w, h: fin.h, buffer: fin.data.buffer, ms: performance.now() - t0, carveKey: key };
-  const transfer = [fin.data.buffer];
+  const preKey = key + '|' + JSON.stringify([P.lens, P.ca, P.color, P.scale]);
+  if (recarved || !PRE || PRE.key !== preKey) {
+    const { w, h } = CACHE;
+    progress(id, 'Resampling', 0.5);
+    const out = resample(CACHE.data, w, h, P.lens, P.ca);
+    colorRoundtrip(out, w, h, P.color, id);
+    const fin = rescale(out, w, h, P.scale, id);
+    PRE = { key: preKey, data: fin.data, w: fin.w, h: fin.h };
+  }
+  const outData = PRE.data.slice();
+  addNoise(outData, PRE.w, PRE.h, P.noise, id);
+  const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: outData.buffer, ms: performance.now() - t0, carveKey: key };
+  const transfer = [outData.buffer];
   if (recarved) { const mk = CACHE.mask.slice(); msg.mask = mk.buffer; transfer.push(mk.buffer); }
   self.postMessage(msg, transfer);
 }
@@ -608,5 +615,149 @@ function rescale(d, w, h, S, id) {
   return { data: out, w: fw, h: fh };
 }
 
+/* ------------------------------------------------------------------ */
+/* 6. Noise distribution (with painted mask)                            */
+/* ------------------------------------------------------------------ */
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(x, y, s) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(s, 1442695041)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const a = hash2(xi, yi, s), b = hash2(xi + 1, yi, s), c = hash2(xi, yi + 1, s), d = hash2(xi + 1, yi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+// Rasterise brush strokes (normalised coords) into a 0..1 mask at w x h
+function rasterMask(strokes, w, h) {
+  const m = new Float32Array(w * h);
+  for (const s of strokes) {
+    const R = Math.max(0.7072, (+s.r || 0) * w);
+    const inner = R * Math.min(1, Math.max(0, +s.h || 0));
+    const op = Math.min(1, Math.max(0, s.o == null ? 1 : +s.o));
+    const erase = s.mode === 'erase';
+    const pts = s.pts || [];
+    const stamp = (cx, cy) => {
+      const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(w - 1, Math.ceil(cx + R));
+      const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(h - 1, Math.ceil(cy + R));
+      for (let y = y0; y <= y1; y++) {
+        const dy = y + 0.5 - cy;
+        for (let x = x0; x <= x1; x++) {
+          const dx = x + 0.5 - cx, d = Math.sqrt(dx * dx + dy * dy);
+          if (d >= R) continue;
+          let a = d <= inner ? 1 : 1 - (d - inner) / (R - inner);
+          a = a * a * (3 - 2 * a) * op;
+          const i = y * w + x;
+          if (erase) { const v = 1 - a; if (v < m[i]) m[i] = v; } else if (a > m[i]) m[i] = a;
+        }
+      }
+    };
+    if (pts.length < 2) continue;
+    let px = pts[0] * w, py = pts[1] * h;
+    stamp(px, py);
+    const step = Math.max(0.35, R * 0.2);
+    for (let k = 2; k + 1 < pts.length; k += 2) {
+      const qx = pts[k] * w, qy = pts[k + 1] * h;
+      const len = Math.hypot(qx - px, qy - py), n = Math.ceil(len / step);
+      for (let j = 1; j <= n; j++) stamp(px + (qx - px) * j / n, py + (qy - py) * j / n);
+      px = qx; py = qy;
+    }
+  }
+  return m;
+}
+
+function addNoise(d, w, h, N, id) {
+  if (!N) return;
+  const amp = +N.amount || 0;
+  if (!(amp > 0)) return;
+  const scope = N.scope || 'all';
+  let mask = null;
+  if (scope !== 'all') {
+    if (scope === 'inside' && !(N.strokes && N.strokes.length)) return;
+    progress(id, 'Noise mask', 0.2);
+    mask = rasterMask(N.strokes || [], w, h);
+  }
+  progress(id, 'Noise', 0.5);
+  const type = N.type || 'gaussian';
+  const dens = Math.min(1, Math.max(0, (N.density == null ? 100 : +N.density) / 100));
+  const ch = Math.min(1, Math.max(0, (+N.chroma || 0) / 100));
+  const g = Math.max(1, +N.grain || 1);
+  const irr = Math.min(1, Math.max(0, (+N.irregular || 0) / 100));
+  const iS = Math.max(1, +N.irrScale || 32);
+  const seed = Math.round(+N.seed || 1);
+
+  const rA = mulberry32(seed * 2654435761), rD = mulberry32((seed ^ 0x5bd1e995) * 2246822519);
+  let spare = null;
+  const gauss = () => {
+    if (spare !== null) { const v = spare; spare = null; return v; }
+    let u = rA(); if (u < 1e-12) u = 1e-12;
+    const v = rA(), r = Math.sqrt(-2 * Math.log(u));
+    spare = r * Math.sin(2 * Math.PI * v);
+    return r * Math.cos(2 * Math.PI * v);
+  };
+  const draw = type === 'uniform' ? () => (rA() * 2 - 1) * 1.7320508
+    : type === 'laplacian' ? () => { const u = rA() - 0.5, a = Math.max(1e-12, 1 - 2 * Math.abs(u)); return (u < 0 ? 1 : -1) * Math.log(a) / Math.SQRT2; }
+    : type === 'impulse' ? () => (rA() < 0.5 ? -1 : 1)
+    : gauss;
+  const shot = type === 'shot';
+
+  // Coarse fields for grain > 1
+  let F = null, gw = 0, gh = 0, comp = 1;
+  if (g > 1) {
+    gw = Math.ceil(w / g) + 2; gh = Math.ceil(h / g) + 2;
+    F = [new Float32Array(gw * gh), new Float32Array(gw * gh), new Float32Array(gw * gh), new Float32Array(gw * gh)];
+    for (let i = 0; i < gw * gh; i++) { F[0][i] = draw(); F[1][i] = draw(); F[2][i] = draw(); F[3][i] = draw(); }
+    comp = 1 + 0.5 * Math.min(1, g - 1);
+  }
+  const sampleF = (f, x, y) => {
+    const gx = x / g, gy = y / g, xi = gx | 0, yi = gy | 0, fx = gx - xi, fy = gy - yi, o = yi * gw + xi;
+    const a = f[o] + (f[o + 1] - f[o]) * fx, b = f[o + gw] + (f[o + gw + 1] - f[o + gw]) * fx;
+    return (a + (b - a) * fy) * comp;
+  };
+
+  let last = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x, i = p * 4;
+      // consume randoms in a fixed order so the pattern is stable while you paint
+      let nm, n0, n1, n2;
+      if (F) { nm = sampleF(F[0], x, y); n0 = sampleF(F[1], x, y); n1 = sampleF(F[2], x, y); n2 = sampleF(F[3], x, y); }
+      else { nm = draw(); n0 = draw(); n1 = draw(); n2 = draw(); }
+      const dr = rD();
+      let wgt = 1;
+      if (mask) { wgt = scope === 'inside' ? mask[p] : 1 - mask[p]; if (wgt <= 0) continue; }
+      let mult = 1;
+      if (irr > 0) {
+        const V = vnoise(x / iS, y / iS, seed) * 0.65 + vnoise(2 * x / iS, 2 * y / iS, seed + 7) * 0.35;
+        mult = 1 + irr * (2 * V - 1) * 1.6;
+        if (mult <= 0) continue;
+      }
+      if (dr >= dens * Math.min(1, mult)) continue;
+      const A = amp * wgt * mult;
+      const a0 = (1 - ch) * nm + ch * n0, a1 = (1 - ch) * nm + ch * n1, a2 = (1 - ch) * nm + ch * n2;
+      if (shot) {
+        d[i] = d[i] + a0 * A * Math.sqrt(Math.max(d[i], 1) / 128);
+        d[i + 1] = d[i + 1] + a1 * A * Math.sqrt(Math.max(d[i + 1], 1) / 128);
+        d[i + 2] = d[i + 2] + a2 * A * Math.sqrt(Math.max(d[i + 2], 1) / 128);
+      } else {
+        d[i] = d[i] + a0 * A; d[i + 1] = d[i + 1] + a1 * A; d[i + 2] = d[i + 2] + a2 * A;
+      }
+    }
+    if ((y & 63) === 0) { const t = performance.now(); if (t - last > 80) { last = t; progress(id, 'Noise', 0.5 + 0.5 * y / h); } }
+  }
+}
+
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale };
+if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask };
