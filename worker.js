@@ -7,12 +7,13 @@
 let SRC = null;   // { w, h, data: Uint8ClampedArray RGBA }
 let CACHE = null; // { key, w, h, data, mask }
 let PRE = null;   // output of everything before the noise stage { key, data, w, h }
+let CLEAN = null; // cleaned source { key, data }
 
 self.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'load') {
     SRC = { w: m.w, h: m.h, data: new Uint8ClampedArray(m.buffer) };
-    CACHE = null; PRE = null;
+    CACHE = null; PRE = null; CLEAN = null;
   } else if (m.type === 'process') {
     try { runJob(m.id, m.params); }
     catch (err) { self.postMessage({ type: 'error', id: m.id, message: (err && err.message) || String(err) }); }
@@ -26,20 +27,30 @@ function carveKey(C) { return `${Math.round(+C.dw || 0)}|${Math.round(+C.dh || 0
 function runJob(id, P) {
   if (!SRC) throw new Error('No image loaded');
   const t0 = performance.now();
-  const key = carveKey(P.carve);
+  const C = P.clean || {};
+  const cleanOn = cleanActive(C);
+  const startClean = cleanOn && C.position !== 'end';
+  const ck = startClean ? JSON.stringify(C) : '';
+  if (!CLEAN || CLEAN.key !== ck) {
+    CLEAN = { key: ck, data: startClean ? cleanup(SRC.data.slice(), SRC.w, SRC.h, C, id) : SRC.data };
+    CACHE = null;
+  }
+  const key = carveKey(P.carve) + '#' + ck;
   let recarved = false;
   if (!CACHE || CACHE.key !== key) {
-    CACHE = carve(SRC, P.carve, id);
+    CACHE = carve({ w: SRC.w, h: SRC.h, data: CLEAN.data }, P.carve, id);
     CACHE.key = key;
     recarved = true;
   }
-  const preKey = key + '|' + JSON.stringify([P.lens, P.ca, P.color, P.scale]);
+  const endClean = cleanOn && C.position === 'end';
+  const preKey = key + '|' + JSON.stringify([P.lens, P.ca, P.color, P.scale, endClean ? C : 0]);
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
     progress(id, 'Resampling', 0.5);
     const out = resample(CACHE.data, w, h, P.lens, P.ca);
     colorRoundtrip(out, w, h, P.color, id);
     const fin = rescale(out, w, h, P.scale, id);
+    if (endClean) cleanup(fin.data, fin.w, fin.h, C, id);
     PRE = { key: preKey, data: fin.data, w: fin.w, h: fin.h };
   }
   const outData = PRE.data.slice();
@@ -759,5 +770,223 @@ function addNoise(d, w, h, N, id) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 0. Clean-up: deblock, periodic-pattern removal, deband               */
+/* ------------------------------------------------------------------ */
+
+function cleanActive(C) {
+  return !!(C && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on)));
+}
+
+function cleanup(d, w, h, C, id) {
+  if (C.deblock && C.deblock.on) { progress(id, 'Deblocking', 0.1); deblock(d, w, h, C.deblock); }
+  if (C.pattern && C.pattern.on) depattern(d, w, h, C.pattern, id);
+  if (C.deband && C.deband.on) { progress(id, 'Debanding', 0.9); deband(d, w, h, C.deband); }
+  return d;
+}
+
+// JPEG 8x8 block-edge smoothing (H.264-style, only where the edge is a small step on flat sides)
+function deblock(d, w, h, B) {
+  const s = Math.min(1, Math.max(0, (+B.strength || 0) / 100));
+  const thr = Math.max(0.1, +B.threshold || 6);
+  const beta = thr * 0.5 + 0.5;
+  const L = (i) => 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  const f = new Float32Array(8 * 3);
+  // q0 = first pixel after the block boundary, st = stride between pixels across the edge
+  const edge = (q0i, st) => {
+    const lp0 = L(q0i - st), lq0 = L(q0i);
+    const step = Math.abs(lp0 - lq0);
+    if (step === 0 || step >= thr) return;
+    let flat = true, weakOk = true;
+    for (let k = 1; k < 4; k++) {
+      const dp = Math.abs(L(q0i - (k + 1) * st) - lp0), dq = Math.abs(L(q0i + k * st) - lq0);
+      if (dp >= beta || dq >= beta) { flat = false; if (k === 1) weakOk = false; }
+    }
+    if (!weakOk) return;
+    for (let c = 0; c < 3; c++) {
+      if (flat) {
+        // spread the step as an even ramp across both half-blocks
+        const dlt = (d[q0i + c] - d[q0i - st + c]) * s / 9;
+        for (let k = 0; k < 4; k++) {
+          d[q0i - (k + 1) * st + c] += dlt * (4 - k);
+          d[q0i + k * st + c] -= dlt * (4 - k);
+        }
+      } else {
+        const p1 = d[q0i - 2 * st + c], p0 = d[q0i - st + c], q0 = d[q0i + c], q1 = d[q0i + st + c];
+        let delta = ((q0 - p0) * 4 + (p1 - q1)) / 8;
+        if (delta > thr) delta = thr; else if (delta < -thr) delta = -thr;
+        delta *= s;
+        d[q0i - st + c] = p0 + delta; d[q0i + c] = q0 - delta;
+        d[q0i - 2 * st + c] = p1 + delta / 2; d[q0i + st + c] = q1 - delta / 2;
+      }
+    }
+  };
+  for (let y = 0; y < h; y++) for (let x = 8; x + 3 < w; x += 8) edge((y * w + x) * 4, 4);
+  for (let y = 8; y + 3 < h; y += 8) for (let x = 0; x < w; x++) edge((y * w + x) * 4, w * 4);
+}
+
+// Gradient debanding (flash3kyuu-style): replace pixels in flat areas with the mean of 4 random
+// neighbours at distance <= radius, then re-quantise with triangular dither so bands don't return.
+function deband(d, w, h, D) {
+  const R = Math.max(1, +D.radius || 16);
+  const thr = Math.max(0.05, +D.threshold || 3);
+  const grain = Math.max(0, +D.grain || 0);
+  const passes = Math.max(1, Math.min(4, Math.round(+D.passes || 1)));
+  const rnd = mulberry32(0x2545F491);
+  const cx = (v) => (v < 0 ? 0 : v >= w ? w - 1 : v), cy = (v) => (v < 0 ? 0 : v >= h ? h - 1 : v);
+  for (let pass = 0; pass < passes; pass++) {
+    const src = d.slice();
+    const rad = Math.max(1, R / (pass + 1));
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const a = rnd() * 6.283185307, dist = 1 + rnd() * (rad - 1);
+        const dx = Math.round(Math.cos(a) * dist), dy = Math.round(Math.sin(a) * dist);
+        const i = (y * w + x) * 4;
+        const s0 = (cy(y + dy) * w + cx(x + dx)) * 4, s1 = (cy(y - dy) * w + cx(x - dx)) * 4;
+        const s2 = (cy(y + dx) * w + cx(x - dy)) * 4, s3 = (cy(y - dx) * w + cx(x + dy)) * 4;
+        let ok = true;
+        for (let c = 0; c < 3 && ok; c++) {
+          const p = src[i + c];
+          if (Math.abs(src[s0 + c] - p) > thr || Math.abs(src[s1 + c] - p) > thr ||
+              Math.abs(src[s2 + c] - p) > thr || Math.abs(src[s3 + c] - p) > thr) ok = false;
+        }
+        const n1 = rnd(), n2 = rnd();
+        if (!ok) continue;
+        const dt = (n1 - n2) * grain;
+        for (let c = 0; c < 3; c++) {
+          const m = (src[s0 + c] + src[s1 + c] + src[s2 + c] + src[s3 + c]) / 4;
+          d[i + c] = m + dt + (rnd() - 0.5) * 0.5;
+        }
+      }
+    }
+  }
+}
+
+// --- FFT ---
+const FFTP = {};
+function fftPlan(n) {
+  if (FFTP[n]) return FFTP[n];
+  const bits = Math.log2(n), rev = new Uint32Array(n);
+  for (let i = 0; i < n; i++) { let r = 0; for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b); rev[i] = r; }
+  const cs = new Float64Array(n / 2), sn = new Float64Array(n / 2);
+  for (let k = 0; k < n / 2; k++) { cs[k] = Math.cos(2 * Math.PI * k / n); sn[k] = Math.sin(2 * Math.PI * k / n); }
+  return (FFTP[n] = { rev, cs, sn });
+}
+function fft1(re, im, n, inv, P) {
+  const { rev, cs, sn } = P;
+  for (let i = 0; i < n; i++) { const j = rev[i]; if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let size = 2; size <= n; size <<= 1) {
+    const half = size >> 1, step = n / size;
+    for (let i = 0; i < n; i += size) {
+      for (let j = 0, k = 0; j < half; j++, k += step) {
+        const a = i + j, b = a + half, c = cs[k], s = inv ? -sn[k] : sn[k];
+        const tr = re[b] * c + im[b] * s, ti = im[b] * c - re[b] * s;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+      }
+    }
+  }
+}
+function fft2(re, im, T, inv, P, cr, ci) {
+  for (let r = 0; r < T; r++) fft1(re.subarray(r * T, r * T + T), im.subarray(r * T, r * T + T), T, inv, P);
+  for (let c = 0; c < T; c++) {
+    for (let r = 0; r < T; r++) { cr[r] = re[r * T + c]; ci[r] = im[r * T + c]; }
+    fft1(cr, ci, T, inv, P);
+    for (let r = 0; r < T; r++) { re[r * T + c] = cr[r]; im[r * T + c] = ci[r]; }
+  }
+}
+
+// Periodic-pattern suppression: overlapped windowed tiles, find spectral peaks that stand out from
+// their neighbourhood (moiré, halftone dots, screen grids, scan lines, JPEG grid) and pull them down.
+function depattern(d, w, h, Q, id) {
+  const T = [128, 256, 512].includes(+Q.tile) ? +Q.tile : 256;
+  const sens = Math.log(Math.max(1.05, +Q.sensitivity || 4));
+  const str = Math.min(1, Math.max(0, (Q.strength == null ? 100 : +Q.strength) / 100));
+  const prot = Math.max(0, (+Q.protect || 0) / 100) * (T / 2);
+  const P = fftPlan(T), hop = T / 2, N = T * T;
+  const win = new Float64Array(T);
+  for (let i = 0; i < T; i++) win[i] = Math.sqrt(0.5 - 0.5 * Math.cos(2 * Math.PI * i / T));
+  const out = new Float32Array(w * h * 3);
+  const r1 = new Float64Array(N), i1 = new Float64Array(N), r2 = new Float64Array(N), i2 = new Float64Array(N);
+  const Lg = new Float64Array(N), tmp = new Float64Array(N), Bg = new Float64Array(N), fac = new Float64Array(N);
+  const cr = new Float64Array(T), ci = new Float64Array(T);
+  const K = 4; // background box radius in bins
+  const freq = (u) => (u <= T / 2 ? u : u - T);
+  const protMask = new Uint8Array(N);
+  for (let v = 0; v < T; v++) for (let u = 0; u < T; u++) {
+    const fu = freq(u), fv = freq(v);
+    protMask[v * T + u] = fu * fu + fv * fv <= prot * prot || (Math.abs(fu) <= 1 && Math.abs(fv) <= 1) ? 1 : 0;
+  }
+  const tilesX = Math.ceil((w + hop) / hop), tilesY = Math.ceil((h + hop) / hop);
+  let done = 0, last = 0;
+  for (let ty = -hop; ty < h; ty += hop) {
+    for (let tx = -hop; tx < w; tx += hop) {
+      for (let y = 0; y < T; y++) {
+        const sy = Math.min(h - 1, Math.max(0, ty + y)), wy = win[y];
+        for (let x = 0; x < T; x++) {
+          const sx = Math.min(w - 1, Math.max(0, tx + x)), wv = wy * win[x], si = (sy * w + sx) * 4, o = y * T + x;
+          const R = d[si], G = d[si + 1], Bb = d[si + 2];
+          r1[o] = R * wv; i1[o] = G * wv; r2[o] = Bb * wv; i2[o] = (0.299 * R + 0.587 * G + 0.114 * Bb) * wv;
+        }
+      }
+      fft2(r1, i1, T, false, P, cr, ci);
+      fft2(r2, i2, T, false, P, cr, ci);
+      // |Y| from packed B + iY spectrum
+      for (let v = 0; v < T; v++) {
+        const mv = ((T - v) % T) * T;
+        for (let u = 0; u < T; u++) {
+          const k = v * T + u, mk = mv + ((T - u) % T);
+          const yr = (i2[k] + i2[mk]) * 0.5, yi = (r2[mk] - r2[k]) * 0.5;
+          Lg[k] = Math.log(Math.sqrt(yr * yr + yi * yi) + 1e-6);
+        }
+      }
+      // background = wrapped box blur of log-magnitude
+      for (let v = 0; v < T; v++) {
+        const row = v * T;
+        let s = 0;
+        for (let k = -K; k <= K; k++) s += Lg[row + ((k + T) % T)];
+        for (let u = 0; u < T; u++) {
+          tmp[row + u] = s;
+          s += Lg[row + ((u + K + 1) % T)] - Lg[row + ((u - K + T) % T)];
+        }
+      }
+      for (let u = 0; u < T; u++) {
+        let s = 0;
+        for (let k = -K; k <= K; k++) s += tmp[((k + T) % T) * T + u];
+        for (let v = 0; v < T; v++) {
+          Bg[v * T + u] = s / ((2 * K + 1) * (2 * K + 1));
+          s += tmp[((v + K + 1) % T) * T + u] - tmp[((v - K + T) % T) * T + u];
+        }
+      }
+      let any = false;
+      for (let k = 0; k < N; k++) {
+        const ex = Lg[k] - Bg[k];
+        if (protMask[k] || ex <= sens) fac[k] = 1;
+        else { fac[k] = Math.exp(-(ex - sens * 0.5) * str); any = true; }
+      }
+      if (any) {
+        for (let k = 0; k < N; k++) { const f = fac[k]; r1[k] *= f; i1[k] *= f; r2[k] *= f; i2[k] *= f; }
+      }
+      fft2(r1, i1, T, true, P, cr, ci);
+      fft2(r2, i2, T, true, P, cr, ci);
+      const sc = 1 / N;
+      for (let y = 0; y < T; y++) {
+        const sy = ty + y;
+        if (sy < 0 || sy >= h) continue;
+        const wy = win[y];
+        for (let x = 0; x < T; x++) {
+          const sx = tx + x;
+          if (sx < 0 || sx >= w) continue;
+          const wv = wy * win[x] * sc, o = y * T + x, p = (sy * w + sx) * 3;
+          out[p] += r1[o] * wv; out[p + 1] += i1[o] * wv; out[p + 2] += r2[o] * wv;
+        }
+      }
+      done++;
+      const t = performance.now();
+      if (t - last > 100) { last = t; progress(id, 'Removing patterns', done / (tilesX * tilesY)); }
+    }
+  }
+  for (let p = 0, i = 0; p < w * h; p++, i += 4) { d[i] = out[p * 3]; d[i + 1] = out[p * 3 + 1]; d[i + 2] = out[p * 3 + 2]; }
+}
+
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask };
+if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };

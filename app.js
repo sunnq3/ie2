@@ -4,6 +4,12 @@ const $ = (s) => document.querySelector(s);
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 const DEFAULTS = {
+  clean: {
+    position: 'start',
+    deblock: { on: false, threshold: 8, strength: 100 },
+    pattern: { on: false, sensitivity: 4, strength: 100, protect: 6, tile: '256' },
+    deband: { on: false, radius: 16, threshold: 3, grain: 0.6, passes: 1 },
+  },
   carve: { dw: 0, dh: 0, energy: 'forward' },
   lens: { k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'bicubic' },
   ca: { rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0, gs: 0, bs: 0 },
@@ -18,12 +24,32 @@ const DEFAULTS = {
   },
   scale: { up: 1, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   noise: { amount: 0, type: 'gaussian', density: 100, chroma: 0, grain: 1, irregular: 0, irrScale: 32, seed: 1, scope: 'all' },
-  brush: { size: 24, hard: 50, opacity: 100, mode: 'add', show: true },
+  brush: { size: 24, hard: 50, opacity: 100, mode: 'add', display: 'outline' },
   out: { quality: 92, name: '' },
 };
 const NOPROCESS = ['out.', 'brush.'];
 
 const SCHEMA = [
+  {
+    id: 'clean', title: '0 · Clean up banding & patterns',
+    note: 'Removes JPEG block edges, repeating patterns (moiré, halftone dots, grids, scan lines) and gradient banding. Use Diff to see exactly what changed.',
+    controls: [
+      { k: 'clean.position', label: 'Run', type: 'select', options: [['start', 'First (fix the source image)'], ['end', 'After colour & scale, before noise']] },
+      { k: 'clean.deblock.on', label: 'Deblock (JPEG 8×8 grid)', type: 'check', group: 'start' },
+      { k: 'clean.deblock.threshold', label: 'Max step', type: 'range', min: 1, max: 30, step: 0.1, unit: 'lvl', sub: true },
+      { k: 'clean.deblock.strength', label: 'Strength', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
+      { k: 'clean.pattern.on', label: 'Remove repeating patterns', type: 'check', group: 'start' },
+      { k: 'clean.pattern.sensitivity', label: 'Threshold', type: 'range', min: 1.5, max: 20, step: 0.1, unit: '×', sub: true },
+      { k: 'clean.pattern.strength', label: 'Strength', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
+      { k: 'clean.pattern.protect', label: 'Keep detail <', type: 'range', min: 0, max: 40, step: 0.1, unit: '%', sub: true },
+      { k: 'clean.pattern.tile', label: 'Window', type: 'select', sub: true, options: [['128', '128 px (local)'], ['256', '256 px'], ['512', '512 px (fine frequencies)']] },
+      { k: 'clean.deband.on', label: 'Deband gradients', type: 'check', group: 'start' },
+      { k: 'clean.deband.radius', label: 'Radius', type: 'range', min: 2, max: 64, step: 1, unit: 'px', sub: true },
+      { k: 'clean.deband.threshold', label: 'Threshold', type: 'range', min: 0.5, max: 12, step: 0.1, unit: 'lvl', sub: true },
+      { k: 'clean.deband.grain', label: 'Dither', type: 'range', min: 0, max: 3, step: 0.01, unit: 'lvl', sub: true },
+      { k: 'clean.deband.passes', label: 'Passes', type: 'range', min: 1, max: 4, step: 1, sub: true },
+    ],
+  },
   {
     id: 'carve', title: '1 · Content-aware scale',
     note: 'Seam carving. Negative removes, positive inserts low-energy pixel paths. Values are pixels.',
@@ -111,7 +137,7 @@ const SCHEMA = [
       { k: 'brush.size', label: 'Brush size', type: 'range', min: 1, max: 300, step: 0.5, unit: 'px', nmax: 5000 },
       { k: 'brush.hard', label: 'Hardness', type: 'range', min: 0, max: 100, step: 1, unit: '%' },
       { k: 'brush.opacity', label: 'Opacity', type: 'range', min: 1, max: 100, step: 0.1, unit: '%' },
-      { k: 'brush.show', label: 'Show painted mask', type: 'check' },
+      { k: 'brush.display', label: 'Mask view', type: 'select', options: [['outline', 'Thin outline'], ['tint', 'Tinted fill'], ['hidden', 'Hidden']] },
     ],
   },
   {
@@ -259,11 +285,11 @@ function syncUI() {
 }
 
 function syncSubs() {
-  // dim the sub-controls of disabled colour stages
-  for (const s of ['linear', 'p3', 'lab', 'hsv', 'hsl', 'ycc']) {
-    const on = params.color[s].on;
-    document.querySelectorAll(`.ctl.sub[data-k^="color.${s}."]`).forEach(el => el.classList.toggle('off', !on));
-  }
+  // dim the sub-controls of disabled stages (any "<prefix>.on" checkbox)
+  document.querySelectorAll('.ctl.check[data-k$=".on"]').forEach(cb => {
+    const pre = cb.dataset.k.slice(0, -2), on = !!getPath(params, cb.dataset.k);
+    document.querySelectorAll(`.ctl.sub[data-k^="${pre}"]`).forEach(el => el.classList.toggle('off', !on));
+  });
   const irr = document.querySelector('.ctl[data-k="noise.irrScale"]');
   if (irr) irr.classList.toggle('off', !(+params.noise.irregular > 0));
   document.querySelectorAll('.tool').forEach(b => {
@@ -278,14 +304,14 @@ function resetSection(sec) {
   }
   syncUI(); saveParams();
   if (sec.id !== 'out') schedule();
-  renderOverlay();
+  requestOverlay(true);
 }
 
 function update(k, v) {
   setPath(params, k, v);
   saveParams();
   if (k === 'noise.irregular') syncSubs();
-  if (k === 'brush.show') renderOverlay();
+  if (k === 'brush.display') requestOverlay(true);
   if (!NOPROCESS.some(p => k.startsWith(p))) schedule();
 }
 
@@ -293,7 +319,12 @@ function update(k, v) {
 
 let worker = null, jobId = 0, inflight = null, pending = false, workerCarveKey = null, timer = 0;
 
-function carveKeyOf(p) { return `${Math.round(+p.carve.dw || 0)}|${Math.round(+p.carve.dh || 0)}|${p.carve.energy}`; }
+function cleanOn(C) { return !!(C && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on))); }
+// must match the key the worker builds
+function carveKeyOf(p) {
+  const ck = cleanOn(p.clean) && p.clean.position !== 'end' ? JSON.stringify(p.clean) : '';
+  return `${Math.round(+p.carve.dw || 0)}|${Math.round(+p.carve.dh || 0)}|${p.carve.energy}#${ck}`;
+}
 
 function makeWorker() {
   if (worker) worker.terminate();
@@ -417,33 +448,87 @@ const octx = overlay.getContext('2d');
 const brushRing = $('#brushring');
 const wrap = $('#wrap');
 
-function drawStroke(s, from) {
-  const W = overlay.width, H = overlay.height, p = s.pts;
-  octx.save();
-  octx.globalCompositeOperation = s.mode === 'erase' ? 'destination-out' : 'source-over';
-  octx.strokeStyle = octx.fillStyle = '#ff2bd6';
-  octx.globalAlpha = s.mode === 'erase' ? 1 : Math.max(0.15, s.o);
+// Mask strokes are drawn into offscreen canvases at *screen* resolution, then shown either as a
+// thin outline (default), a light tint, or not at all — so you can see the actual result.
+const maskC = document.createElement('canvas'), maskX = maskC.getContext('2d');
+const combC = document.createElement('canvas'), combX = combC.getContext('2d');
+const ringC = document.createElement('canvas'), ringX = ringC.getContext('2d');
+let maskDirty = true, ovRaf = 0;
+
+function drawStroke(ctx, s, W, H) {
+  const p = s.pts;
+  ctx.save();
+  ctx.globalCompositeOperation = s.mode === 'erase' ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = ctx.fillStyle = '#000';
   const lw = Math.max(1, s.r * W * 2);
-  octx.lineWidth = lw; octx.lineCap = 'round'; octx.lineJoin = 'round';
-  if (p.length <= 2 || from === 0 && p.length <= 2) {
-    octx.beginPath(); octx.arc(p[0] * W, p[1] * H, lw / 2, 0, Math.PI * 2); octx.fill();
+  ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (p.length <= 2) {
+    ctx.beginPath(); ctx.arc(p[0] * W, p[1] * H, lw / 2, 0, Math.PI * 2); ctx.fill();
   } else {
-    const st = Math.max(0, (from || 0) - 2);
-    octx.beginPath(); octx.moveTo(p[st] * W, p[st + 1] * H);
-    for (let k = st + 2; k + 1 < p.length; k += 2) octx.lineTo(p[k] * W, p[k + 1] * H);
-    octx.stroke();
+    ctx.beginPath(); ctx.moveTo(p[0] * W, p[1] * H);
+    for (let k = 2; k + 1 < p.length; k += 2) ctx.lineTo(p[k] * W, p[k + 1] * H);
+    ctx.stroke();
   }
-  octx.restore();
+  ctx.restore();
+}
+
+function requestOverlay(dirty) {
+  if (dirty) maskDirty = true;
+  if (!ovRaf) ovRaf = requestAnimationFrame(() => { ovRaf = 0; renderOverlay(); });
+}
+
+function ring(src, off, color, W, H) {
+  ringX.globalCompositeOperation = 'source-over';
+  ringX.clearRect(0, 0, W, H);
+  for (let a = 0; a < 8; a++) {
+    const t = a * Math.PI / 4;
+    ringX.drawImage(src, Math.cos(t) * off, Math.sin(t) * off);
+  }
+  ringX.globalCompositeOperation = 'destination-out';
+  ringX.drawImage(src, 0, 0);
+  ringX.globalCompositeOperation = 'source-in';
+  ringX.fillStyle = color; ringX.fillRect(0, 0, W, H);
+  ringX.globalCompositeOperation = 'source-over';
+  octx.drawImage(ringC, 0, 0);
 }
 
 function renderOverlay() {
-  const show = !!result && (paintMode || params.brush.show) && !holding;
-  overlay.hidden = !show;
-  if (!show) return;
-  if (overlay.width !== view.width || overlay.height !== view.height) { overlay.width = view.width; overlay.height = view.height; }
-  octx.clearRect(0, 0, overlay.width, overlay.height);
-  for (const s of strokes) drawStroke(s, 0);
-  if (curStroke) drawStroke(curStroke, 0);
+  const disp = params.brush.display || 'outline';
+  const showing = !!result && !holding && disp !== 'hidden' && (strokes.length > 0 || !!curStroke) &&
+    (paintMode || viewMode === 'result');
+  overlay.hidden = !showing;
+  if (!showing) return;
+  const cssW = parseFloat(view.style.width) || view.width, cssH = parseFloat(view.style.height) || view.height;
+  const dpr = window.devicePixelRatio || 1;
+  let sc = dpr;
+  const maxPx = 16e6;
+  if (cssW * cssH * sc * sc > maxPx) sc = Math.sqrt(maxPx / (cssW * cssH));
+  const W = Math.max(1, Math.min(16384, Math.round(cssW * sc))), H = Math.max(1, Math.min(16384, Math.round(cssH * sc)));
+  if (overlay.width !== W || overlay.height !== H) {
+    overlay.width = maskC.width = combC.width = ringC.width = W;
+    overlay.height = maskC.height = combC.height = ringC.height = H;
+    maskDirty = true;
+  }
+  if (maskDirty) {
+    maskX.clearRect(0, 0, W, H);
+    for (const s of strokes) drawStroke(maskX, s, W, H);
+    maskDirty = false;
+  }
+  combX.globalCompositeOperation = 'source-over';
+  combX.clearRect(0, 0, W, H);
+  combX.drawImage(maskC, 0, 0);
+  if (curStroke) drawStroke(combX, curStroke, W, H);
+  octx.clearRect(0, 0, W, H);
+  if (disp === 'tint') {
+    octx.globalAlpha = 0.28;
+    octx.drawImage(combC, 0, 0);
+    octx.globalCompositeOperation = 'source-in';
+    octx.fillStyle = '#ff2bd6'; octx.fillRect(0, 0, W, H);
+    octx.globalCompositeOperation = 'source-over'; octx.globalAlpha = 1;
+  }
+  const u = sc;
+  ring(combC, 2.6 * u, 'rgba(0,0,0,0.7)', W, H);
+  ring(combC, 1.3 * u, '#ff2bd6', W, H);
 }
 
 function setPaint(on, mode) {
@@ -458,8 +543,8 @@ function setPaint(on, mode) {
 function maskAction(act) {
   if (act === 'paint') setPaint(!(paintMode && params.brush.mode === 'add'), 'add');
   else if (act === 'erase') setPaint(!(paintMode && params.brush.mode === 'erase'), 'erase');
-  else if (act === 'undo') { if (strokes.length) { strokes.pop(); renderOverlay(); schedule(); } }
-  else if (act === 'clear') { if (strokes.length) { strokes = []; renderOverlay(); schedule(); } }
+  else if (act === 'undo') { if (strokes.length) { strokes.pop(); requestOverlay(true); schedule(); } }
+  else if (act === 'clear') { if (strokes.length) { strokes = []; requestOverlay(true); schedule(); } }
 }
 
 function evToNorm(e) {
@@ -487,7 +572,7 @@ wrap.addEventListener('pointerdown', (e) => {
   if (params.noise.scope === 'all') { params.noise.scope = 'inside'; CTRL['noise.scope'].set('inside'); saveParams(); }
   const mode = e.altKey ? (params.brush.mode === 'erase' ? 'add' : 'erase') : params.brush.mode;
   curStroke = { mode, r: params.brush.size / 2 / view.width, h: params.brush.hard / 100, o: params.brush.opacity / 100, pts: [nx, ny] };
-  renderOverlay();
+  requestOverlay();
 });
 wrap.addEventListener('pointermove', (e) => {
   moveRing(e);
@@ -497,12 +582,12 @@ wrap.addEventListener('pointermove', (e) => {
   const distPx = Math.hypot((nx - lx) * view.width, (ny - ly) * view.height);
   if (distPx < 0.25 && r) return;
   p.push(nx, ny);
-  drawStroke(curStroke, p.length - 2);
+  requestOverlay();
 });
 const endStroke = () => {
   if (!curStroke) return;
   strokes.push(curStroke); curStroke = null;
-  renderOverlay(); schedule();
+  requestOverlay(true); schedule();
 };
 wrap.addEventListener('pointerup', endStroke);
 wrap.addEventListener('pointercancel', endStroke);
@@ -573,7 +658,7 @@ async function loadFile(file) {
     } else x.drawImage(srcImg, 0, 0);
     orig = x.getImageData(0, 0, W, H);
     origName = (file.name || 'image').replace(/\.[^.]+$/, '') || 'image';
-    result = null; mask = null; strokes = []; curStroke = null;
+    result = null; mask = null; strokes = []; curStroke = null; maskDirty = true;
     $('#drop').classList.add('hidden');
     const cw = Math.max(10, Math.min(400, Math.round(W * 0.25))), ch = Math.max(10, Math.min(400, Math.round(H * 0.25)));
     CTRL['carve.dw'].setRange(-cw, cw, -(W - 2), W * 4);
@@ -631,8 +716,8 @@ document.querySelectorAll('#views button').forEach(b => b.addEventListener('clic
   render();
 }));
 $('#amp').addEventListener('input', (e) => { diffAmp = +e.target.value; $('#ampv').textContent = '×' + diffAmp; if (viewMode === 'diff') render(); });
-$('#zoom').addEventListener('change', (e) => { zoomMode = e.target.value; applyZoom(); });
-window.addEventListener('resize', () => { if (zoomMode === 'fit') applyZoom(); });
+$('#zoom').addEventListener('change', (e) => { zoomMode = e.target.value; applyZoom(); requestOverlay(); });
+window.addEventListener('resize', () => { if (zoomMode === 'fit') { applyZoom(); requestOverlay(); } });
 
 const hold = $('#hold');
 const holdOn = (e) => { e.preventDefault(); if (!holding) { holding = true; render(); } };
