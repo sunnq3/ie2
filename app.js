@@ -12,7 +12,17 @@ const DEFAULTS = {
   },
   carve: { dw: 0, dh: 0, energy: 'forward' },
   lens: { k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'bicubic' },
-  ca: { rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0, gs: 0, bs: 0 },
+  ca: {
+    rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0, gs: 0, bs: 0,
+    fall: { curve: 'power', exp: 1, start: 0, width: 30, aspect: 0, shifts: false },
+    disp: { on: false, amount: 0.3, bands: 10, balance: 550 },
+    irr: { on: false, amount: 0.5, scale: 80, detail: 2, lockg: true, fall: false, seed: 1 },
+    axial: { on: false, r: 0, g: 0, b: 0.6, edge: 0 },
+    smear: { on: false, dir: 'radial', angle: 0, r: 0.8, g: 0, b: -0.8, mode: 'trail', follow: true },
+    echo: { on: false, count: 2, decay: 0.45, spacing: 1 },
+    cl: { on: false, cbx: 0.6, cby: 0, crx: -0.6, cry: 0, bleed: 0, soft: 0 },
+    pf: { on: false, amount: 50, thr: 215, width: 2, bias: 0.6, hue: 285, edge: 40 },
+  },
   color: {
     iterations: 1,
     linear: { on: false, bits: 8 },
@@ -61,8 +71,9 @@ const SCHEMA = [
   },
   {
     id: 'ca', title: '2 · Chromatic aberration',
-    note: 'Per-channel sub-pixel shift (px) and radial scale (%, lateral CA from the lens centre).',
+    note: 'Lateral shift/scale per channel, shaped by the radial falloff curve. Each effect below has its own switch; they all run in the same resample as the lens warp.',
     controls: [
+      { type: 'head', label: 'Lateral' },
       { k: 'ca.rx', label: 'Red X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
       { k: 'ca.ry', label: 'Red Y', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
       { k: 'ca.gx', label: 'Green X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px' },
@@ -72,6 +83,63 @@ const SCHEMA = [
       { k: 'ca.rs', label: 'Red radial', type: 'range', min: -1, max: 1, step: 0.001, unit: '%' },
       { k: 'ca.gs', label: 'Green radial', type: 'range', min: -1, max: 1, step: 0.001, unit: '%' },
       { k: 'ca.bs', label: 'Blue radial', type: 'range', min: -1, max: 1, step: 0.001, unit: '%' },
+
+      { type: 'head', label: 'Radial falloff' },
+      { k: 'ca.fall.curve', label: 'Curve', type: 'select', options: [['power', 'Power (rⁿ)'], ['smooth', 'S-curve'], ['ring', 'Ring (peaks at a radius)']] },
+      { k: 'ca.fall.exp', label: 'Exponent', type: 'range', min: 0.1, max: 6, step: 0.01 },
+      { k: 'ca.fall.start', label: 'Start / ring r', type: 'range', min: 0, max: 95, step: 0.1, unit: '%' },
+      { k: 'ca.fall.width', label: 'Ring width', type: 'range', min: 2, max: 100, step: 0.1, unit: '%' },
+      { k: 'ca.fall.aspect', label: 'Aspect', type: 'range', min: -60, max: 60, step: 0.1, unit: '%' },
+      { k: 'ca.fall.shifts', label: 'Falloff also scales X/Y shifts', type: 'check' },
+
+      { k: 'ca.disp.on', label: 'Spectral dispersion (rainbow fringes)', type: 'check', group: 'start' },
+      { k: 'ca.disp.amount', label: 'Amount', type: 'range', min: -2, max: 2, step: 0.001, unit: '%', sub: true },
+      { k: 'ca.disp.bands', label: 'Bands', type: 'range', min: 3, max: 32, step: 1, sub: true },
+      { k: 'ca.disp.balance', label: 'Neutral λ', type: 'range', min: 430, max: 680, step: 1, unit: 'nm', sub: true },
+
+      { k: 'ca.irr.on', label: 'Irregular CA field', type: 'check', group: 'start' },
+      { k: 'ca.irr.amount', label: 'Amount', type: 'range', min: 0, max: 4, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.irr.scale', label: 'Patch size', type: 'range', min: 4, max: 600, step: 1, unit: 'px', sub: true },
+      { k: 'ca.irr.detail', label: 'Detail', type: 'range', min: 1, max: 5, step: 1, sub: true },
+      { k: 'ca.irr.seed', label: 'Seed', type: 'range', min: 1, max: 9999, step: 1, extra: 'seed', sub: true },
+      { k: 'ca.irr.lockg', label: 'Keep green steady', type: 'check', sub: true },
+      { k: 'ca.irr.fall', label: 'Follow radial falloff', type: 'check', sub: true },
+
+      { k: 'ca.axial.on', label: 'Axial CA (per-channel defocus)', type: 'check', group: 'start' },
+      { k: 'ca.axial.r', label: 'Red blur', type: 'range', min: 0, max: 4, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.axial.g', label: 'Green blur', type: 'range', min: 0, max: 4, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.axial.b', label: 'Blue blur', type: 'range', min: 0, max: 4, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.axial.edge', label: 'Edge weight', type: 'range', min: 0, max: 100, step: 0.1, unit: '%', sub: true },
+
+      { k: 'ca.smear.on', label: 'Directional smear', type: 'check', group: 'start' },
+      { k: 'ca.smear.dir', label: 'Direction', type: 'select', sub: true, options: [['radial', 'Radial (from centre)'], ['tangential', 'Tangential (around centre)'], ['fixed', 'Fixed angle']] },
+      { k: 'ca.smear.angle', label: 'Angle', type: 'range', min: -180, max: 180, step: 0.1, unit: '°', sub: true },
+      { k: 'ca.smear.r', label: 'R length', type: 'range', min: -10, max: 10, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.smear.g', label: 'G length', type: 'range', min: -10, max: 10, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.smear.b', label: 'B length', type: 'range', min: -10, max: 10, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.smear.mode', label: 'Shape', type: 'select', sub: true, options: [['trail', 'Trail (one-sided, fading)'], ['centered', 'Centred (both ways)']] },
+      { k: 'ca.smear.follow', label: 'Follow radial falloff', type: 'check', sub: true },
+
+      { k: 'ca.echo.on', label: 'Echo passes (ghost fringes)', type: 'check', group: 'start' },
+      { k: 'ca.echo.count', label: 'Echoes', type: 'range', min: 1, max: 8, step: 1, sub: true },
+      { k: 'ca.echo.decay', label: 'Decay', type: 'range', min: 0.05, max: 1, step: 0.01, sub: true },
+      { k: 'ca.echo.spacing', label: 'Spacing', type: 'range', min: 0.25, max: 4, step: 0.01, unit: '×', sub: true },
+
+      { k: 'ca.cl.on', label: 'Chroma vs luma shift', type: 'check', group: 'start' },
+      { k: 'ca.cl.cbx', label: 'Cb X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.cl.cby', label: 'Cb Y', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.cl.crx', label: 'Cr X', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.cl.cry', label: 'Cr Y', type: 'range', min: -5, max: 5, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.cl.bleed', label: 'Bleed', type: 'range', min: 0, max: 12, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.cl.soft', label: 'Chroma blur', type: 'range', min: 0, max: 4, step: 0.01, unit: 'px', sub: true },
+
+      { k: 'ca.pf.on', label: 'Purple fringing', type: 'check', group: 'start' },
+      { k: 'ca.pf.amount', label: 'Amount', type: 'range', min: 0, max: 100, step: 0.1, unit: '%', sub: true },
+      { k: 'ca.pf.thr', label: 'Highlight ≥', type: 'range', min: 100, max: 255, step: 0.5, unit: 'lvl', sub: true },
+      { k: 'ca.pf.width', label: 'Width', type: 'range', min: 0.3, max: 12, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.pf.bias', label: 'Outward', type: 'range', min: -6, max: 6, step: 0.01, unit: 'px', sub: true },
+      { k: 'ca.pf.hue', label: 'Hue', type: 'range', min: 0, max: 360, step: 0.5, unit: '°', sub: true },
+      { k: 'ca.pf.edge', label: 'Edge weight', type: 'range', min: 0, max: 100, step: 0.1, unit: '%', sub: true },
     ],
   },
   {
@@ -245,6 +313,9 @@ function makeControl(c) {
     t.addEventListener('input', () => update(c.k, t.value));
     row.append(lab, t);
     CTRL[c.k] = { set: (v) => { t.value = v; }, el: t };
+  } else if (c.type === 'head') {
+    row.textContent = c.label;
+    return row;
   } else if (c.type === 'buttons') {
     for (const [act, text] of c.buttons) {
       const b = document.createElement('button');
@@ -288,8 +359,12 @@ function syncSubs() {
   // dim the sub-controls of disabled stages (any "<prefix>.on" checkbox)
   document.querySelectorAll('.ctl.check[data-k$=".on"]').forEach(cb => {
     const pre = cb.dataset.k.slice(0, -2), on = !!getPath(params, cb.dataset.k);
-    document.querySelectorAll(`.ctl.sub[data-k^="${pre}"]`).forEach(el => el.classList.toggle('off', !on));
+    document.querySelectorAll(`.ctl.sub[data-k^="${pre}"]`).forEach(el => el.classList.toggle('hide', !on));
   });
+  const rw = document.querySelector('.ctl[data-k="ca.fall.width"]');
+  if (rw) rw.classList.toggle('off', params.ca.fall.curve !== 'ring');
+  const ang = document.querySelector('.ctl[data-k="ca.smear.angle"]');
+  if (ang) ang.classList.toggle('off', params.ca.smear.dir !== 'fixed');
   const irr = document.querySelector('.ctl[data-k="noise.irrScale"]');
   if (irr) irr.classList.toggle('off', !(+params.noise.irregular > 0));
   document.querySelectorAll('.tool').forEach(b => {
@@ -310,7 +385,7 @@ function resetSection(sec) {
 function update(k, v) {
   setPath(params, k, v);
   saveParams();
-  if (k === 'noise.irregular') syncSubs();
+  if (k === 'noise.irregular' || k === 'ca.fall.curve' || k === 'ca.smear.dir') syncSubs();
   if (k === 'brush.display') requestOverlay(true);
   if (!NOPROCESS.some(p => k.startsWith(p))) schedule();
 }

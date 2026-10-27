@@ -151,3 +151,11 @@ input[type=checkbox] { accent-color: var(--accent); }
   .panel { border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
   .meta { order: 10; flex-basis: 100%; }
 }
+
+/* sub-section headings and collapsed sub-controls */
+.ctl.head {
+  display: block; margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line);
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600;
+}
+.ctl.head:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.ctl.hide { display: none; }

@@ -47,7 +47,7 @@ function runJob(id, P) {
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
     progress(id, 'Resampling', 0.5);
-    const out = resample(CACHE.data, w, h, P.lens, P.ca);
+    const out = resample(CACHE.data, w, h, P.lens, P.ca, id);
     colorRoundtrip(out, w, h, P.color, id);
     const fin = rescale(out, w, h, P.scale, id);
     if (endClean) cleanup(fin.data, fin.w, fin.h, C, id);
@@ -318,41 +318,388 @@ function autoZoom(w, h, cx, cy, k1, k2) {
   return req > 1e-3 ? req : 1;
 }
 
-function resample(data, w, h, L, A) {
+/* Plane helpers (Float32 single-channel images, values 0..255) */
+function bilP(P, w, h, x, y) {
+  if (x < 0) x = 0; else if (x > w - 1) x = w - 1;
+  if (y < 0) y = 0; else if (y > h - 1) y = h - 1;
+  const x0 = x | 0, y0 = y | 0, x1 = x0 < w - 1 ? x0 + 1 : x0, y1 = y0 < h - 1 ? y0 + 1 : y0;
+  const fx = x - x0, fy = y - y0, r0 = y0 * w, r1 = y1 * w;
+  const a = P[r0 + x0] + (P[r0 + x1] - P[r0 + x0]) * fx;
+  const b = P[r1 + x0] + (P[r1 + x1] - P[r1 + x0]) * fx;
+  return a + (b - a) * fy;
+}
+function boxH(s, d, w, h, r) {
+  const k = 1 / (2 * r + 1);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let sum = (r + 1) * s[row];
+    for (let j = 1; j <= r; j++) sum += s[row + Math.min(j, w - 1)];
+    for (let x = 0; x < w; x++) {
+      d[row + x] = sum * k;
+      sum += s[row + Math.min(x + r + 1, w - 1)] - s[row + Math.max(x - r, 0)];
+    }
+  }
+}
+function boxV(s, d, w, h, r) {
+  const k = 1 / (2 * r + 1);
+  for (let x = 0; x < w; x++) {
+    let sum = (r + 1) * s[x];
+    for (let j = 1; j <= r; j++) sum += s[Math.min(j, h - 1) * w + x];
+    for (let y = 0; y < h; y++) {
+      d[y * w + x] = sum * k;
+      sum += s[Math.min(y + r + 1, h - 1) * w + x] - s[Math.max(y - r, 0) * w + x];
+    }
+  }
+}
+function blurPlane(src, w, h, sigma) {
+  if (!(sigma > 0.05)) return src.slice();
+  const tmp = new Float32Array(w * h);
+  if (sigma < 2.5) {
+    const r = Math.max(1, Math.ceil(sigma * 3)), K = new Float32Array(2 * r + 1);
+    let s = 0;
+    for (let i = -r; i <= r; i++) { K[i + r] = Math.exp(-(i * i) / (2 * sigma * sigma)); s += K[i + r]; }
+    for (let i = 0; i < K.length; i++) K[i] /= s;
+    const out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        let a = 0;
+        for (let i = -r; i <= r; i++) { let xi = x + i; xi = xi < 0 ? 0 : xi >= w ? w - 1 : xi; a += src[row + xi] * K[i + r]; }
+        tmp[row + x] = a;
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let a = 0;
+        for (let i = -r; i <= r; i++) { let yi = y + i; yi = yi < 0 ? 0 : yi >= h ? h - 1 : yi; a += tmp[yi * w + x] * K[i + r]; }
+        out[y * w + x] = a;
+      }
+    }
+    return out;
+  }
+  // 3 box blurs approximate a Gaussian
+  const n = 3, wIdeal = Math.sqrt(12 * sigma * sigma / n + 1);
+  let wl = Math.floor(wIdeal); if (wl % 2 === 0) wl--;
+  const m = Math.round((12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4));
+  const a = src.slice();
+  for (let i = 0; i < n; i++) {
+    const r = ((i < m ? wl : wl + 2) - 1) / 2;
+    boxH(a, tmp, w, h, r); boxV(tmp, a, w, h, r);
+  }
+  return a;
+}
+
+/* Spectral dispersion: wavelength bands, per-channel sensitivity weights, Cauchy-like index curve */
+function spectralBands(N, balance) {
+  const lam = [], e = [], wt = [[], [], []], ebar = [0, 0, 0];
+  const g = (l, c, s) => Math.exp(-0.5 * ((l - c) / s) * ((l - c) / s));
+  const inv = (l) => 1 / (l * l);
+  const l0 = balance || 550, norm = inv(400) - inv(550);
+  for (let b = 0; b < N; b++) {
+    const l = 400 + 300 * (b + 0.5) / N;
+    lam.push(l);
+    e.push((inv(l) - inv(l0)) / norm);
+    wt[0].push(g(l, 600, 45) + 0.12 * g(l, 445, 20));
+    wt[1].push(g(l, 545, 40));
+    wt[2].push(g(l, 450, 28));
+  }
+  for (let c = 0; c < 3; c++) {
+    // drop bands that contribute < 4% of the channel's peak (speed), then normalise
+    const mx = Math.max(...wt[c]);
+    for (let b = 0; b < N; b++) if (wt[c][b] < 0.04 * mx) wt[c][b] = 0;
+    const s = wt[c].reduce((a, v) => a + v, 0);
+    for (let b = 0; b < N; b++) { wt[c][b] /= s; ebar[c] += wt[c][b] * e[b]; }
+  }
+  return { e, wt, ebar };
+}
+
+function hsvRgb(hDeg, s, v) {
+  const h = ((hDeg % 360) + 360) % 360 / 60, c = v * s, x = c * (1 - Math.abs((h % 2) - 1)), m = v - c;
+  let r = 0, g = 0, b = 0;
+  if (h < 1) { r = c; g = x; } else if (h < 2) { r = x; g = c; } else if (h < 3) { g = c; b = x; }
+  else if (h < 4) { g = x; b = c; } else if (h < 5) { r = x; b = c; } else { r = c; b = x; }
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+
+/*
+ * Lens distortion + chromatic aberration.
+ * Main pass (one resample from the source): per-channel lateral shift, radial scale shaped by a
+ * falloff curve, spectral dispersion, irregular displacement field.
+ * Post passes on float planes: axial blur, directional smear, echo, chroma-vs-luma shift, purple fringing.
+ */
+function resample(data, w, h, L, A, id) {
   L = L || {}; A = A || {};
   const k1 = +L.k1 || 0, k2 = +L.k2 || 0;
   const userZoom = +L.zoom || 1;
   const cx = w * (0.5 + (+L.cx || 0) / 100), cy = h * (0.5 + (+L.cy || 0) / 100);
   const sh = [[+A.rx || 0, +A.ry || 0], [+A.gx || 0, +A.gy || 0], [+A.bx || 0, +A.by || 0]];
-  const sc = [1 + (+A.rs || 0) / 100, 1 + (+A.gs || 0) / 100, 1 + (+A.bs || 0) / 100];
+  const scl = [(+A.rs || 0) / 100, (+A.gs || 0) / 100, (+A.bs || 0) / 100];
+  const F = A.fall || {}, DS = A.disp || {}, IR = A.irr || {}, AX = A.axial || {}, SM = A.smear || {},
+        EC = A.echo || {}, CL = A.cl || {}, PF = A.pf || {};
+
+  const D = DS.on ? (+DS.amount || 0) / 100 : 0;
+  const irrOn = !!IR.on && (+IR.amount || 0) > 0;
+  const axOn = !!AX.on && ((+AX.r || 0) > 0 || (+AX.g || 0) > 0 || (+AX.b || 0) > 0);
+  const smOn = !!SM.on && ((+SM.r || 0) !== 0 || (+SM.g || 0) !== 0 || (+SM.b || 0) !== 0);
+  const ecOn = !!EC.on && (+EC.count || 0) >= 1 && (+EC.decay || 0) > 0;
+  const clOn = !!CL.on && ['cbx', 'cby', 'crx', 'cry', 'bleed', 'soft'].some(k => (+CL[k] || 0) !== 0);
+  const pfOn = !!PF.on && (+PF.amount || 0) > 0;
+  const postOn = axOn || smOn || ecOn || clOn || pfOn;
+
   const lensOn = k1 !== 0 || k2 !== 0;
-  const caOn = sh.some(s => s[0] !== 0 || s[1] !== 0) || sc.some(s => s !== 1);
+  const caOn = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || postOn;
   let z = userZoom;
   if (lensOn && L.autofill) z *= autoZoom(w, h, cx, cy, k1, k2);
   if (!lensOn && !caOn && z === 1) return data.slice();
 
   const sample = L.interp === 'bilinear' ? bil : bic;
-  const out = new Uint8ClampedArray(w * h * 4);
   const R = Math.sqrt(w * w + h * h) / 2, invR = 1 / R, iz = 1 / z;
-  const i0 = 1 / sc[0], i1 = 1 / sc[1], i2 = 1 / sc[2];
-  for (let y = 0; y < h; y++) {
-    const py = y + 0.5 - cy;
-    for (let x = 0; x < w; x++) {
-      const px = x + 0.5 - cx;
-      let dx = px, dy = py;
-      if (lensOn) {
-        const nx = px * invR, ny = py * invR, r2 = nx * nx + ny * ny;
-        const f = 1 + k1 * r2 + k2 * r2 * r2;
-        dx *= f; dy *= f;
+
+  // radial falloff curve g(r): r = 0 at centre, 1 at the corner
+  const curve = F.curve || 'power', ex = Math.max(0.01, F.exp == null ? 1 : +F.exp);
+  const r0 = Math.min(0.99, Math.max(0, (+F.start || 0) / 100));
+  const rw = Math.max(0.01, (F.width == null ? 30 : +F.width) / 100);
+  const asp = Math.max(-0.95, Math.min(0.95, (+F.aspect || 0) / 100));
+  const linear = curve === 'power' && ex === 1 && r0 === 0;
+  const gf = (rr) => {
+    if (curve === 'ring') { const d = (rr - r0) / rw; return Math.exp(-ex * d * d); }
+    const t = (rr - r0) / (1 - r0);
+    if (t <= 0) return 0;
+    if (curve === 'smooth') { const u = t < 1 ? t : 1, s = u * u * (3 - 2 * u); return (ex === 1 ? s : Math.pow(s, ex)) * (t > 1 ? t : 1); }
+    return ex === 1 ? t : Math.pow(t, ex);
+  };
+  const shiftFall = !!F.shifts;
+
+  // geometry for an output pixel: source offset from centre (dx, dy), radial unit vector, falloff
+  const G = { dx: 0, dy: 0, ux: 0, uy: 0, g: 0 };
+  const geo = (x, y) => {
+    const px = x + 0.5 - cx, py = y + 0.5 - cy;
+    let dx = px, dy = py;
+    if (lensOn) {
+      const nx = px * invR, ny = py * invR, r2 = nx * nx + ny * ny, f = 1 + k1 * r2 + k2 * r2 * r2;
+      dx *= f; dy *= f;
+    }
+    dx *= iz; dy *= iz;
+    const dl = Math.sqrt(dx * dx + dy * dy);
+    G.dx = dx; G.dy = dy;
+    G.ux = dl > 1e-9 ? dx / dl : 0; G.uy = dl > 1e-9 ? dy / dl : 0;
+    const rr = asp === 0 ? dl * invR : Math.sqrt(dx * dx * (1 + asp) * (1 + asp) + dy * dy * (1 - asp) * (1 - asp)) * invR;
+    G.g = linear ? rr : gf(rr);
+    return G;
+  };
+
+  // spectral bands
+  let SB = null, NB = 0;
+  if (D !== 0) { NB = Math.max(3, Math.min(32, Math.round(+DS.bands || 12))); SB = spectralBands(NB, +DS.balance || 550); }
+
+  // irregular displacement field on a coarse grid
+  let IG = null, ist = 1, igw = 0;
+  const irrA = +IR.amount || 0, irrFall = !!IR.fall;
+  if (irrOn) {
+    const S = Math.max(2, +IR.scale || 80), oct = Math.max(1, Math.min(5, Math.round(+IR.detail || 2)));
+    const seed = Math.round(+IR.seed || 1);
+    ist = Math.max(1, Math.min(8, Math.round(S / 6)));
+    igw = Math.ceil(w / ist) + 2;
+    const igh = Math.ceil(h / ist) + 2;
+    IG = [];
+    let ampSum = 0; for (let o = 0; o < oct; o++) ampSum += Math.pow(0.5, o);
+    for (let c = 0; c < 3; c++) {
+      const fx = new Float32Array(igw * igh), fy = new Float32Array(igw * igh);
+      if (!(c === 1 && IR.lockg)) {
+        for (let j = 0; j < igh; j++) for (let i = 0; i < igw; i++) {
+          const X = i * ist / S, Y = j * ist / S;
+          let ax = 0, ay = 0;
+          for (let o = 0; o < oct; o++) {
+            const f = 1 << o, a = Math.pow(0.5, o);
+            ax += a * (2 * vnoise(X * f, Y * f, seed * 31 + c * 7 + o * 101) - 1);
+            ay += a * (2 * vnoise(X * f + 17.3, Y * f - 9.1, seed * 31 + c * 7 + o * 101 + 53) - 1);
+          }
+          fx[j * igw + i] = (ax / ampSum) * irrA * 1.8;
+          fy[j * igw + i] = (ay / ampSum) * irrA * 1.8;
+        }
       }
-      dx *= iz; dy *= iz;
-      const o = (y * w + x) * 4;
-      out[o]     = sample(data, w, h, cx + dx * i0 - sh[0][0] - 0.5, cy + dy * i0 - sh[0][1] - 0.5, 0);
-      out[o + 1] = sample(data, w, h, cx + dx * i1 - sh[1][0] - 0.5, cy + dy * i1 - sh[1][1] - 0.5, 1);
-      out[o + 2] = sample(data, w, h, cx + dx * i2 - sh[2][0] - 0.5, cy + dy * i2 - sh[2][1] - 0.5, 2);
-      out[o + 3] = 255;
+      IG.push([fx, fy]);
     }
   }
+  const IRX = [0, 0, 0], IRY = [0, 0, 0];
+  const irrAt = (x, y, g) => {
+    const gx = x / ist, gy = y / ist, xi = gx | 0, yi = gy | 0, fx = gx - xi, fy = gy - yi, o = yi * igw + xi;
+    const k = irrFall ? g : 1;
+    for (let c = 0; c < 3; c++) {
+      const [ax, ay] = IG[c];
+      const a0 = ax[o] + (ax[o + 1] - ax[o]) * fx, a1 = ax[o + igw] + (ax[o + igw + 1] - ax[o + igw]) * fx;
+      const b0 = ay[o] + (ay[o + 1] - ay[o]) * fx, b1 = ay[o + igw] + (ay[o + igw + 1] - ay[o + igw]) * fx;
+      IRX[c] = (a0 + (a1 - a0) * fy) * k; IRY[c] = (b0 + (b1 - b0) * fy) * k;
+    }
+  };
+
+  // ---- main pass ----
+  const N = w * h;
+  const out = new Uint8ClampedArray(N * 4);
+  const P = postOn ? [new Float32Array(N), new Float32Array(N), new Float32Array(N)] : null;
+  const V = [0, 0, 0];
+  let last = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const g = geo(x, y), dx = g.dx, dy = g.dy, ux = g.ux, uy = g.uy, gg = g.g;
+      if (irrOn) irrAt(x, y, gg);
+      const fs = shiftFall ? gg : 1;
+      for (let c = 0; c < 3; c++) {
+        let bx = cx + dx - sh[c][0] * fs - 0.5, by = cy + dy - sh[c][1] * fs - 0.5;
+        if (irrOn) { bx -= IRX[c]; by -= IRY[c]; }
+        if (D === 0) {
+          const d = scl[c] * gg * R;
+          V[c] = sample(data, w, h, bx - ux * d, by - uy * d, c);
+        } else {
+          const wt = SB.wt[c], e = SB.e;
+          let acc = 0;
+          for (let b = 0; b < NB; b++) {
+            const wb = wt[b];
+            if (wb === 0) continue;
+            const d = (scl[c] + D * e[b]) * gg * R;
+            acc += wb * bil(data, w, h, bx - ux * d, by - uy * d, c);
+          }
+          V[c] = acc;
+        }
+      }
+      const p = y * w + x;
+      if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; }
+      else { const o = p * 4; out[o] = V[0]; out[o + 1] = V[1]; out[o + 2] = V[2]; out[o + 3] = 255; }
+    }
+    if (id != null && (y & 31) === 0) { const t = performance.now(); if (t - last > 100) { last = t; progress(id, 'Lens / CA', 0.3 + 0.4 * y / h); } }
+  }
+  if (!P) return out;
+
+  // ---- axial CA: per-channel defocus ----
+  if (axOn) {
+    if (id != null) progress(id, 'Axial CA', 0.72);
+    const rad = [+AX.r || 0, +AX.g || 0, +AX.b || 0], ew = Math.min(1, Math.max(0, (+AX.edge || 0) / 100));
+    for (let c = 0; c < 3; c++) {
+      if (!(rad[c] > 0)) continue;
+      const B = blurPlane(P[c], w, h, rad[c]), Pc = P[c];
+      if (ew === 0) { P[c] = B; continue; }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const p = y * w + x, k = (1 - ew) + ew * Math.min(1.5, geo(x, y).g);
+        Pc[p] += (B[p] - Pc[p]) * k;
+      }
+    }
+  }
+
+  // ---- directional smear ----
+  if (smOn) {
+    if (id != null) progress(id, 'Smear', 0.78);
+    const len = [+SM.r || 0, +SM.g || 0, +SM.b || 0];
+    const th = (+SM.angle || 0) * Math.PI / 180, ca = Math.cos(th), sa = Math.sin(th);
+    const mode = SM.dir || 'fixed', trail = SM.mode === 'trail', follow = !!SM.follow;
+    for (let c = 0; c < 3; c++) {
+      if (len[c] === 0) continue;
+      const S = P[c].slice(), Pc = P[c];
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let vx = ca, vy = sa, Lc = len[c];
+        if (mode !== 'fixed' || follow) {
+          const g = geo(x, y);
+          if (mode === 'radial') { vx = g.ux; vy = g.uy; } else if (mode === 'tangential') { vx = -g.uy; vy = g.ux; }
+          if (follow) Lc *= Math.min(1.5, g.g);
+        }
+        const aL = Math.abs(Lc);
+        if (aL < 0.01) continue;
+        const n = Math.max(2, Math.ceil(aL * 2) + 1);
+        let acc = 0, ws = 0;
+        for (let i = 0; i < n; i++) {
+          const f = i / (n - 1);
+          const t = trail ? f * Lc : (f - 0.5) * Lc;
+          const wgt = trail ? 1 - f * (n - 1) / n : 1;
+          acc += wgt * bilP(S, w, h, x - vx * t, y - vy * t); ws += wgt;
+        }
+        Pc[y * w + x] = acc / ws;
+      }
+    }
+  }
+
+  // ---- echo: ghost copies at multiples of each channel's displacement ----
+  if (ecOn) {
+    if (id != null) progress(id, 'Echo', 0.84);
+    const E = Math.max(1, Math.min(8, Math.round(+EC.count || 1))), dec = Math.min(1, Math.max(0, +EC.decay || 0));
+    const sp = Math.max(0.05, +EC.spacing || 1);
+    const S = [P[0].slice(), P[1].slice(), P[2].slice()];
+    const MX = [0, 0, 0], MY = [0, 0, 0];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const g = geo(x, y), gg = g.g, fs = shiftFall ? gg : 1;
+      if (irrOn) irrAt(x, y, gg);
+      for (let c = 0; c < 3; c++) {
+        const d = (scl[c] + (SB ? D * SB.ebar[c] : 0)) * gg * R;
+        MX[c] = g.ux * d + sh[c][0] * fs + (irrOn ? IRX[c] : 0);
+        MY[c] = g.uy * d + sh[c][1] * fs + (irrOn ? IRY[c] : 0);
+      }
+      const p = y * w + x;
+      for (let c = 0; c < 3; c++) {
+        if (Math.abs(MX[c]) + Math.abs(MY[c]) < 1e-3) continue;
+        let acc = S[c][p], ws = 1, wk = 1;
+        for (let k = 1; k <= E; k++) {
+          wk *= dec;
+          acc += wk * bilP(S[c], w, h, x - k * sp * MX[c], y - k * sp * MY[c]); ws += wk;
+        }
+        P[c][p] = acc / ws;
+      }
+    }
+  }
+
+  // ---- chroma vs luma shift (YCbCr, BT.709) ----
+  if (clOn) {
+    if (id != null) progress(id, 'Chroma shift', 0.9);
+    const Kr = 0.2126, Kb = 0.0722, Kg = 1 - Kr - Kb;
+    const Y = new Float32Array(N), Cb = new Float32Array(N), Cr = new Float32Array(N);
+    for (let p = 0; p < N; p++) {
+      const r = P[0][p], g = P[1][p], b = P[2][p], yy = Kr * r + Kg * g + Kb * b;
+      Y[p] = yy; Cb[p] = (b - yy) / (2 * (1 - Kb)); Cr[p] = (r - yy) / (2 * (1 - Kr));
+    }
+    const soft = +CL.soft || 0;
+    const CbS = soft > 0 ? blurPlane(Cb, w, h, soft) : Cb, CrS = soft > 0 ? blurPlane(Cr, w, h, soft) : Cr;
+    const cbx = +CL.cbx || 0, cby = +CL.cby || 0, crx = +CL.crx || 0, cry = +CL.cry || 0, bl = +CL.bleed || 0;
+    const nb = bl > 0.01 ? Math.max(2, Math.ceil(bl * 2) + 1) : 1;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let b = 0, r = 0, ws = 0;
+      for (let i = 0; i < nb; i++) {
+        const f = nb > 1 ? i / (nb - 1) : 0, t = f * bl, wgt = 1 - f * (nb - 1) / nb;
+        b += wgt * bilP(CbS, w, h, x - cbx - t, y - cby);
+        r += wgt * bilP(CrS, w, h, x - crx - t, y - cry);
+        ws += wgt;
+      }
+      b /= ws; r /= ws;
+      const p = y * w + x, yy = Y[p];
+      const R_ = yy + 2 * (1 - Kr) * r, B_ = yy + 2 * (1 - Kb) * b;
+      P[0][p] = R_; P[2][p] = B_; P[1][p] = (yy - Kr * R_ - Kb * B_) / Kg;
+    }
+  }
+
+  // ---- purple fringing around bright high-contrast edges ----
+  if (pfOn) {
+    if (id != null) progress(id, 'Purple fringing', 0.95);
+    const amt = Math.min(1, (+PF.amount || 0) / 100), thr = +PF.thr || 215, soft = 24;
+    const wid = Math.max(0.2, +PF.width || 2.5), bias = +PF.bias || 0, ew = Math.min(1, Math.max(0, (+PF.edge || 0) / 100));
+    const col = hsvRgb(PF.hue == null ? 285 : +PF.hue, 0.8, 0.72);
+    const H = new Float32Array(N);
+    for (let p = 0; p < N; p++) {
+      const l = 0.2126 * P[0][p] + 0.7152 * P[1][p] + 0.0722 * P[2][p];
+      let t = (l - (thr - soft)) / soft; t = t < 0 ? 0 : t > 1 ? 1 : t;
+      H[p] = t * t * (3 - 2 * t);
+    }
+    const Hb = blurPlane(H, w, h, wid);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = y * w + x;
+      let hb, wgt = 1;
+      if (bias !== 0 || ew > 0) {
+        const g = geo(x, y);
+        hb = bias !== 0 ? bilP(Hb, w, h, x - g.ux * bias, y - g.uy * bias) : Hb[p];
+        wgt = (1 - ew) + ew * Math.min(1.5, g.g);
+      } else hb = Hb[p];
+      let halo = (hb - H[p]) * 2.2; if (halo <= 0) continue; if (halo > 1) halo = 1;
+      const k = amt * halo * wgt;
+      P[0][p] += (col[0] - P[0][p]) * k; P[1][p] += (col[1] - P[1][p]) * k; P[2][p] += (col[2] - P[2][p]) * k;
+    }
+  }
+
+  for (let p = 0, o = 0; p < N; p++, o += 4) { out[o] = P[0][p]; out[o + 1] = P[1][p]; out[o + 2] = P[2][p]; out[o + 3] = 255; }
   return out;
 }
 
@@ -989,4 +1336,4 @@ function depattern(d, w, h, Q, id) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
+if (typeof module !== 'undefined') module.exports = { blurPlane, spectralBands, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };

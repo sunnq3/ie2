@@ -11,7 +11,16 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
    - *Remove repeating patterns*: overlapped FFT tiles; spectral peaks that stand out from their neighbourhood (moiré, halftone, grids, scan lines) are pulled down. Threshold, strength, low-frequency protection, window size.
    - *Deband*: flash3kyuu-style averaging in flat areas with triangular dither so gradient bands don't come back.
 1. **Content-aware scale (seam carving)** — removes or inserts low-energy pixel seams horizontally and/or vertically, pixel by pixel. Forward-energy or gradient energy.
-2. **Chromatic aberration** — per-channel sub-pixel X/Y shifts (0.01 px steps) plus per-channel radial scale (lateral CA, 0.001 % steps).
+2. **Chromatic aberration** — all in the same resample as the lens warp:
+   - *Lateral*: per-channel sub-pixel X/Y shifts and radial scale.
+   - *Radial falloff*: power (rⁿ), S-curve or ring curve, start radius, ring width, elliptical aspect; optionally applied to the X/Y shifts too.
+   - *Spectral dispersion*: 3–32 wavelength bands with Cauchy-like dispersion and per-channel sensitivity weights → smooth rainbow fringes; adjustable neutral wavelength.
+   - *Irregular CA field*: low-frequency fBm displacement per channel (amount, patch size, detail, seed, keep green steady, follow falloff).
+   - *Axial CA*: per-channel defocus blur with optional edge weighting.
+   - *Directional smear*: per-channel streaks — radial, tangential or fixed angle; trail or centred; can follow the falloff.
+   - *Echo passes*: ghost copies at multiples of each channel's own displacement, with decay and spacing.
+   - *Chroma vs luma shift*: Cb/Cr shifted against Y, plus horizontal chroma bleed and chroma blur.
+   - *Purple fringing*: tinted halo around bright high-contrast edges (threshold, width, outward offset, hue, edge weighting).
 3. **Elastic warp / lens distortion** — radial `r·(1 + k1·r² + k2·r⁴)` model (barrel / pincushion), movable centre, scale, auto-fill, bicubic or bilinear resampling. Distortion and CA share one resampling pass to avoid double interpolation.
 4. **Colour-space roundtrip** — sRGB↔linear, sRGB↔Display P3, sRGB↔CIE Lab, RGB↔HSV, RGB↔HSL, RGB↔YCbCr (BT.601/709/2020, full/limited range, 4:4:4/4:2:2/4:2:0), each with adjustable intermediate precision (4–16 bits, fractional) and 1–10 passes.
 
