@@ -25,7 +25,7 @@ const SECTIONS = [
   { title: 'Lens fringing', controls: [
     { k: 'fringe.amount', type: 'range', label: 'Amount', min: 0, max: 100, step: 1, unit: '%' },
     { k: 'fringe.type', type: 'select', label: 'Type', options: [['achromat', 'Green / magenta (most lenses)'], ['singlet', 'Blue / yellow (simple lens)']] },
-  ], hint: 'Subtle colour fringes toward the corners, like a real lens. Only colour changes — detail stays sharp. 25 % is a typical camera.' },
+  ], hint: 'Modelled on measured lenses: blue-led fringes that grow toward the corners, purple / green rims on out-of-focus edges, purple fringing beside blown highlights. Only colour changes — detail stays sharp. 25 % is a typical camera.' },
   { title: 'Grain', controls: [
     { k: 'grain.amount', type: 'range', label: 'Amount', min: 0, max: 4, step: 0.01, unit: '×' },
     { k: 'grain.shadows', type: 'range', label: 'Shadow grain', min: 0, max: 4, step: 0.01, unit: '×' },
@@ -42,6 +42,37 @@ const SECTIONS = [
   ], hint: 'Full-resolution colour. Protect grain keeps fine grain from being rounded away by compression (bigger file). Check the JPEG view before exporting.' },
 ];
 
+/*
+ * Lens fringing, modelled on measured lenses (s = Amount / 25; 25 % is a typical camera lens):
+ *  - lateral CA: blue vs green dominates, red vs green is small; radial profile is a lensfun-style
+ *    polynomial, ~0 inside a third of the radius and growing toward the corners
+ *    (at 25 % blue sits ~0.05 % of the radius off at the corner = Imatest "low")
+ *  - a slightly decentred CA axis, so the two sides of the frame are not mirror images
+ *  - longitudinal CA: purple rims in front of the focal plane, green behind, only where the image is
+ *    out of focus (anywhere in the frame, centre included)
+ *  - purple fringing on the dark side of clipped highlights, wider toward the corners
+ *  - fringes softened the way a Bayer sensor records them
+ * Only colour changes; brightness comes from the uncorrected geometry, so detail never softens.
+ */
+function caParams(s, type) {
+  const on = s > 0, simple = type === 'singlet';
+  return {
+    keepLuma: true, linear: true,
+    rx: 0, ry: 0, gx: 0, gy: 0, bx: 0.04 * s, by: -0.03 * s,
+    rs: (simple ? 0.03 : 0.012) * s, gs: 0, bs: -(simple ? 0.07 : 0.055) * s,
+    ocx: 2.5, ocy: -1.5,
+    fall: { curve: 'poly', poly: [0.35, 0, 0.95, -0.3], exp: 1, start: 0, width: 30, aspect: 3, shifts: false },
+    disp: { on, lens: type, amount: (simple ? 0.15 : 0.12) * s, bands: 10, balance: 550 },
+    axial: { on, r: simple ? 0 : Math.min(0.4, 0.12 * s), g: 0, b: Math.min(0.7, (simple ? 0.35 : 0.22) * s), edge: 0 },
+    cam: {
+      on, loca: Math.min(0.35, 0.05 * s),
+      front: simple ? [1, 0.4, 0] : [1, 0, 1], behind: simple ? [0, 0.4, 1] : [0, 1, 0],
+      pf: Math.min(0.8, 0.22 * s), pfw: 1.6 + 0.8 * Math.min(4, s), pfThr: 232, soft: 0.6,
+    },
+    pf: { on: false }, irr: { on: false }, cl: { on: false }, smear: { on: false }, echo: { on: false },
+  };
+}
+
 // Everything the engine needs, derived from the few visible settings.
 function toWorker(p) {
   const s = Math.max(0, +p.fringe.amount || 0) / 25, fr = s > 0, final = +p.size.final || 100;
@@ -49,13 +80,7 @@ function toWorker(p) {
     clean: { on: !!p.fix, deblock: { on: !!p.fix, threshold: 8, strength: 100 }, deband: { on: !!p.fix, radius: 16, threshold: 3, grain: 0.6, passes: 1 } },
     carve: { on: false, dw: 0, dh: 0, energy: 'forward' },
     lens: { on: fr, k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'lanczos3' },
-    ca: {
-      keepLuma: true, linear: true, rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0.04 * s, gs: 0, bs: -0.05 * s,
-      fall: { curve: 'power', exp: 1.8, start: 0, width: 30, aspect: 0, shifts: false },
-      disp: { on: fr, lens: p.fringe.type, amount: 0.15 * s, bands: 10, balance: 550 },
-      axial: { on: fr, r: 0, g: 0, b: Math.min(0.6, 0.3 * s), edge: 0 },
-      pf: { on: false }, irr: { on: false }, cl: { on: false }, smear: { on: false }, echo: { on: false },
-    },
+    ca: caParams(s, p.fringe.type),
     resize: { on: true },
     scale: { on: final !== 100, up: 1, final, upMethod: 'bicubic', downMethod: final < 100 ? 'box' : 'lanczos3', quant: false },
     blend: { on: false }, sharpen: { on: false },

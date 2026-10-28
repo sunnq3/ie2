@@ -471,20 +471,24 @@ function blurPlane(src, w, h, sigma) {
     let s = 0;
     for (let i = -r; i <= r; i++) { K[i + r] = Math.exp(-(i * i) / (2 * sigma * sigma)); s += K[i + r]; }
     for (let i = 0; i < K.length; i++) K[i] /= s;
-    const out = new Float32Array(w * h);
+    const out = new Float32Array(w * h), KL = K.length;
+    // horizontal: clamped taps only near the borders, a plain dot product inside
     for (let y = 0; y < h; y++) {
       const row = y * w;
       for (let x = 0; x < w; x++) {
         let a = 0;
-        for (let i = -r; i <= r; i++) { let xi = x + i; xi = xi < 0 ? 0 : xi >= w ? w - 1 : xi; a += src[row + xi] * K[i + r]; }
+        if (x >= r && x < w - r) { const b0 = row + x - r; for (let i = 0; i < KL; i++) a += src[b0 + i] * K[i]; }
+        else for (let i = -r; i <= r; i++) { let xi = x + i; xi = xi < 0 ? 0 : xi >= w ? w - 1 : xi; a += src[row + xi] * K[i + r]; }
         tmp[row + x] = a;
       }
     }
+    // vertical: accumulate whole rows (cache friendly)
     for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        let a = 0;
-        for (let i = -r; i <= r; i++) { let yi = y + i; yi = yi < 0 ? 0 : yi >= h ? h - 1 : yi; a += tmp[yi * w + x] * K[i + r]; }
-        out[y * w + x] = a;
+      const o = y * w;
+      for (let i = -r; i <= r; i++) {
+        let yi = y + i; yi = yi < 0 ? 0 : yi >= h ? h - 1 : yi;
+        const k = K[i + r], t = yi * w;
+        for (let x = 0; x < w; x++) out[o + x] += tmp[t + x] * k;
       }
     }
     return out;
@@ -499,6 +503,32 @@ function blurPlane(src, w, h, sigma) {
     boxH(a, tmp, w, h, r); boxV(tmp, a, w, h, r);
   }
   return a;
+}
+
+/* Gaussian blur for wide radii: 2x box-downsample, blur at half size, bilinear upsample.
+   For sigma >= 3 the error is far below one grey level and it is ~4x cheaper. */
+function blurWide(src, w, h, sigma) {
+  if (sigma < 3 || w < 16 || h < 16) return blurPlane(src, w, h, sigma);
+  const hw = w >> 1, hh = h >> 1, S = new Float32Array(hw * hh);
+  for (let y = 0; y < hh; y++) for (let x = 0; x < hw; x++) {
+    const p = 2 * y * w + 2 * x;
+    S[y * hw + x] = 0.25 * (src[p] + src[p + 1] + src[p + w] + src[p + w + 1]);
+  }
+  // box-downsampling already adds sigma^2 of 1/12 (in half-res px^2) per axis
+  const B = blurPlane(S, hw, hh, Math.sqrt(Math.max(0.01, (sigma * sigma) / 4 - 1 / 12)));
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let fy = (y + 0.5) / 2 - 0.5; if (fy < 0) fy = 0; if (fy > hh - 1) fy = hh - 1;
+    const y0 = fy | 0, y1 = y0 < hh - 1 ? y0 + 1 : y0, ty = fy - y0;
+    for (let x = 0; x < w; x++) {
+      let fx = (x + 0.5) / 2 - 0.5; if (fx < 0) fx = 0; if (fx > hw - 1) fx = hw - 1;
+      const x0 = fx | 0, x1 = x0 < hw - 1 ? x0 + 1 : x0, tx = fx - x0;
+      const a = B[y0 * hw + x0] + (B[y0 * hw + x1] - B[y0 * hw + x0]) * tx;
+      const b = B[y1 * hw + x0] + (B[y1 * hw + x1] - B[y1 * hw + x0]) * tx;
+      out[y * w + x] = a + (b - a) * ty;
+    }
+  }
+  return out;
 }
 
 /* Spectral dispersion: wavelength bands, per-channel sensitivity weights, Cauchy-like index curve */
@@ -678,10 +708,16 @@ function resample(data, w, h, L, A, id) {
   const ecOn = !!EC.on && (+EC.count || 0) >= 1 && (+EC.decay || 0) > 0;
   const clOn = !!CL.on && ['cbx', 'cby', 'crx', 'cry', 'bleed', 'soft'].some(k => (+CL[k] || 0) !== 0);
   const pfOn = !!PF.on && (+PF.amount || 0) > 0;
-  const postOn = axOn || smOn || ecOn || clOn || pfOn;
+  // camera model: longitudinal CA from estimated defocus, highlight purple fringing, sensor-soft fringes
+  const CAM = A.cam && A.cam.on ? A.cam : null;
+  const postOn = axOn || smOn || ecOn || clOn || pfOn || !!CAM;
 
   const lensOn = k1 !== 0 || k2 !== 0;
   const caOn = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || postOn;
+  // decentred CA axis (a slightly tilted / decentred element), in pixels
+  const ocx = (+A.ocx || 0) * w / 100, ocy = (+A.ocy || 0) * h / 100;
+  // pixel scale of a real camera file (~12-24 MP) relative to this image
+  const pxs = Math.max(0.35, Math.min(2.5, Math.sqrt(w * w + h * h) / 2 / 2500));
   let z = userZoom;
   if (lensOn && L.autofill) z *= autoZoom(w, h, cx, cy, k1, k2);
   if (!lensOn && !caOn && z === 1) return data.slice();
@@ -708,6 +744,7 @@ function resample(data, w, h, L, A, id) {
   const linear = curve === 'power' && ex === 1 && r0 === 0;
   const gf = (rr) => {
     if (curve === 'ring') { const d = (rr - r0) / rw; return Math.exp(-ex * d * d); }
+    if (curve === 'poly') { const c = F.poly; return rr * (c[0] + rr * (c[1] + rr * (c[2] + rr * c[3]))); }
     const t = (rr - r0) / (1 - r0);
     if (t <= 0) return 0;
     if (curve === 'smooth') { const u = t < 1 ? t : 1, s = u * u * (3 - 2 * u); return (ex === 1 ? s : Math.pow(s, ex)) * (t > 1 ? t : 1); }
@@ -725,10 +762,11 @@ function resample(data, w, h, L, A, id) {
       dx *= f; dy *= f;
     }
     dx *= iz; dy *= iz;
-    const dl = Math.sqrt(dx * dx + dy * dy);
     G.dx = dx; G.dy = dy;
-    G.ux = dl > 1e-9 ? dx / dl : 0; G.uy = dl > 1e-9 ? dy / dl : 0;
-    const rr = asp === 0 ? dl * invR : Math.sqrt(dx * dx * (1 + asp) * (1 + asp) + dy * dy * (1 - asp) * (1 - asp)) * invR;
+    const qx = dx - ocx, qy = dy - ocy;
+    const dl = Math.sqrt(qx * qx + qy * qy);
+    G.ux = dl > 1e-9 ? qx / dl : 0; G.uy = dl > 1e-9 ? qy / dl : 0;
+    const rr = asp === 0 ? dl * invR : Math.sqrt(qx * qx * (1 + asp) * (1 + asp) + qy * qy * (1 - asp) * (1 - asp)) * invR;
     G.g = linear ? rr : gf(rr);
     return G;
   };
@@ -785,10 +823,14 @@ function resample(data, w, h, L, A, id) {
   const V = [0, 0, 0];
   // Keep detail sharp: fringes may change colour, but brightness (luma) is taken from a plain
   // geometric resample of the image, so colour effects never soften fine detail.
-  const moves = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || axOn || smOn || ecOn;
-  const keepY = A.keepLuma !== false && moves;
+  const moves = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || axOn || smOn || ecOn || !!CAM;
+  const keepY = (A.keepLuma !== false && moves) || !!CAM;
   const YR = keepY && P ? new Float32Array(N) : null;
+  // CA-free reference planes (camera model): fringes are measured against these
+  const REF = CAM ? [new Float32Array(N), new Float32Array(N), new Float32Array(N)] : null;
   const toG = (v) => (linOn ? encPx(v) : v);
+  // no distortion, no zoom, centred axis: the reference geometry is the pixel grid itself
+  const identity = !lensOn && z === 1 && Math.abs(cx - w / 2) < 1e-9 && Math.abs(cy - h / 2) < 1e-9;
   let last = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -817,7 +859,11 @@ function resample(data, w, h, L, A, id) {
       let yRef = 0;
       if (keepY) {
         const bx = cx + dx - 0.5, by = cy + dy - 0.5;
-        yRef = 0.299 * toG(sample(src, w, h, bx, by, 0)) + 0.587 * toG(sample(src, w, h, bx, by, 1)) + 0.114 * toG(sample(src, w, h, bx, by, 2));
+        let r0_, g0_, b0_;
+        if (identity) { const q = p * 4; r0_ = src[q]; g0_ = src[q + 1]; b0_ = src[q + 2]; }
+        else { r0_ = sample(src, w, h, bx, by, 0); g0_ = sample(src, w, h, bx, by, 1); b0_ = sample(src, w, h, bx, by, 2); }
+        if (REF) { REF[0][p] = r0_; REF[1][p] = g0_; REF[2][p] = b0_; }
+        yRef = 0.299 * toG(r0_) + 0.587 * toG(g0_) + 0.114 * toG(b0_);
       }
       if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; if (YR) YR[p] = yRef; }
       else {
@@ -905,8 +951,98 @@ function resample(data, w, h, L, A, id) {
     }
   }
 
+  // ---- longitudinal (axial) CA, camera model ----
+  // Out-of-focus areas get coloured rims: in front of the focal plane the channels that focus
+  // behind it (red+blue for a corrected lens) are more defocused -> purple rims; behind it green is
+  // -> green rims. In-focus detail is untouched. Depth guess: blur is background (behind) unless it
+  // lies below all the in-focus content, where it is most likely foreground (ground plane).
+  if (CAM && CAM.loca > 0 && YR) {
+    if (id != null) progress(id, 'Axial CA', 0.8);
+    const DF = defocusMap(YR, w, h, pxs), Dm = DF.Dm, ramp = Math.max(8, 0.1 * h);
+    // the colour that is further out of focus is blurred by a fixed fraction more: extra blur
+    // sx = s * sqrt((1+a)^2 - 1) for an edge already blurred by s (calibrated estimate)
+    const fac = Math.sqrt((1 + CAM.loca) * (1 + CAM.loca) - 1);
+    const SX = new Float32Array(N); let sxMax = 0;
+    for (let p = 0; p < N; p++) {
+      if (Dm[p] < 1e-3) continue;
+      let st = (DF.Sg[p] - 0.6) / 1.65; st = st < 0 ? 0 : st > 10 ? 10 : st;
+      SX[p] = st * fac; if (SX[p] > sxMax) sxMax = SX[p];
+    }
+    const FW = new Float32Array(h);
+    for (let y = 0; y < h; y++) { let f = (y - DF.yLow) / ramp; FW[y] = f < 0 ? 0 : f > 1 ? 1 : f * f * (3 - 2 * f); }
+    const fr = CAM.front || [1, 0, 1], bh = CAM.behind || [0, 1, 0];
+    const L0 = 0.7, NL = Math.max(1, Math.min(5, Math.ceil(Math.log2(Math.max(sxMax, L0) / L0)) + 1));
+    // per pixel: lower blur level index (-1 = none) and the fraction toward the next level
+    const LI = new Int8Array(N), LF = new Float32Array(N);
+    for (let p = 0; p < N; p++) {
+      const sx = SX[p];
+      if (sx <= 0) { LI[p] = -2; continue; }
+      if (sx < L0) { LI[p] = -1; LF[p] = sx / L0; continue; }
+      const t = Math.min(NL - 1, Math.log2(sx / L0)), i0 = Math.floor(t);
+      LI[p] = i0; LF[p] = t - i0;
+    }
+    for (let c = 0; c < 3; c++) {
+      if (!(fr[c] > 0 || bh[c] > 0) || sxMax <= 0) continue;
+      const O = P[c].slice(), Acc = new Float32Array(N);
+      // tent weights across blur levels 0, 0.7, 1.4, 2.8, ... px (level -1 = unblurred)
+      for (let p = 0; p < N; p++) Acc[p] = LI[p] < 0 ? O[p] * (1 - LF[p]) : 0;
+      for (let i = 0; i < NL; i++) {
+        const B = blurWide(O, w, h, L0 * (1 << i));
+        for (let p = 0; p < N; p++) {
+          const li = LI[p];
+          if (li === i) Acc[p] += B[p] * (li === NL - 1 ? 1 : 1 - LF[p]);
+          else if (li === i - 1) Acc[p] += B[p] * LF[p];
+        }
+      }
+      const Pc = P[c];
+      for (let y = 0; y < h; y++) {
+        const f = FW[y], kc0 = f * fr[c] + (1 - f) * bh[c];
+        if (kc0 <= 0) continue;
+        for (let x = 0; x < w; x++) {
+          const p = y * w + x, k = Dm[p] * kc0;
+          if (k > 0 && SX[p] > 0) Pc[p] = O[p] + (Acc[p] - O[p]) * k;
+        }
+      }
+    }
+  }
+
   // back to gamma-encoded values for the display-space effects below
-  if (linOn) for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
+  if (linOn) for (let c = 0; c < 3; c++) {
+    const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]);
+    if (REF) { const Rc = REF[c]; for (let p = 0; p < N; p++) Rc[p] = encPx(Rc[p]); }
+  }
+
+  if (CAM) {
+    // ---- purple fringing: violet halo on the dark side of clipped highlights (blooming +
+    // violet defocus), wider toward the corners; colour only ----
+    if (CAM.pf > 0 && YR) {
+      if (id != null) progress(id, 'Purple fringing', 0.9);
+      const H = new Float32Array(N), thr = CAM.pfThr || 232, soft = 14;
+      for (let p = 0; p < N; p++) { let t = (YR[p] - (thr - soft)) / soft; t = t < 0 ? 0 : t > 1 ? 1 : t; H[p] = t * t * (3 - 2 * t); }
+      const wid = Math.max(0.6, (CAM.pfw || 2) * pxs), bias = 0.6 * wid;
+      const Hb = blurPlane(H, w, h, wid), col = hsvRgb(CAM.pfHue || 278, 0.78, 0.62);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const p = y * w + x, g = geo(x, y);
+        let halo = (bilP(Hb, w, h, x - g.ux * bias, y - g.uy * bias) - H[p]) * 2.4;
+        if (halo <= 0) continue; if (halo > 1) halo = 1;
+        const dark = 1 - 0.55 * YR[p] / 255;
+        const k = Math.min(0.9, CAM.pf * halo * dark * (0.45 + 0.8 * Math.min(1.3, g.g)));
+        P[0][p] += (col[0] - P[0][p]) * k; P[1][p] += (col[1] - P[1][p]) * k; P[2][p] += (col[2] - P[2][p]) * k;
+      }
+    }
+    // ---- fringes as a sensor records them: the colour error is soft (Bayer sampling + demosaic +
+    // chroma subsampling), never a crisp 1-px coloured line ----
+    if (CAM.soft > 0) {
+      const sig = CAM.soft * pxs;
+      for (let c = 0; c < 3; c++) {
+        const Pc = P[c], Rc = REF[c], Dl = new Float32Array(N);
+        for (let p = 0; p < N; p++) Dl[p] = Pc[p] - Rc[p];
+        const Db = blurPlane(Dl, w, h, sig);
+        for (let p = 0; p < N; p++) Pc[p] = Rc[p] + Db[p];
+      }
+    }
+  }
+
   if (YR) {
     const P0 = P[0], P1 = P[1], P2 = P[2];
     for (let p = 0; p < N; p++) { const dl = YR[p] - (0.299 * P0[p] + 0.587 * P1[p] + 0.114 * P2[p]); P0[p] += dl; P1[p] += dl; P2[p] += dl; }
@@ -970,6 +1106,46 @@ function resample(data, w, h, L, A, id) {
   for (let p = 0, o = 0; p < N; p++, o += 4) { out[o] = cl255(P[0][p]); out[o + 1] = cl255(P[1][p]); out[o + 2] = cl255(P[2][p]); out[o + 3] = 255; }
   return out;
 }
+
+/*
+ * Defocus estimate from luma (0..255), gradient-ratio method (Zhuo & Sim 2011): re-blur the image
+ * with a known Gaussian s0 and compare local gradient energy before/after. For an edge blurred by s
+ * the ratio is sqrt(s^2+s0^2)/s, so s = s0/sqrt(ratio^2-1) independent of edge contrast.
+ * Returns Dm (0 = in focus or flat, 1 = clearly out-of-focus edge), the blur estimate in px, and
+ * yLow, the lowest row that still holds in-focus content.
+ */
+function defocusMap(Y, w, h, k) {
+  const N = w * h, s0 = 1;
+  const Yb = blurPlane(Y, w, h, s0);
+  const G1 = new Float32Array(N), G2 = new Float32Array(N);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x, xl = x > 0 ? p - 1 : p, xr = x < w - 1 ? p + 1 : p, yu = y > 0 ? p - w : p, yd = y < h - 1 ? p + w : p;
+    const gx = (Y[xr] - Y[xl]) / 2, gy = (Y[yd] - Y[yu]) / 2, bx = (Yb[xr] - Yb[xl]) / 2, by = (Yb[yd] - Yb[yu]) / 2;
+    G1[p] = gx * gx + gy * gy; G2[p] = bx * bx + by * by;
+  }
+  const ew = Math.max(2.5, 4 * k);
+  const E1 = blurWide(G1, w, h, ew), E2 = blurWide(G2, w, h, ew);
+  const Dm = new Float32Array(N), Sg = new Float32Array(N);
+  const ss = (a, b, v) => { let t = (v - a) / (b - a); t = t < 0 ? 0 : t > 1 ? 1 : t; return t * t * (3 - 2 * t); };
+  const rowW = new Float64Array(h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x, r2 = E1[p] / (E2[p] + 1e-3);
+    const sg = r2 > 1.0001 ? s0 / Math.sqrt(r2 - 1) : 50;
+    // min(): the windows have finite support, so far from an edge only the re-blurred energy is
+    // non-zero; that is not defocus
+    const con = ss(DEFOCUS.c0, DEFOCUS.c1, Math.min(E1[p], E2[p]));
+    const df = ss(DEFOCUS.s0, DEFOCUS.s1, sg);
+    Sg[p] = sg; Dm[p] = df * con;
+    rowW[y] += (1 - df) * con;
+  }
+  // lowest row that still holds in-focus content (92nd percentile of in-focus weight by row)
+  let tot = 0; for (let y = 0; y < h; y++) tot += rowW[y];
+  let yLow = h, acc = 0;
+  if (tot > 0) for (let y = 0; y < h; y++) { acc += rowW[y]; if (acc >= 0.92 * tot) { yLow = y; break; } }
+  return { Dm: blurPlane(Dm, w, h, 1), Sg, E1, E2, yLow };
+}
+// blur (px) where a region starts / is fully treated as out of focus; gradient energy for "has an edge"
+const DEFOCUS = { s0: 1.6, s1: 3.0, c0: 1, c1: 9 };
 
 /* ------------------------------------------------------------------ */
 /* sRGB transfer helpers                                                */
@@ -1849,4 +2025,4 @@ function encodeJPEG(rgba, w, h, opts) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { blendStage, dehalo, fillPatches, encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
+if (typeof module !== 'undefined') module.exports = { blendStage, dehalo, fillPatches, encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, blurWide, defocusMap, DEFOCUS, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
