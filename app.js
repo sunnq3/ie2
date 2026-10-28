@@ -65,6 +65,17 @@ const ADV = { adv: true };
  */
 const STAGES = [
   {
+    id: 'resize', title: 'Size', heading: 'Size (resampled first)', on: 'resize.on', resamples: true,
+    desc: 'Optional. Resizes the original before any edit, so every effect after it is applied at the final size and is never resampled again.',
+    cards: [
+      { title: 'Upscale → downscale', on: 'scale.on', hint: 'To make the image smaller for where it will be shown (e.g. Reddit), set Upscale to 1× and Final size to the target. Nearest up + Box down at 100% changes nothing.', controls: [
+        R('scale.final', 'Final size', 25, 200, 0.01, '%'), R('scale.up', 'Upscale', 1, 6, 0.01, '×'),
+        S('scale.upMethod', 'Up filter', [['bicubic', 'Bicubic'], ['lanczos3', 'Lanczos 3'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['nearest', 'Nearest']], ADV),
+        S('scale.downMethod', 'Down filter', [['lanczos3', 'Lanczos 3'], ['bicubic', 'Bicubic'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['box', 'Box (area)'], ['nearest', 'Nearest']], ADV),
+        C('scale.quant', 'Round the enlarged image to 8-bit', ADV)] },
+    ],
+  },
+  {
     id: 'clean', title: 'Clean-up', heading: 'Clean-up', on: 'clean.on',
     desc: 'Fix problems already in the photo before anything else. Skip this if the source looks fine.',
     cards: [
@@ -129,16 +140,10 @@ const STAGES = [
     ],
   },
   {
-    id: 'resize', title: 'Resample', heading: 'Resample & sharpen', on: 'resize.on', resamples: true,
-    desc: 'Optional. Nothing here runs unless you switch a card on.',
+    id: 'sharpen', title: 'Sharpen', heading: 'Sharpen', on: 'sharpen.on',
+    desc: 'Optional. Sharpens brightness only, so there are no colour halos. Runs after the lens stage and before grain.',
     cards: [
-      { title: 'Upscale → downscale', on: 'scale.on', hint: 'Enlarges, then shrinks to the final size. Set Final size to the size the image will be shown at (e.g. for Reddit).', controls: [
-        R('scale.up', 'Upscale', 1, 6, 0.01, '×'), R('scale.final', 'Final size', 25, 200, 0.01, '%'),
-        S('scale.upMethod', 'Up filter', [['bicubic', 'Bicubic'], ['lanczos3', 'Lanczos 3'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['nearest', 'Nearest']], ADV),
-        S('scale.downMethod', 'Down filter', [['lanczos3', 'Lanczos 3'], ['bicubic', 'Bicubic'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['box', 'Box (area)'], ['nearest', 'Nearest']], ADV),
-        C('scale.quant', 'Round the enlarged image to 8-bit', ADV)] },
-      { title: 'Sharpen', on: 'sharpen.on', hint: 'Sharpens brightness only, so no colour halos.', controls: [
-        R('sharpen.amount', 'Amount', 0, 3, 0.01), R('sharpen.radius', 'Radius', 0.3, 4, 0.01, 'px'), R('sharpen.threshold', 'Threshold', 0, 20, 0.1, 'lvl', ADV)] },
+      { controls: [R('sharpen.amount', 'Amount', 0, 3, 0.01), R('sharpen.radius', 'Radius', 0.3, 4, 0.01, 'px'), R('sharpen.threshold', 'Threshold', 0, 20, 0.1, 'lvl', ADV)] },
     ],
   },
   {
@@ -383,7 +388,8 @@ function stageActive(id) {
       return p.lens.on && (+p.lens.k1 !== 0 || +p.lens.k2 !== 0 || +p.lens.zoom !== 1 ||
         ['rx', 'ry', 'gx', 'gy', 'bx', 'by', 'rs', 'gs', 'bs'].some(k => +a[k] !== 0) || anyOn(a, ['disp', 'irr', 'axial', 'pf', 'cl', 'smear', 'echo']));
     }
-    case 'resize': return p.resize.on && ((p.scale.on && (+p.scale.up !== 1 || +p.scale.final !== 100)) || (p.sharpen.on && +p.sharpen.amount > 0));
+    case 'resize': return p.resize.on && p.scale.on && (+p.scale.up !== 1 || +p.scale.final !== 100);
+    case 'sharpen': return p.sharpen.on && +p.sharpen.amount > 0;
     case 'grain': return p.sensor.on && +p.sensor.amount > 0;
     default: return false;
   }
@@ -451,7 +457,8 @@ function cleanOn(C) { return !!(C && C.on !== false && ((C.deblock && C.deblock.
 function carveKeyOf(p) {
   const ck = cleanOn(p.clean) && p.clean.position !== 'end' ? JSON.stringify(p.clean) : '';
   const cv = p.carve.on === false ? { dw: 0, dh: 0, energy: p.carve.energy } : p.carve;
-  return `${Math.round(+cv.dw || 0)}|${Math.round(+cv.dh || 0)}|${cv.energy}#${ck}`;
+  const sk = p.resize.on !== false && p.scale.on ? JSON.stringify(p.scale) : '';
+  return `${Math.round(+cv.dw || 0)}|${Math.round(+cv.dh || 0)}|${cv.energy}#${ck}#${sk}`;
 }
 
 function makeWorker() {
@@ -543,12 +550,15 @@ function render() {
   let img = null, note = '';
   const mode = holding ? 'original' : viewMode;
   if (mode === 'original') img = orig;
-  else if (mode === 'diff') { img = diffImage(); if (!img) note = 'Diff needs equal dimensions — seam carving changed the size. Showing result.'; }
+  else if (mode === 'diff') { img = diffImage(); if (!img) note = 'Diff needs the same size as the original — Size or Seams changed it. Showing result.'; }
   else if (mode === 'jpeg' && result) {
     if (jpegPreview && jpegPreview.key === encKey() && jpegPreview.img) { img = jpegPreview.img; note = 'JPEG view: decoded export file'; }
     else { note = 'Encoding JPEG preview…'; refreshJpegPreview(); }
   }
-  else if (mode === 'seams') { img = seamImage(); if (!mask || !mask.some(v => v)) note = 'No seams yet — set a width/height Δ.'; }
+  else if (mode === 'seams') {
+    if (mask && mask.length !== orig.width * orig.height) note = 'Seams view needs Size at 100% — showing result.';
+    else { img = seamImage(); if (!mask || !mask.some(v => v)) note = 'No seams yet — set a width/height Δ.'; }
+  }
   if (!img) img = result || orig;
   if (view.width !== img.width || view.height !== img.height) { view.width = img.width; view.height = img.height; }
   vctx.putImageData(img, 0, 0);

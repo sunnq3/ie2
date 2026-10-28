@@ -13,11 +13,12 @@ Everything runs locally in the browser; images are never uploaded. Every edit is
 
 ## Stages
 
-Pixels stay in floating point between stages and are rounded to 8-bit once, at the end, with an invisible anti-banding dither. With every stage neutral the output is byte-identical to the input. Each stage has an on/off switch; off skips it entirely. Stages that interpolate pixels are tagged **resamples**.
+Resizing (if you use it) happens first, on the original, so no edit is ever resampled afterwards. Pixels stay in floating point between stages and are rounded to 8-bit once, at the end, with an invisible anti-banding dither. With every stage neutral the output is byte-identical to the input. Each stage has an on/off switch; off skips it entirely. Stages that interpolate pixels are tagged **resamples**.
 
-1. **Clean-up** — deblock JPEG 8×8 edges, deband gradients, remove moiré/halftone/grids. Always runs first.
-2. **Seams** — content-aware resize (remove or insert low-detail seams).
-3. **Lens** — distortion and chromatic aberration in a single resample, with your choice of interpolation (Lanczos 3, bicubic, bilinear, nearest = no blending). Colour fringing (red/blue radial scale with corner bias), lens dispersion (achromat green/magenta, simple lens blue/yellow), soft blue focus (axial CA), purple fringing. Advanced: per-channel shifts, falloff shape, irregular field, and stylised effects (chroma/luma shift, smear, echo).
-4. **Resample** — optional upscale (up to 6×) → downscale to a final size; optional luminance-only sharpening.
-5. **Grain** — camera sensor noise, added last so nothing softens it, and only the noise goes through the pipeline (your pixels are not resampled): photosite shot + read noise in linear light → edge-directed demosaic steered by the image's own edges → in-camera luma NR, sharpening and chroma NR. Read noise is a constant floor that the sRGB curve amplifies in dark tones, so grain accumulates in the shadows (≈2.6× the highlights at the defaults). Simple controls: **Amount**, **Shadow grain**, **Colour noise**.
-6. **Export** — built-in JPEG encoder: quality, full-resolution colour (4:4:4) by default, and **Protect grain** (flatter high-frequency quantisation + stochastic rounding so fine grain is not rounded away).
+1. **Size** — optional, runs first on the original: upscale (up to 6×) → downscale to a final size. Every later edit is applied at the final size.
+2. **Clean-up** — deblock JPEG 8×8 edges, deband gradients, remove moiré/halftone/grids.
+3. **Seams** — content-aware resize (remove or insert low-detail seams).
+4. **Lens** — distortion and chromatic aberration in a single resample, with your choice of interpolation (Lanczos 3, bicubic, bilinear, nearest = no blending). Colour fringing (red/blue radial scale with corner bias), lens dispersion (achromat green/magenta, simple lens blue/yellow), soft blue focus (axial CA), purple fringing. Advanced: per-channel shifts, falloff shape, irregular field, and stylised effects (chroma/luma shift, smear, echo).
+5. **Sharpen** — optional luminance-only unsharp mask.
+6. **Grain** — camera sensor noise, added last so nothing softens it, and only the noise goes through the pipeline (your pixels are not resampled): photosite shot + read noise in linear light → edge-directed demosaic steered by the image's own edges → in-camera luma NR, sharpening and chroma NR. Read noise is a constant floor that the sRGB curve amplifies in dark tones, so grain accumulates in the shadows (≈2.6× the highlights at the defaults). Simple controls: **Amount**, **Shadow grain**, **Colour noise**.
+7. **Export** — built-in JPEG encoder: quality, full-resolution colour (4:4:4) by default, and **Protect grain** (flatter high-frequency quantisation + stochastic rounding so fine grain is not rounded away).

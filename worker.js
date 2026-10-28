@@ -2,8 +2,8 @@
 /*
  * ie2 processing worker.
  * Pipeline (each stage can be switched off and is then skipped entirely):
- *   clean-up -> seam carving -> lens + chromatic aberration -> resample (upscale -> downscale) ->
- *   sharpen -> camera grain -> 8-bit
+ *   size (upscale -> downscale, done first on the original) -> clean-up -> seam carving ->
+ *   lens + chromatic aberration -> sharpen -> camera grain -> 8-bit
  * Pixels stay in floating point between stages; they are rounded to 8-bit exactly once, at the end.
  */
 
@@ -11,12 +11,13 @@ let SRC = null;   // { w, h, data: Uint8ClampedArray RGBA }
 let CACHE = null; // after seam carving { key, w, h, data, mask }
 let PRE = null;   // everything before grain { key, data, w, h }
 let CLEAN = null; // cleaned source { key, data }
+let SIZED = null; // resized original { key, data, w, h }
 
 self.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'load') {
     SRC = { w: m.w, h: m.h, data: new Uint8ClampedArray(m.buffer) };
-    CACHE = null; PRE = null; CLEAN = null;
+    CACHE = null; PRE = null; CLEAN = null; SIZED = null;
   } else if (m.type === 'encode') {
     try {
       const bytes = encodeJPEG(new Uint8ClampedArray(m.buffer), m.w, m.h, m.opts || {});
@@ -54,37 +55,42 @@ function runJob(id, P) {
   const t0 = performance.now();
   const on = (k) => !(P[k] && P[k].on === false);
 
-  // clean-up (always first) — cached
+  // size: resample the original first, so no later edit is ever resampled — cached
+  const scaleOn = on('resize') && !!(P.scale && P.scale.on);
+  const sk = scaleOn ? JSON.stringify(P.scale) : '';
+  if (!SIZED || SIZED.key !== sk) {
+    if (scaleOn) { const r = rescale(toF32(SRC.data), SRC.w, SRC.h, P.scale, id); SIZED = { key: sk, data: toF32(r.data), w: r.w, h: r.h }; }
+    else SIZED = { key: '', data: SRC.data, w: SRC.w, h: SRC.h };
+    CLEAN = null;
+  }
+
+  // clean-up — cached
   const C = P.clean || {};
   const cleanOn = on('clean') && cleanActive(C);
   const ck = cleanOn ? JSON.stringify(C) : '';
   if (!CLEAN || CLEAN.key !== ck) {
-    CLEAN = { key: ck, data: cleanOn ? cleanup(toF32(SRC.data).slice(), SRC.w, SRC.h, C, id) : SRC.data };
+    CLEAN = { key: ck, data: cleanOn ? cleanup(toF32(SIZED.data).slice(), SIZED.w, SIZED.h, C, id) : SIZED.data };
     CACHE = null;
   }
 
   // seam carving — cached
   const carveP = on('carve') ? (P.carve || {}) : { dw: 0, dh: 0, energy: (P.carve || {}).energy };
-  const key = carveKey(carveP) + '#' + ck;
+  const key = carveKey(carveP) + '#' + ck + '#' + sk;
   let recarved = false;
   if (!CACHE || CACHE.key !== key) {
-    CACHE = carve({ w: SRC.w, h: SRC.h, data: CLEAN.data }, carveP, id);
+    CACHE = carve({ w: SIZED.w, h: SIZED.h, data: CLEAN.data }, carveP, id);
     CACHE.key = key;
     recarved = true;
   }
 
-  // lens/CA -> resample -> sharpen — cached
-  const lensOn = on('lens'), resizeOn = on('resize');
-  const scaleOn = resizeOn && !!(P.scale && P.scale.on), sharpOn = resizeOn && !!(P.sharpen && P.sharpen.on);
-  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, scaleOn && P.scale, sharpOn && P.sharpen]);
+  // lens/CA -> sharpen — cached
+  const lensOn = on('lens'), sharpOn = !!(P.sharpen && P.sharpen.on);
+  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, sharpOn && P.sharpen]);
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
-    let out = lensOn ? resample(CACHE.data, w, h, P.lens, P.ca, id) : CACHE.data.slice();
-    out = toF32(out);
-    const fin = scaleOn ? rescale(out, w, h, P.scale, id) : { data: out, w, h };
-    fin.data = toF32(fin.data);
-    if (sharpOn) sharpenImage(fin.data, fin.w, fin.h, P.sharpen);
-    PRE = { key: preKey, data: fin.data, w: fin.w, h: fin.h };
+    const out = toF32(lensOn ? resample(CACHE.data, w, h, P.lens, P.ca, id) : CACHE.data.slice());
+    if (sharpOn) sharpenImage(out, w, h, P.sharpen);
+    PRE = { key: preKey, data: out, w, h };
   }
 
   // camera grain — last, after all resampling
