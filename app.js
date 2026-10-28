@@ -28,11 +28,11 @@ const DEFAULTS = {
   resize: { on: true },
   blend: {
     on: true,
-    wrap: { on: false, amount: 30, radius: 1 },
-    bloom: { on: false, amount: 15, threshold: 60, radius: 2, warmth: 0 },
-    veil: { on: false, amount: 2 },
-    unify: { on: false, amount: 40, reach: 10 },
-    vig: { on: false, amount: 20, shape: 2.5 },
+    wrap: { on: false, amount: 15, radius: 0.6 },
+    bloom: { on: false, amount: 8, threshold: 85, radius: 1.5, warmth: 0 },
+    veil: { on: false, amount: 0.3 },
+    unify: { on: false, amount: 30, reach: 10 },
+    vig: { on: false, amount: 10, shape: 2.5 },
   },
   scale: { on: false, up: 2, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   sharpen: { on: false, amount: 0.5, radius: 0.8, threshold: 1 },
@@ -58,7 +58,7 @@ const LOOKS = {
     'sharpen.on': true, 'sharpen.amount': 0.6, 'sharpen.radius': 0.7,
     'sensor.on': true, 'sensor.amount': 1.3, 'sensor.shadows': 1.6, 'sensor.colour': 0.6, 'sensor.lumaNR': 80 } },
   blend: { label: 'Blend a composite', set: {
-    'blend.wrap.on': true, 'blend.bloom.on': true, 'blend.veil.on': true, 'blend.unify.on': true, 'blend.vig.on': true,
+    'blend.unify.on': true, 'blend.veil.on': true,
     'ca.rs': 0.04, 'ca.bs': -0.05, 'ca.fall.exp': 1.8, 'ca.disp.on': true, 'ca.disp.amount': 0.15,
     'sensor.on': true, 'grain.fill.on': true } },
   vintage: { label: 'Vintage lens', set: {
@@ -159,19 +159,19 @@ const STAGES = [
   },
   {
     id: 'blend', title: 'Blend', heading: 'Blend & unify', on: 'blend.on',
-    desc: 'Makes separate elements look photographed together: light and colour are shared across edges, the way a real lens and scene do it. Use these when parts of an image look pasted in.',
+    desc: 'Helps separate elements look photographed together. Start with Unify colour casts; the others are optional and meant to be subtle.',
     cards: [
-      { title: 'Light wrap', on: 'blend.wrap.on', hint: 'Bright surroundings spill a little light onto the edges of whatever is in front of them, so cut-out edges stop looking cut.', controls: [
-        R('blend.wrap.amount', 'Amount', 0, 100, 1, '%'), R('blend.wrap.radius', 'Reach', 0.2, 5, 0.05, '%')] },
+      { title: 'Light wrap', on: 'blend.wrap.on', hint: 'Bright surroundings spill a little light onto the edges of objects in front of them. Only acts at large object boundaries; keep it low.', controls: [
+        R('blend.wrap.amount', 'Amount', 0, 60, 1, '%'), R('blend.wrap.radius', 'Reach', 0.2, 3, 0.05, '%')] },
       { title: 'Unify colour casts', on: 'blend.unify.on', hint: 'Removes part of each region’s colour cast so pieces from different sources share one white balance. Fine colour detail is untouched; very large coloured areas lose a little saturation.', controls: [
         R('blend.unify.amount', 'Amount', 0, 100, 1, '%'), R('blend.unify.reach', 'Region size', 2, 40, 0.5, '%', ADV)] },
       { title: 'Bloom', on: 'blend.bloom.on', hint: 'Highlights glow softly over their surroundings and across boundaries.', controls: [
-        R('blend.bloom.amount', 'Amount', 0, 100, 1, '%'), R('blend.bloom.threshold', 'Highlights from', 10, 99, 1, '%'),
+        R('blend.bloom.amount', 'Amount', 0, 40, 0.5, '%'), R('blend.bloom.threshold', 'Highlights from', 50, 99, 1, '%'),
         R('blend.bloom.radius', 'Spread', 0.2, 10, 0.1, '%', ADV), R('blend.bloom.warmth', 'Warmth', -100, 100, 1, '', ADV)] },
       { title: 'Lens veil', on: 'blend.veil.on', hint: 'A little scattered light from the whole frame lands everywhere, so all elements share the same black level.', controls: [
-        R('blend.veil.amount', 'Amount', 0, 15, 0.1, '%')] },
+        R('blend.veil.amount', 'Amount', 0, 3, 0.05, '%')] },
       { title: 'Vignette', on: 'blend.vig.on', hint: 'Natural light falloff toward the corners, applied across everything.', controls: [
-        R('blend.vig.amount', 'Amount', 0, 80, 1, '%'), R('blend.vig.shape', 'Falloff', 0.8, 6, 0.1, '', ADV)] },
+        R('blend.vig.amount', 'Amount', 0, 50, 1, '%'), R('blend.vig.shape', 'Falloff', 0.8, 6, 0.1, '', ADV)] },
     ],
   },
   {

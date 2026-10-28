@@ -1528,12 +1528,23 @@ function blendStage(d, w, h, B, id) {
   for (let p = 0, i = 0; p < N; p++, i += 4) { P[0][p] = linOf(d[i]); P[1][p] = linOf(d[i + 1]); P[2][p] = linOf(d[i + 2]); }
   const md = Math.min(w, h), diag = Math.hypot(w, h);
   const before = [P[0].slice(), P[1].slice(), P[2].slice()];
-  // light wrap: brighter surroundings spill light onto the edges of whatever is in front of them
+  // light wrap: brighter surroundings spill light onto the edges of whatever is in front of them.
+  // Only at real object boundaries (a large brightness step that survives a wide blur), never inside
+  // textured areas — so local contrast and detail are left alone.
   if (B.wrap && B.wrap.on) {
     const k = Math.max(0, (+B.wrap.amount || 0) / 100), r = Math.max(1, (+B.wrap.radius || 1) / 100 * md);
+    const Yl = new Float32Array(N);
+    for (let p = 0; p < N; p++) Yl[p] = 0.2126 * before[0][p] + 0.7152 * before[1][p] + 0.0722 * before[2][p];
+    const Lg = wideBlur(Yl, w, h, r * 2), E = new Float32Array(N);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = y * w + x, xl = x > 0 ? p - 1 : p, xr = x < w - 1 ? p + 1 : p, yu = y > 0 ? p - w : p, yd = y < h - 1 ? p + w : p;
+      const g = Math.hypot(Lg[xr] - Lg[xl], Lg[yd] - Lg[yu]) * r / (Lg[p] + 0.03);
+      let e = (g - 0.25) / 0.25; E[p] = e <= 0 ? 0 : e >= 1 ? 1 : e * e * (3 - 2 * e);
+    }
+    const Ew = wideBlur(E, w, h, r * 0.5);
     for (let c = 0; c < 3; c++) {
       const L = wideBlur(before[c], w, h, r), A = P[c], S = before[c];
-      for (let p = 0; p < N; p++) { const dl = L[p] - S[p]; if (dl > 0) A[p] += k * dl; }
+      for (let p = 0; p < N; p++) { const dl = L[p] - S[p]; if (dl > 0 && Ew[p] > 0) A[p] += k * Ew[p] * dl; }
     }
   }
   // bloom / halation: highlights scatter into their neighbourhood at several scales
