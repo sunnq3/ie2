@@ -760,12 +760,6 @@ function resample(data, w, h, L, A, id) {
   const out = new Float32Array(N * 4);
   const P = postOn ? [new Float32Array(N), new Float32Array(N), new Float32Array(N)] : null;
   const V = [0, 0, 0];
-  // Keep detail sharp: fringes may change colour, but brightness (luma) is taken from a plain
-  // geometric resample of the image, so CA never softens fine detail.
-  const moves = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || axOn || smOn || ecOn;
-  const keepY = A.keepLuma !== false && moves;
-  const YR = keepY && P ? new Float32Array(N) : null;
-  const toG = (v) => (linOn ? encPx(v) : v);
   let last = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -791,18 +785,9 @@ function resample(data, w, h, L, A, id) {
         }
       }
       const p = y * w + x;
-      let yRef = 0;
-      if (keepY) {
-        const bx = cx + dx - 0.5, by = cy + dy - 0.5;
-        yRef = 0.299 * toG(sample(src, w, h, bx, by, 0)) + 0.587 * toG(sample(src, w, h, bx, by, 1)) + 0.114 * toG(sample(src, w, h, bx, by, 2));
-      }
-      if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; if (YR) YR[p] = yRef; }
-      else {
-        const o = p * 4;
-        let r = toG(V[0]), g2 = toG(V[1]), b = toG(V[2]);
-        if (keepY) { const dl = yRef - (0.299 * r + 0.587 * g2 + 0.114 * b); r += dl; g2 += dl; b += dl; }
-        out[o] = cl255(r); out[o + 1] = cl255(g2); out[o + 2] = cl255(b); out[o + 3] = 255;
-      }
+      if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; }
+      else if (linOn) { const o = p * 4; out[o] = encPx(V[0]); out[o + 1] = encPx(V[1]); out[o + 2] = encPx(V[2]); out[o + 3] = 255; }
+      else { const o = p * 4; out[o] = cl255(V[0]); out[o + 1] = cl255(V[1]); out[o + 2] = cl255(V[2]); out[o + 3] = 255; }
     }
     if (id != null && (y & 31) === 0) { const t = performance.now(); if (t - last > 100) { last = t; progress(id, 'Lens / CA', 0.3 + 0.4 * y / h); } }
   }
@@ -884,10 +869,6 @@ function resample(data, w, h, L, A, id) {
 
   // back to gamma-encoded values for the display-space effects below
   if (linOn) for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
-  if (YR) {
-    const P0 = P[0], P1 = P[1], P2 = P[2];
-    for (let p = 0; p < N; p++) { const dl = YR[p] - (0.299 * P0[p] + 0.587 * P1[p] + 0.114 * P2[p]); P0[p] += dl; P1[p] += dl; P2[p] += dl; }
-  }
 
   // ---- chroma vs luma shift (YCbCr, BT.709) ----
   if (clOn) {
