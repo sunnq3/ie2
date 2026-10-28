@@ -26,6 +26,14 @@ const DEFAULTS = {
     echo: { on: false, count: 2, decay: 0.45, spacing: 1 },
   },
   resize: { on: true },
+  blend: {
+    on: true,
+    wrap: { on: false, amount: 30, radius: 1 },
+    bloom: { on: false, amount: 15, threshold: 60, radius: 2, warmth: 0 },
+    veil: { on: false, amount: 2 },
+    unify: { on: false, amount: 40, reach: 10 },
+    vig: { on: false, amount: 20, shape: 2.5 },
+  },
   scale: { on: false, up: 2, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   sharpen: { on: false, amount: 0.5, radius: 0.8, threshold: 1 },
   grain: { on: true, fill: { on: false, strength: 100, match: 1, pct: 7, size: 6 } },
@@ -49,6 +57,10 @@ const LOOKS = {
     'ca.rs': 0.02, 'ca.bs': -0.03, 'ca.fall.exp': 2, 'ca.disp.on': true, 'ca.disp.amount': 0.08,
     'sharpen.on': true, 'sharpen.amount': 0.6, 'sharpen.radius': 0.7,
     'sensor.on': true, 'sensor.amount': 1.3, 'sensor.shadows': 1.6, 'sensor.colour': 0.6, 'sensor.lumaNR': 80 } },
+  blend: { label: 'Blend a composite', set: {
+    'blend.wrap.on': true, 'blend.bloom.on': true, 'blend.veil.on': true, 'blend.unify.on': true, 'blend.vig.on': true,
+    'ca.rs': 0.04, 'ca.bs': -0.05, 'ca.fall.exp': 1.8, 'ca.disp.on': true, 'ca.disp.amount': 0.15,
+    'sensor.on': true, 'grain.fill.on': true } },
   vintage: { label: 'Vintage lens', set: {
     'lens.k1': 0.02, 'ca.rs': 0.12, 'ca.bs': -0.15, 'ca.fall.exp': 2,
     'ca.disp.on': true, 'ca.disp.lens': 'singlet', 'ca.disp.amount': 0.45, 'ca.axial.on': true, 'ca.axial.r': 0.2, 'ca.axial.b': 0.6,
@@ -143,6 +155,23 @@ const STAGES = [
         R('ca.smear.b', 'Blue length', -10, 10, 0.01, 'px'), S('ca.smear.mode', 'Shape', [['trail', 'Trail (fading)'], ['centered', 'Centred']]), C('ca.smear.follow', 'Follow corner bias')] },
       { title: 'Echo (ghost fringes)', on: 'ca.echo.on', adv: true, stylised: true, controls: [
         R('ca.echo.count', 'Echoes', 1, 8, 1), R('ca.echo.decay', 'Decay', 0.05, 1, 0.01), R('ca.echo.spacing', 'Spacing', 0.25, 4, 0.01, '×')] },
+    ],
+  },
+  {
+    id: 'blend', title: 'Blend', heading: 'Blend & unify', on: 'blend.on',
+    desc: 'Makes separate elements look photographed together: light and colour are shared across edges, the way a real lens and scene do it. Use these when parts of an image look pasted in.',
+    cards: [
+      { title: 'Light wrap', on: 'blend.wrap.on', hint: 'Bright surroundings spill a little light onto the edges of whatever is in front of them, so cut-out edges stop looking cut.', controls: [
+        R('blend.wrap.amount', 'Amount', 0, 100, 1, '%'), R('blend.wrap.radius', 'Reach', 0.2, 5, 0.05, '%')] },
+      { title: 'Unify colour casts', on: 'blend.unify.on', hint: 'Removes part of each region’s colour cast so pieces from different sources share one white balance. Fine colour detail is untouched; very large coloured areas lose a little saturation.', controls: [
+        R('blend.unify.amount', 'Amount', 0, 100, 1, '%'), R('blend.unify.reach', 'Region size', 2, 40, 0.5, '%', ADV)] },
+      { title: 'Bloom', on: 'blend.bloom.on', hint: 'Highlights glow softly over their surroundings and across boundaries.', controls: [
+        R('blend.bloom.amount', 'Amount', 0, 100, 1, '%'), R('blend.bloom.threshold', 'Highlights from', 10, 99, 1, '%'),
+        R('blend.bloom.radius', 'Spread', 0.2, 10, 0.1, '%', ADV), R('blend.bloom.warmth', 'Warmth', -100, 100, 1, '', ADV)] },
+      { title: 'Lens veil', on: 'blend.veil.on', hint: 'A little scattered light from the whole frame lands everywhere, so all elements share the same black level.', controls: [
+        R('blend.veil.amount', 'Amount', 0, 15, 0.1, '%')] },
+      { title: 'Vignette', on: 'blend.vig.on', hint: 'Natural light falloff toward the corners, applied across everything.', controls: [
+        R('blend.vig.amount', 'Amount', 0, 80, 1, '%'), R('blend.vig.shape', 'Falloff', 0.8, 6, 0.1, '', ADV)] },
     ],
   },
   {
@@ -399,6 +428,7 @@ function stageActive(id) {
     }
     case 'resize': return p.resize.on && p.scale.on && (+p.scale.up !== 1 || +p.scale.final !== 100);
     case 'sharpen': return p.sharpen.on && +p.sharpen.amount > 0;
+    case 'blend': return p.blend.on && anyOn(p.blend, ['wrap', 'bloom', 'veil', 'unify', 'vig']);
     case 'grain': return p.grain.on && ((p.sensor.on && +p.sensor.amount > 0) || (p.grain.fill.on && +p.grain.fill.strength > 0));
     default: return false;
   }

@@ -3,7 +3,7 @@
  * ie2 processing worker.
  * Pipeline (each stage can be switched off and is then skipped entirely):
  *   size (upscale -> downscale, done first on the original) -> clean-up -> seam carving ->
- *   lens + chromatic aberration -> sharpen -> camera grain -> 8-bit
+ *   lens + chromatic aberration -> blend & unify -> sharpen -> grain -> 8-bit
  * Pixels stay in floating point between stages; they are rounded to 8-bit exactly once, at the end.
  */
 
@@ -83,12 +83,13 @@ function runJob(id, P) {
     recarved = true;
   }
 
-  // lens/CA -> sharpen — cached
-  const lensOn = on('lens'), sharpOn = !!(P.sharpen && P.sharpen.on);
-  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, sharpOn && P.sharpen]);
+  // lens/CA -> blend -> sharpen — cached
+  const lensOn = on('lens'), sharpOn = !!(P.sharpen && P.sharpen.on), blendOn = on('blend') && blendActive(P.blend);
+  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, blendOn && P.blend, sharpOn && P.sharpen]);
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
     const out = toF32(lensOn ? resample(CACHE.data, w, h, P.lens, P.ca, id) : CACHE.data.slice());
+    if (blendOn) blendStage(out, w, h, P.blend, id);
     if (sharpOn) sharpenImage(out, w, h, P.sharpen);
     PRE = { key: preKey, data: out, w, h };
   }
@@ -1485,6 +1486,110 @@ function sensorSim(d, w, h, S, id) {
     } }
 }
 
+/* ------------------------------------------------------------------ */
+/* Blend & unify: make separate elements look photographed together     */
+/* ------------------------------------------------------------------ */
+/*
+ * All of these move light or colour between regions — the thing a pasted-together image lacks.
+ * Light, bloom, veil and vignette work in linear light (how real light adds up); colour unify works
+ * on chroma. None of them touch fine detail.
+ */
+// Wide blur done at reduced resolution (same look for large radii, far faster on big photos)
+function wideBlur(A, w, h, sigma) {
+  const f = Math.min(16, Math.floor(sigma / 3));
+  if (f < 2) return blurPlane(A, w, h, sigma);
+  const sw = Math.ceil(w / f), sh = Math.ceil(h / f), S = new Float32Array(sw * sh), Cn = new Float32Array(sw * sh);
+  for (let y = 0; y < h; y++) {
+    const row = y * w, srow = ((y / f) | 0) * sw;
+    for (let x = 0; x < w; x++) { const q = srow + ((x / f) | 0); S[q] += A[row + x]; Cn[q]++; }
+  }
+  for (let q = 0; q < S.length; q++) S[q] /= Cn[q];
+  const Bs = blurPlane(S, sw, sh, Math.sqrt(Math.max(0.01, sigma * sigma / (f * f) - 1 / 12)));
+  const X0 = new Int32Array(w), X1 = new Int32Array(w), FX = new Float32Array(w);
+  for (let x = 0; x < w; x++) { const gx = Math.min(sw - 1, Math.max(0, (x + 0.5) / f - 0.5)); X0[x] = gx | 0; X1[x] = Math.min(sw - 1, X0[x] + 1); FX[x] = gx - X0[x]; }
+  const O = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const gy = Math.min(sh - 1, Math.max(0, (y + 0.5) / f - 0.5)), y0 = gy | 0, r0 = y0 * sw, r1 = Math.min(sh - 1, y0 + 1) * sw, fy = gy - y0, o = y * w;
+    for (let x = 0; x < w; x++) {
+      const x0 = X0[x], x1 = X1[x], fx = FX[x];
+      const a = Bs[r0 + x0] + (Bs[r0 + x1] - Bs[r0 + x0]) * fx, b = Bs[r1 + x0] + (Bs[r1 + x1] - Bs[r1 + x0]) * fx;
+      O[o + x] = a + (b - a) * fy;
+    }
+  }
+  return O;
+}
+function blendActive(B) {
+  return !!(B && ['wrap', 'bloom', 'veil', 'unify', 'vig'].some(k => B[k] && B[k].on));
+}
+function blendStage(d, w, h, B, id) {
+  if (id != null) progress(id, 'Blending', 0.75);
+  encLut();
+  const N = w * h, P = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+  for (let p = 0, i = 0; p < N; p++, i += 4) { P[0][p] = linOf(d[i]); P[1][p] = linOf(d[i + 1]); P[2][p] = linOf(d[i + 2]); }
+  const md = Math.min(w, h), diag = Math.hypot(w, h);
+  const before = [P[0].slice(), P[1].slice(), P[2].slice()];
+  // light wrap: brighter surroundings spill light onto the edges of whatever is in front of them
+  if (B.wrap && B.wrap.on) {
+    const k = Math.max(0, (+B.wrap.amount || 0) / 100), r = Math.max(1, (+B.wrap.radius || 1) / 100 * md);
+    for (let c = 0; c < 3; c++) {
+      const L = wideBlur(before[c], w, h, r), A = P[c], S = before[c];
+      for (let p = 0; p < N; p++) { const dl = L[p] - S[p]; if (dl > 0) A[p] += k * dl; }
+    }
+  }
+  // bloom / halation: highlights scatter into their neighbourhood at several scales
+  if (B.bloom && B.bloom.on) {
+    const k = Math.max(0, (+B.bloom.amount || 0) / 100), thr = Math.min(0.99, Math.max(0, (B.bloom.threshold == null ? 60 : +B.bloom.threshold) / 100));
+    const r = Math.max(1, (+B.bloom.radius || 2) / 100 * diag), warm = Math.max(-1, Math.min(1, (+B.bloom.warmth || 0) / 100));
+    const tint = [1 + 0.35 * warm, 1, 1 - 0.35 * warm];
+    for (let c = 0; c < 3; c++) {
+      const S = before[c], Hh = new Float32Array(N);
+      for (let p = 0; p < N; p++) { const v = S[p] - thr; Hh[p] = v > 0 ? v * v / (v + 0.1) : 0; }
+      const b1 = wideBlur(Hh, w, h, r * 0.25), b2 = wideBlur(Hh, w, h, r), b3 = wideBlur(Hh, w, h, r * 3), A = P[c];
+      for (let p = 0; p < N; p++) A[p] += k * tint[c] * (0.5 * b1[p] + 0.3 * b2[p] + 0.2 * b3[p]);
+    }
+  }
+  // lens veil: a little scattered light from the whole frame lands everywhere, lifting all blacks together
+  if (B.veil && B.veil.on) {
+    const k = Math.max(0, (+B.veil.amount || 0) / 100);
+    for (let c = 0; c < 3; c++) { let m = 0; const S = before[c]; for (let p = 0; p < N; p++) m += S[p]; m /= N; const A = P[c]; for (let p = 0; p < N; p++) A[p] = A[p] * (1 - k) + m * k + 0; }
+  }
+  // vignette: natural light falloff toward the corners
+  if (B.vig && B.vig.on) {
+    const k = Math.max(0, Math.min(1, (+B.vig.amount || 0) / 100)), ex = Math.max(0.5, +B.vig.shape || 2.5);
+    const cx = w / 2, cy = h / 2, iR2 = 4 / (diag * diag), LUT = new Float32Array(4097);
+    for (let i = 0; i <= 4096; i++) LUT[i] = 1 - k * Math.pow(i / 4096, ex / 2);   // indexed by r² (0..1)
+    const P0 = P[0], P1 = P[1], P2 = P[2];
+    for (let y = 0; y < h; y++) {
+      const dy = y + 0.5 - cy, dy2 = dy * dy * iR2;
+      for (let x = 0; x < w; x++) {
+        const dx = x + 0.5 - cx, r2 = dx * dx * iR2 + dy2, f = LUT[Math.min(4096, (r2 * 4096 + 0.5) | 0)], p = y * w + x;
+        P0[p] *= f; P1[p] *= f; P2[p] *= f;
+      }
+    }
+  }
+  for (let p = 0, i = 0; p < N; p++, i += 4) { d[i] = encPx(P[0][p] * 255); d[i + 1] = encPx(P[1][p] * 255); d[i + 2] = encPx(P[2][p] * 255); }
+  // unify colour casts: remove part of each region's large-scale colour cast relative to the whole
+  // image, so pieces from different sources share one white balance. Fine colour detail stays.
+  if (B.unify && B.unify.on) {
+    const k = Math.max(0, Math.min(1, (+B.unify.amount || 0) / 100)), r = Math.max(4, (B.unify.reach == null ? 10 : +B.unify.reach) / 100 * md);
+    const Cb = new Float32Array(N), Cr = new Float32Array(N), Wt = new Float32Array(N);
+    let mb = 0, mr = 0, mw = 0;
+    for (let p = 0, i = 0; p < N; p++, i += 4) {
+      const yy = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      Cb[p] = d[i + 2] - yy; Cr[p] = d[i] - yy;
+      const wt = yy > 12 && yy < 243 ? 1 : 0.2; Wt[p] = wt; mb += Cb[p] * wt; mr += Cr[p] * wt; mw += wt;
+    }
+    mb /= mw; mr /= mw;
+    const Lb = wideBlur(Cb, w, h, r), Lr = wideBlur(Cr, w, h, r);
+    for (let p = 0, i = 0; p < N; p++, i += 4) {
+      const db = -k * (Lb[p] - mb), dr = -k * (Lr[p] - mr);
+      // shift chroma, keep brightness: r += dr, b += db, g compensates
+      const r0 = d[i] + dr, b0 = d[i + 2] + db, g0 = d[i + 1] - (0.299 * dr + 0.114 * db) / 0.587;
+      d[i] = cl255(r0); d[i + 1] = cl255(g0); d[i + 2] = cl255(b0);
+    }
+  }
+}
+
 /*
  * Fill smoothed patches. Retouched skin, healed/cloned spots and AI-cleaned areas have less fine
  * texture than the rest of the photo, and that mismatch is what gives an edit away. This measures
@@ -1733,4 +1838,4 @@ function encodeJPEG(rgba, w, h, opts) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { dehalo, fillPatches, encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
+if (typeof module !== 'undefined') module.exports = { blendStage, dehalo, fillPatches, encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
