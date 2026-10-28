@@ -7,6 +7,7 @@ const DEFAULTS = {
   clean: {
     on: true,
     deblock: { on: false, threshold: 8, strength: 100 },
+    dehalo: { on: false, strength: 70, radius: 2, tolerance: 5, edge: 25 },
     deband: { on: false, radius: 16, threshold: 3, grain: 0.6, passes: 1 },
     pattern: { on: false, sensitivity: 4, strength: 100, protect: 6, tile: '256' },
   },
@@ -27,6 +28,7 @@ const DEFAULTS = {
   resize: { on: true },
   scale: { on: false, up: 2, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   sharpen: { on: false, amount: 0.5, radius: 0.8, threshold: 1 },
+  grain: { on: true, fill: { on: false, strength: 100, match: 1, pct: 7, size: 6 } },
   sensor: {
     on: false, amount: 1, shadows: 1, colour: 1, seed: 1,
     shot: 0.06, read: 0.09, rgain: 30, bgain: 50,
@@ -82,6 +84,9 @@ const STAGES = [
     cards: [
       { title: 'Deblock', on: 'clean.deblock.on', hint: 'Smooths JPEG 8×8 block edges in flat areas.',
         controls: [R('clean.deblock.strength', 'Strength', 0, 100, 1, '%'), R('clean.deblock.threshold', 'Max step', 1, 30, 0.1, 'lvl', ADV)] },
+      { title: 'Remove halos', on: 'clean.dehalo.on', hint: 'Reduces the bright/dark outlines that sharpening, clarity or HDR edits leave along edges. Only touches pixels beside strong edges.',
+        controls: [R('clean.dehalo.strength', 'Strength', 0, 100, 1, '%'), R('clean.dehalo.radius', 'Halo width', 0.5, 6, 0.1, 'px'),
+          R('clean.dehalo.tolerance', 'Tolerance', 0, 20, 0.1, 'lvl', ADV), R('clean.dehalo.edge', 'Edge threshold', 2, 80, 1, 'lvl', ADV)] },
       { title: 'Deband', on: 'clean.deband.on', hint: 'Smooths stepped gradients (skies, walls). Edges are left alone.',
         controls: [R('clean.deband.radius', 'Radius', 2, 64, 1, 'px'), R('clean.deband.threshold', 'Threshold', 0.5, 12, 0.1, 'lvl', ADV),
           R('clean.deband.grain', 'Dither', 0, 3, 0.01, 'lvl', ADV), R('clean.deband.passes', 'Passes', 1, 4, 1, '', ADV)] },
@@ -148,17 +153,20 @@ const STAGES = [
     ],
   },
   {
-    id: 'grain', title: 'Grain', heading: 'Camera grain', on: 'sensor.on',
-    desc: 'Real sensor noise, added last so nothing softens it. Builds up in dark areas like a real camera; your image’s own pixels are not resampled.',
+    id: 'grain', title: 'Grain', heading: 'Grain & texture', on: 'grain.on',
+    desc: 'Added last so nothing softens it. Camera grain covers the whole photo; Fill smoothed patches only puts noise back where an earlier edit wiped it out.',
     cards: [
-      { controls: [R('sensor.amount', 'Amount', 0, 4, 0.01, '×'), R('sensor.shadows', 'Shadow grain', 0, 4, 0.01, '×'), R('sensor.colour', 'Colour noise', 0, 3, 0.01, '×'),
-        R('sensor.seed', 'Seed', 1, 9999, 1, '', { extra: 'seed', adv: true })] },
-      { title: 'Sensor', adv: true, hint: 'Shot noise grows with brightness; read noise is a constant floor that dominates the shadows.', controls: [
-        R('sensor.shot', 'Shot noise', 0, 0.6, 0.001), R('sensor.read', 'Read noise', 0, 0.4, 0.001),
-        R('sensor.rgain', 'Red sites +', 0, 150, 1, '%'), R('sensor.bgain', 'Blue sites +', 0, 150, 1, '%')] },
-      { title: 'In-camera processing', adv: true, hint: 'How the camera cleans the noise up — this is what shapes the grain.', controls: [
-        R('sensor.lumaNR', 'Luma NR', 0, 100, 1, '%'), R('sensor.sharpen', 'Sharpening', 0, 3, 0.01), R('sensor.sharpenR', 'Radius', 0.3, 4, 0.01, 'px'),
-        R('sensor.chromaNR', 'Chroma NR', 0, 100, 1, '%'), R('sensor.blotch', 'Blotches', 0, 5, 0.01, '×'), R('sensor.blotchSize', 'Blotch size', 0.5, 10, 0.1, 'px')] },
+      { title: 'Camera grain', on: 'sensor.on', open: true, hint: 'Real sensor noise. Builds up in dark areas like a real camera; your image’s own pixels are not resampled.', controls: [
+        R('sensor.amount', 'Amount', 0, 4, 0.01, '×'), R('sensor.shadows', 'Shadow grain', 0, 4, 0.01, '×'), R('sensor.colour', 'Colour noise', 0, 3, 0.01, '×'),
+        R('sensor.seed', 'Seed', 1, 9999, 1, '', { extra: 'seed', adv: true }),
+        H('Sensor', ADV), R('sensor.shot', 'Shot noise', 0, 0.6, 0.001, '', ADV), R('sensor.read', 'Read noise', 0, 0.4, 0.001, '', ADV),
+        R('sensor.rgain', 'Red sites +', 0, 150, 1, '%', ADV), R('sensor.bgain', 'Blue sites +', 0, 150, 1, '%', ADV),
+        H('In-camera processing', ADV), R('sensor.lumaNR', 'Luma NR', 0, 100, 1, '%', ADV), R('sensor.sharpen', 'Sharpening', 0, 3, 0.01, '', ADV),
+        R('sensor.sharpenR', 'Radius', 0.3, 4, 0.01, 'px', ADV), R('sensor.chromaNR', 'Chroma NR', 0, 100, 1, '%', ADV),
+        R('sensor.blotch', 'Blotches', 0, 5, 0.01, '×', ADV), R('sensor.blotchSize', 'Blotch size', 0.5, 10, 0.1, 'px', ADV)] },
+      { title: 'Fill smoothed patches', on: 'grain.fill.on', hint: 'Retouched skin, healed spots and AI-cleaned areas have no camera noise, which gives an edit away. This learns the photo’s own noise level at each brightness and puts matching grain back only where it is missing.', controls: [
+        R('grain.fill.strength', 'Strength', 0, 200, 1, '%'), R('grain.fill.match', 'Match level', 0.25, 3, 0.01, '×'),
+        R('grain.fill.pct', 'Noise floor', 1, 40, 0.5, '%', ADV), R('grain.fill.size', 'Detection size', 3, 20, 0.5, 'px', ADV)] },
     ],
   },
   {
@@ -382,7 +390,7 @@ function anyOn(o, keys) { return keys.some(k => o[k] && o[k].on); }
 function stageActive(id) {
   const p = params;
   switch (id) {
-    case 'clean': return p.clean.on && anyOn(p.clean, ['deblock', 'pattern', 'deband']);
+    case 'clean': return p.clean.on && anyOn(p.clean, ['deblock', 'dehalo', 'pattern', 'deband']);
     case 'carve': return p.carve.on && (+p.carve.dw !== 0 || +p.carve.dh !== 0);
     case 'lens': {
       const a = p.ca;
@@ -391,7 +399,7 @@ function stageActive(id) {
     }
     case 'resize': return p.resize.on && p.scale.on && (+p.scale.up !== 1 || +p.scale.final !== 100);
     case 'sharpen': return p.sharpen.on && +p.sharpen.amount > 0;
-    case 'grain': return p.sensor.on && +p.sensor.amount > 0;
+    case 'grain': return p.grain.on && ((p.sensor.on && +p.sensor.amount > 0) || (p.grain.fill.on && +p.grain.fill.strength > 0));
     default: return false;
   }
 }
@@ -453,7 +461,7 @@ function update(k, v) {
 
 let worker = null, jobId = 0, inflight = null, pending = false, workerCarveKey = null, timer = 0;
 
-function cleanOn(C) { return !!(C && C.on !== false && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on))); }
+function cleanOn(C) { return !!(C && C.on !== false && ((C.deblock && C.deblock.on) || (C.dehalo && C.dehalo.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on))); }
 // must match the key the worker builds
 function carveKeyOf(p) {
   const ck = cleanOn(p.clean) && p.clean.position !== 'end' ? JSON.stringify(p.clean) : '';

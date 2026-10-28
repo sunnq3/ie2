@@ -93,9 +93,12 @@ function runJob(id, P) {
     PRE = { key: preKey, data: out, w, h };
   }
 
-  // camera grain — last, after all resampling
+  // grain — last, after all resampling
   const outData = PRE.data.slice();
-  sensorSim(outData, PRE.w, PRE.h, P.sensor, id);
+  if (on('grain')) {
+    if (P.grain && P.grain.fill && P.grain.fill.on) fillPatches(outData, PRE.w, PRE.h, P.grain.fill, P.sensor, id);
+    sensorSim(outData, PRE.w, PRE.h, P.sensor, id);
+  }
   const u8 = quantize(outData, true);
   const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: u8.buffer, ms: performance.now() - t0, carveKey: key };
   const transfer = [u8.buffer];
@@ -1131,11 +1134,12 @@ function vnoise(x, y, s) {
 /* ------------------------------------------------------------------ */
 
 function cleanActive(C) {
-  return !!(C && C.on !== false && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on)));
+  return !!(C && C.on !== false && ((C.deblock && C.deblock.on) || (C.dehalo && C.dehalo.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on)));
 }
 
 function cleanup(d, w, h, C, id) {
   if (C.deblock && C.deblock.on) { progress(id, 'Deblocking', 0.1); deblock(d, w, h, C.deblock); }
+  if (C.dehalo && C.dehalo.on) { progress(id, 'Removing halos', 0.3); dehalo(d, w, h, C.dehalo); }
   if (C.pattern && C.pattern.on) depattern(d, w, h, C.pattern, id);
   if (C.deband && C.deband.on) { progress(id, 'Debanding', 0.9); deband(d, w, h, C.deband); }
   return d;
@@ -1179,6 +1183,55 @@ function deblock(d, w, h, B) {
   };
   for (let y = 0; y < h; y++) for (let x = 8; x + 3 < w; x += 8) edge((y * w + x) * 4, 4);
   for (let y = 8; y + 3 < h; y += 8) for (let x = 0; x < w; x++) edge((y * w + x) * 4, w * 4);
+}
+
+// Sliding-window min / max (separable, square window of radius R)
+function minMaxPlane(A, w, h, R, isMax) {
+  const T = new Float32Array(w * h), O = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const r = y * w;
+    for (let x = 0; x < w; x++) {
+      let m = A[r + x];
+      const a = Math.max(0, x - R), b = Math.min(w - 1, x + R);
+      for (let k = a; k <= b; k++) { const v = A[r + k]; if (isMax ? v > m : v < m) m = v; }
+      T[r + x] = m;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    const a = Math.max(0, y - R), b = Math.min(h - 1, y + R);
+    for (let x = 0; x < w; x++) {
+      let m = T[y * w + x];
+      for (let k = a; k <= b; k++) { const v = T[k * w + x]; if (isMax ? v > m : v < m) m = v; }
+      O[y * w + x] = m;
+    }
+  }
+  return O;
+}
+
+// Halo removal. Sharpening / clarity / HDR halos are bright or dark bands that overshoot both sides
+// of an edge. A blurred copy no longer has the overshoot, so the min..max of the blurred copy around
+// each pixel is the range the edge should span; brightness outside that range (plus a tolerance) is
+// pulled back in. Only applied near strong edges, and only to brightness, so texture and colour stay.
+function dehalo(d, w, h, H) {
+  const r = Math.max(0.5, +H.radius || 2), amt = Math.min(1, Math.max(0, (H.strength == null ? 80 : +H.strength) / 100));
+  const tol = Math.max(0, H.tolerance == null ? 5 : +H.tolerance), et = Math.max(1, +H.edge || 25);
+  if (!(amt > 0)) return;
+  const N = w * h, Y = new Float32Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) Y[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  const B = blurPlane(Y, w, h, r * 1.2);
+  const R = Math.max(1, Math.ceil(r * 1.5));
+  const mn = minMaxPlane(B, w, h, R, false), mx = minMaxPlane(B, w, h, R, true);
+  // edge steps survive a much wider blur; thin lines and fine texture don't — so only real edges count
+  const B2 = blurPlane(Y, w, h, r * 3), R2 = Math.max(2, Math.ceil(r * 3));
+  const mn2 = minMaxPlane(B2, w, h, R2, false), mx2 = minMaxPlane(B2, w, h, R2, true);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    const v = Y[p], lo = mn[p] - tol, hi = mx[p] + tol;
+    if (v >= lo && v <= hi) continue;
+    let e = (mx2[p] - mn2[p] - et) / et; e = e < 0 ? 0 : e > 1 ? 1 : e * e * (3 - 2 * e);
+    if (e === 0) continue;
+    const dl = ((v > hi ? hi : lo) - v) * amt * e;
+    d[i] = cl255(d[i] + dl); d[i + 1] = cl255(d[i + 1] + dl); d[i + 2] = cl255(d[i + 2] + dl);
+  }
 }
 
 // Gradient debanding (flash3kyuu-style): replace pixels in flat areas with the mean of 4 random
@@ -1432,6 +1485,56 @@ function sensorSim(d, w, h, S, id) {
     } }
 }
 
+/*
+ * Fill smoothed patches. Retouched skin, healed/cloned spots and AI-cleaned areas have less fine
+ * texture than the rest of the photo, and that mismatch is what gives an edit away. This measures
+ * fine-texture energy everywhere, takes the photo's typical level as the reference, and adds
+ * camera-style grain only where a region falls short — just enough to bring it up to the reference.
+ */
+function fillPatches(d, w, h, F, S, id) {
+  const amt = Math.min(2, Math.max(0, (F.strength == null ? 100 : +F.strength) / 100));
+  if (!(amt > 0)) return;
+  if (id != null) progress(id, 'Filling smoothed patches', 0.85);
+  const N = w * h, Y = new Float32Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) Y[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  const hp = (A) => { const B = blurPlane(A, w, h, 1), H = new Float32Array(N); for (let p = 0; p < N; p++) { const v = A[p] - B[p]; H[p] = v * v; } return H; };
+  const R = Math.max(3, +F.size || 6);
+  const E = blurPlane(hp(Y), w, h, R);
+  // The photo's own noise curve: for each brightness band, the low end of local fine-detail energy
+  // (the flattest areas at that brightness are pure camera noise). Anything below the curve is
+  // cleaner than the camera could have produced — retouched, healed or AI-smoothed.
+  const Yb = blurPlane(Y, w, h, 2), NB = 16, bins = Array.from({ length: NB }, () => []);
+  for (let p = 0; p < N; p += 2) { const v = Yb[p]; if (v > 6 && v < 249) bins[Math.min(NB - 1, Math.floor(v / 256 * NB))].push(E[p]); }
+  const pct = Math.min(0.5, Math.max(0.02, (F.pct == null ? 7 : +F.pct) / 100));
+  const floorB = bins.map(b => { if (b.length < 200) return NaN; b.sort((x, y) => x - y); return b[Math.floor(pct * (b.length - 1))]; });
+  for (let i = 0; i < NB; i++) if (!Number.isFinite(floorB[i])) {   // fill empty bands from neighbours
+    let l = i - 1, r = i + 1; while (l >= 0 && !Number.isFinite(floorB[l])) l--; while (r < NB && !Number.isFinite(floorB[r])) r++;
+    floorB[i] = l >= 0 && r < NB ? (floorB[l] + floorB[r]) / 2 : l >= 0 ? floorB[l] : r < NB ? floorB[r] : 0;
+  }
+  const m2 = Math.pow(F.match == null ? 1 : +F.match, 2);
+  const curve = (v) => { const t = Math.min(NB - 1.001, Math.max(0, v / 256 * NB - 0.5)), i = Math.floor(t), f = t - i; return floorB[i] * (1 - f) + floorB[Math.min(NB - 1, i + 1)] * f; };
+  // grain field with the same character as the camera grain (flat mid-grey, no shadow boost)
+  const G = new Float32Array(N * 4);
+  for (let i = 0; i < G.length; i += 4) { G[i] = 118; G[i + 1] = 118; G[i + 2] = 118; G[i + 3] = 255; }
+  const gs = Object.assign({}, S || {}, { on: true, amount: 1, shadows: 0, seed: (Math.round(+(S && S.seed) || 1) + 7777) });
+  sensorSim(G, w, h, gs, null);
+  const GY = new Float32Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) { G[i] -= 118; G[i + 1] -= 118; G[i + 2] -= 118; GY[p] = 0.299 * G[i] + 0.587 * G[i + 1] + 0.114 * G[i + 2]; }
+  const GH = hp(GY); let gE = 0; for (let p = 0; p < N; p++) gE += GH[p]; gE /= N;
+  if (!(gE > 1e-9)) return;
+  // per-pixel amount needed, smoothed so patch borders don't show
+  const K = new Float32Array(N);
+  for (let p = 0; p < N; p++) {
+    const ref = curve(Yb[p]) * m2, need = ref - E[p];
+    K[p] = need > 0 && Y[p] > 4 && Y[p] < 251 ? Math.sqrt(need / gE) : 0;
+  }
+  const Ks = blurPlane(K, w, h, R * 0.5);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    const k = Ks[p] * amt; if (k <= 0) continue;
+    d[i] = cl255(d[i] + G[i] * k); d[i + 1] = cl255(d[i + 1] + G[i + 1] * k); d[i + 2] = cl255(d[i + 2] + G[i + 2] * k);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* JPEG encoder (baseline, optimized Huffman)                           */
 /* ------------------------------------------------------------------ */
@@ -1630,4 +1733,4 @@ function encodeJPEG(rgba, w, h, opts) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
+if (typeof module !== 'undefined') module.exports = { dehalo, fillPatches, encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
