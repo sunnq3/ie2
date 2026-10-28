@@ -337,6 +337,19 @@ function nea(d, w, h, x, y, c) {
   xi = xi < 0 ? 0 : xi > w - 1 ? w - 1 : xi; yi = yi < 0 ? 0 : yi > h - 1 ? h - 1 : yi;
   return d[(yi * w + xi) * 4 + c];
 }
+// Pixel replace: copy one real source pixel, chosen between the two candidates on each axis with
+// probability equal to the fractional position. No new (blended) colour values are created, there is
+// no softening, and on average the sub-pixel position is exact. The choice is deterministic for a
+// given source position, so all channels sampled at the same spot pick the same pixel.
+function rpl(d, w, h, x, y, c) {
+  if (x < 0) x = 0; else if (x > w - 1) x = w - 1;
+  if (y < 0) y = 0; else if (y > h - 1) y = h - 1;
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  let xi = x0, yi = y0;
+  if (fx > 0 && x0 < w - 1 && hash2(Math.round(x * 1024), Math.round(y * 1024), 7919) < fx) xi = x0 + 1;
+  if (fy > 0 && y0 < h - 1 && hash2(Math.round(y * 1024), Math.round(x * 1024), 104729) < fy) yi = y0 + 1;
+  return d[(yi * w + xi) * 4 + c];
+}
 // Lanczos-3 via a kernel lookup table
 const LZ_RES = 1024, LZ = new Float64Array(6 * LZ_RES + 1);
 for (let i = 0; i <= 6 * LZ_RES; i++) {
@@ -679,8 +692,8 @@ function resample(data, w, h, L, A, id) {
     }
   }
 
-  const sample = L.interp === 'bilinear' ? bil : L.interp === 'nearest' ? nea : L.interp === 'lanczos3' ? lz3 : bic;
-  const bandSample = L.interp === 'nearest' ? nea : bil;
+  const sample = L.interp === 'bilinear' ? bil : L.interp === 'nearest' ? nea : L.interp === 'replace' ? rpl : L.interp === 'lanczos3' ? lz3 : bic;
+  const bandSample = L.interp === 'nearest' ? nea : L.interp === 'replace' ? rpl : bil;
   const R = Math.sqrt(w * w + h * h) / 2, invR = 1 / R, iz = 1 / z;
 
   // radial falloff curve g(r): r = 0 at centre, 1 at the corner
@@ -1013,12 +1026,28 @@ function apply1d(line, out, C) {
 
 function quant8(a) { for (let i = 0; i < a.length; i++) { let v = Math.round(a[i]); a[i] = v < 0 ? 0 : v > 255 ? 255 : v; } }
 
+// Resize by pixel replacement: every output pixel is a copy of one original pixel picked at random
+// from the area it covers. No averaging, so no blur, halos or new colour values.
+function replaceResize(d, w, h, fw, fh) {
+  const out = new Float32Array(fw * fh * 4), sx = w / fw, sy = h / fh;
+  for (let j = 0; j < fh; j++) {
+    for (let i = 0; i < fw; i++) {
+      let x = Math.floor((i + hash2(i, j, 31337)) * sx), y = Math.floor((j + hash2(j, i, 4241)) * sy);
+      x = x < 0 ? 0 : x > w - 1 ? w - 1 : x; y = y < 0 ? 0 : y > h - 1 ? h - 1 : y;
+      const s = (y * w + x) * 4, o = (j * fw + i) * 4;
+      out[o] = d[s]; out[o + 1] = d[s + 1]; out[o + 2] = d[s + 2]; out[o + 3] = 255;
+    }
+  }
+  return { data: out, w: fw, h: fh };
+}
+
 function rescale(d, w, h, S, id) {
   S = S || {};
   const up = Math.max(1, +S.up || 1);
   const fin = Math.max(0.0001, (+S.final || 100) / 100);
   const fw = Math.max(1, Math.round(w * fin)), fh = Math.max(1, Math.round(h * fin));
   if (up === 1 && fw === w && fh === h) return { data: d, w, h };
+  if (S.downMethod === 'replace') return replaceResize(d, w, h, fw, fh);
   const uw = Math.max(1, Math.round(w * up)), uh = Math.max(1, Math.round(h * up));
   const q = S.quant !== false;
   const cHu = contribs(w, uw, S.upMethod), cHd = contribs(uw, fw, S.downMethod);

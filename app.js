@@ -71,7 +71,7 @@ const STAGES = [
       { title: 'Upscale → downscale', on: 'scale.on', hint: 'To make the image smaller for where it will be shown (e.g. Reddit), set Upscale to 1× and Final size to the target. Nearest up + Box down at 100% changes nothing.', controls: [
         R('scale.final', 'Final size', 25, 200, 0.01, '%'), R('scale.up', 'Upscale', 1, 6, 0.01, '×'),
         S('scale.upMethod', 'Up filter', [['bicubic', 'Bicubic'], ['lanczos3', 'Lanczos 3'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['nearest', 'Nearest']], ADV),
-        S('scale.downMethod', 'Down filter', [['lanczos3', 'Lanczos 3'], ['bicubic', 'Bicubic'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['box', 'Box (area)'], ['nearest', 'Nearest']], ADV),
+        S('scale.downMethod', 'Method', [['lanczos3', 'Lanczos 3 (crisp)'], ['box', 'Box (smoothest)'], ['bicubic', 'Bicubic'], ['mitchell', 'Mitchell'], ['bilinear', 'Bilinear'], ['replace', 'Pixel replace (no blending, sparkles)'], ['nearest', 'Nearest']]),
         C('scale.quant', 'Round the enlarged image to 8-bit', ADV)] },
     ],
   },
@@ -101,7 +101,7 @@ const STAGES = [
     id: 'lens', title: 'Lens', heading: 'Lens & chromatic aberration', on: 'lens.on', resamples: true,
     desc: 'Distortion and colour fringing like a real lens, done in one resample. Switch off to skip resampling entirely.',
     cards: [
-      { controls: [S('lens.interp', 'Interpolation', [['lanczos3', 'Lanczos 3 (sharpest)'], ['bicubic', 'Bicubic'], ['bilinear', 'Bilinear (soft)'], ['nearest', 'Nearest (no blending)']])] },
+      { hint: 'Pixel replace copies real pixels instead of blending — best for small colour fringes; on distortion it makes edges ragged, so use Lanczos 3 there.', controls: [S('lens.interp', 'Interpolation', [['lanczos3', 'Lanczos 3 (sharpest blend)'], ['bicubic', 'Bicubic'], ['bilinear', 'Bilinear (soft)'], ['replace', 'Pixel replace (no blending)'], ['nearest', 'Nearest (whole pixels only)']])] },
       { title: 'Distortion', open: true, hint: '+ barrel, − pincushion.', controls: [
         R('lens.k1', 'Amount', -0.1, 0.1, 0.0001), C('lens.autofill', 'Fill the frame (no empty edges)'),
         R('lens.k2', 'Outer amount', -0.05, 0.05, 0.0001, '', ADV), R('lens.cx', 'Centre X', -10, 10, 0.01, '%', ADV), R('lens.cy', 'Centre Y', -10, 10, 0.01, '%', ADV),
