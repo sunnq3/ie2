@@ -11,8 +11,9 @@ const DEFAULTS = {
     pattern: { on: false, sensitivity: 4, strength: 100, protect: 6, tile: '256' },
   },
   carve: { on: true, dw: 0, dh: 0, energy: 'forward' },
-  lens: { on: true, k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'bicubic' },
+  lens: { on: true, k1: 0, k2: 0, cx: 0, cy: 0, zoom: 1, autofill: true, interp: 'lanczos3' },
   ca: {
+    keepLuma: true,
     rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0, rs: 0, gs: 0, bs: 0,
     fall: { curve: 'power', exp: 1, start: 0, width: 30, aspect: 0, shifts: false },
     disp: { on: false, lens: 'achromat', amount: 0.3, bands: 10, balance: 550 },
@@ -39,7 +40,7 @@ const NOPROCESS = ['out.'];
 const LOOKS = {
   clean: { label: 'Clean (no changes)', set: {} },
   natural: { label: 'Natural camera', set: {
-    'lens.k1': 0.004, 'ca.rs': 0.04, 'ca.bs': -0.05, 'ca.fall.exp': 1.8,
+    'ca.rs': 0.04, 'ca.bs': -0.05, 'ca.fall.exp': 1.8,
     'ca.disp.on': true, 'ca.disp.amount': 0.15, 'ca.axial.on': true, 'ca.axial.b': 0.3,
     'sensor.on': true } },
   phone: { label: 'Phone camera', set: {
@@ -90,8 +91,10 @@ const STAGES = [
     id: 'lens', title: 'Lens', heading: 'Lens & chromatic aberration', on: 'lens.on', resamples: true,
     desc: 'Distortion and colour fringing like a real lens, done in one resample. Switch off to skip resampling entirely.',
     cards: [
-      { controls: [S('lens.interp', 'Interpolation', [['lanczos3', 'Lanczos 3 (sharpest)'], ['bicubic', 'Bicubic'], ['bilinear', 'Bilinear (soft)'], ['nearest', 'Nearest (no blending)']])] },
-      { title: 'Distortion', open: true, hint: '+ barrel, − pincushion.', controls: [
+      { controls: [C('ca.keepLuma', 'Keep detail sharp (fringes change colour only)'),
+        S('lens.interp', 'Interpolation', [['lanczos3', 'Lanczos 3 (sharpest)'], ['bicubic', 'Bicubic'], ['bilinear', 'Bilinear (soft)'], ['nearest', 'Nearest (no blending)']])],
+        hint: 'With Keep detail sharp on, colour fringes never soften the image. Distortion still moves every pixel, which costs a little fine detail.' },
+      { title: 'Distortion', open: true, hint: '+ barrel, − pincushion. Leave at 0 for maximum sharpness.', controls: [
         R('lens.k1', 'Amount', -0.1, 0.1, 0.0001), C('lens.autofill', 'Fill the frame (no empty edges)'),
         R('lens.k2', 'Outer amount', -0.05, 0.05, 0.0001, '', ADV), R('lens.cx', 'Centre X', -10, 10, 0.01, '%', ADV), R('lens.cy', 'Centre Y', -10, 10, 0.01, '%', ADV),
         R('lens.zoom', 'Scale', 0.95, 1.05, 0.0001, '×', ADV)] },
