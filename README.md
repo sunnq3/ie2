@@ -2,48 +2,34 @@
 
 Browser-based micro image editor. Live: **https://sunnq3.github.io/ie2/**
 
-Everything runs locally in the browser (Web Worker); images are never uploaded.
+Everything runs locally in the browser (Web Workers); images are never uploaded. Every edit is baked into the pixels of the exported JPEG — no layers, no metadata tricks.
+
+## Layout
+
+The right-hand panel has a **stage list** (in processing order) and the controls for **one stage at a time**. Each stage has an on/off switch in its header; switching a stage off bypasses it completely. Inside a stage, related controls sit in collapsible cards; cards with a switch are optional effects. A dot in the stage list marks stages that are currently changing the image; a struck-through name means the stage is switched off. Stages that interpolate pixels are tagged **resamples**.
 
 ## Pipeline
 
-0. **Clean up banding & patterns** — runs first (on the source) or late (after colour & scale, before noise).
-   - *Deblock*: smooths JPEG 8×8 block edges where the step is small and the sides are flat.
-   - *Remove repeating patterns*: overlapped FFT tiles; spectral peaks that stand out from their neighbourhood (moiré, halftone, grids, scan lines) are pulled down. Threshold, strength, low-frequency protection, window size.
-   - *Deband*: flash3kyuu-style averaging in flat areas with triangular dither so gradient bands don't come back.
-1. **Content-aware scale (seam carving)** — removes or inserts low-energy pixel seams horizontally and/or vertically, pixel by pixel. Forward-energy or gradient energy.
-2. **Chromatic aberration** — all in the same resample as the lens warp:
-   - *Lateral*: per-channel sub-pixel X/Y shifts and radial scale, mixed in linear light (optional) like real optics.
-   - *Radial falloff*: power (rⁿ), S-curve or ring curve, start radius, ring width, elliptical aspect; optionally applied to the X/Y shifts too.
-   - *Spectral dispersion*: 3–32 wavelength bands integrated with broad Bayer-filter sensitivities. Lens type: achromat (parabolic secondary spectrum → green/magenta fringes, like most real lenses), simple lens (monotonic → blue/yellow) or prism (narrow filters → rainbow). Adjustable neutral wavelength.
-   - *Irregular CA field*: low-frequency fBm displacement per channel (amount, patch size, detail, seed, keep green steady, follow falloff).
-   - *Axial CA*: per-channel defocus blur with optional edge weighting.
-   - *Directional smear*: per-channel streaks — radial, tangential or fixed angle; trail or centred; can follow the falloff.
-   - *Echo passes*: ghost copies at multiples of each channel's own displacement, with decay and spacing.
-   - *Chroma vs luma shift*: Cb/Cr shifted against Y, plus horizontal chroma bleed and chroma blur.
-   - *Purple fringing*: tinted halo around bright high-contrast edges (threshold, width, outward offset, hue, edge weighting).
-3. **Elastic warp / lens distortion** — radial `r·(1 + k1·r² + k2·r⁴)` model (barrel / pincushion), movable centre, scale, auto-fill, bicubic or bilinear resampling. Distortion and CA share one resampling pass to avoid double interpolation.
-4. **Colour-space roundtrip** — sRGB↔linear, sRGB↔Display P3, sRGB↔CIE Lab, RGB↔HSV, RGB↔HSL, RGB↔YCbCr (BT.601/709/2020, full/limited range, 4:4:4/4:2:2/4:2:0), each with adjustable intermediate precision (4–16 bits, fractional) and 1–10 passes.
+Pixels stay in floating point between stages and are rounded to 8-bit **once**, at the end (with an optional invisible anti-banding dither). With every stage neutral, the output is byte-identical to the input.
 
-5. **Upscale → downscale** — enlarge up to 6× (0.01 steps; bicubic, Lanczos 3, Mitchell, bilinear, nearest), optionally store the enlarged image at 8-bit, then shrink to a final size (100 % = same size; 1–600 %) with Lanczos 3, bicubic, Mitchell, bilinear, box or nearest.
-
-6. **Noise distribution** — Gaussian, uniform, Laplacian, impulse (± specks) or shot (brightness-dependent) noise. Amount in 8-bit levels (0.01 steps), density, colour vs. mono, grain size, irregularity (patchy low-frequency modulation with adjustable patch size) and a seed. Apply it to the whole image, only to painted areas, or everywhere except painted areas. Paint the mask on the image with a soft brush (size, hardness, opacity), erase with Alt-drag or the Erase tool, Undo / Clear. The mask is shown as a thin outline (or tinted, or hidden) so the result underneath stays visible. Shortcuts: B paint, E erase, [ ] brush size (Shift for fine), Ctrl/⌘+Z undo, Esc stop painting.
-
-7. **Sensor grain (camera pipeline)** — runs last.
-   - *Grain only* (default): the image's own pixels are not re-sampled. Only the noise goes through a camera pipeline: per-photosite shot (signal-dependent) + read noise on a virtual Bayer mosaic in linear light (extra on red/blue sites) → demosaic of that noise (edge-directed, steered by the clean image's edges; or Malvar-He-Cutler / bilinear / none) → gamma transfer (strongest in shadows) → in-camera luma NR (removes the finest scale), sharpening (lifts mid frequencies) and chroma NR that leaves low-frequency colour blotches.
-   - *Full re-mosaic*: the image itself also goes through mosaic/demosaic, adding real demosaic artefacts.
-   - Optional in-camera image sharpening and optical blur; can follow the noise mask.
-   - Measured at equal strength, this grain keeps 2–4× more of itself through JPEG 4:2:0 (q80–92) than 1-px noise, and ~10× more through WebP q80.
-
-**Export JPG** uses a built-in baseline encoder (optimized Huffman tables):
-- Quality 1–100 (IJG scaling), chroma 4:4:4 / 4:2:2 / 4:2:0 — browsers' own export is 4:2:0, which halves colour resolution.
-- *Grain keep*: flattens the quantisation tables toward high frequencies.
-- *Dithered rounding*: stochastic rounding of AC coefficients so small detail survives in proportion to its size instead of rounding to zero.
-- The **JPEG** view shows the decoded export file, its size and how much of the fine detail survived.
+1. **Clean-up** — deblock JPEG 8×8 edges, remove repeating patterns (FFT peak suppression: moiré, halftone, grids, scan lines), deband gradients. Runs first or late.
+2. **Seams** — content-aware resize: remove or insert low-energy seams (forward or gradient energy).
+3. **Lens & CA** — one resample for everything; interpolation is your choice: Lanczos 3, bicubic, bilinear or **nearest (no interpolation)**. Switch the stage off to skip resampling entirely.
+   - Distortion: `r·(1 + k1·r² + k2·r⁴)`, movable centre, scale, auto-fill.
+   - Lateral CA: per-channel sub-pixel X/Y shift and radial scale, optionally mixed in linear light.
+   - Radial falloff: power / S-curve / ring, start radius, ring width, aspect.
+   - Spectral dispersion (achromat green/magenta, simple lens blue/yellow, prism), axial CA, purple fringing, irregular CA field.
+   - Stylised: chroma-vs-luma shift, directional smear, echo.
+4. **Colour** — roundtrip through linear, Display P3, Lab, HSV, HSL, YCbCr at adjustable intermediate precision (4–16 bits), 1–10 passes.
+5. **Resample** — optional: upscale (up to 6×) → downscale to a final size; optional luminance-only unsharp mask with threshold.
+6. **Grain** — added after all resampling, with one shared placement mask (whole image / painted / everything except painted; brush, erase, undo).
+   - *Camera sensor grain*: photosite shot + read noise in linear light → edge-directed demosaic steered by the image's own edges → in-camera luma NR, sharpening and chroma NR. Grain-only mode never touches the image's own pixels. Mid-frequency grain with soft colour blotches, strongest in shadows; at equal strength it survives JPEG 4:2:0 2–4× better than 1-px noise.
+   - *Synthetic noise*: Gaussian / uniform / Laplacian / impulse / brightness-dependent, density, colour, grain size, irregularity.
+7. **Output** — 8-bit conversion with anti-banding dither, and the built-in JPEG encoder: quality, 4:4:4 / 4:2:2 / 4:2:0, *grain keep* (flatter high-frequency quantisation), *grain-safe rounding* (stochastic rounding of AC coefficients), optimized Huffman tables.
 
 ## Viewer
 
-- Result / Original / Diff (amplified ×1–×128) / Seams (red = removed, green = duplicated)
-- Hold-to-compare button or hold <kbd>Space</kbd>
-- Zoom fit … 1600 % with pixel-exact rendering
-- Open via button, drag-and-drop or paste. HEIC and TIFF fall back to in-browser decoders.
-- Double-click any control label to reset it. Settings persist between visits.
+- Result / Original / Diff (×1–×128) / Seams (when seam carving is active) / JPEG (the decoded export file, its size and how much fine detail survived)
+- Hold to compare (or hold Space); zoom fit … 1600 %
+- Open via button, drag-and-drop or paste; HEIC and TIFF fall back to in-browser decoders
+- Double-click a control's label to reset it; each stage has Reset; settings persist between visits

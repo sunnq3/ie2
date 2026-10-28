@@ -1,12 +1,15 @@
 'use strict';
 /*
- * ie2 processing worker
- * Pipeline: seam carving -> lens distortion + chromatic aberration (single resample) -> colour-space roundtrip
+ * ie2 processing worker.
+ * Pipeline (each stage can be switched off and is then skipped entirely):
+ *   clean-up -> seam carving -> lens + chromatic aberration -> colour roundtrip ->
+ *   resample (upscale -> downscale) -> sharpen -> grain (synthetic noise, camera sensor) -> 8-bit
+ * Pixels stay in floating point between stages; they are rounded to 8-bit exactly once, at the end.
  */
 
 let SRC = null;   // { w, h, data: Uint8ClampedArray RGBA }
-let CACHE = null; // { key, w, h, data, mask }
-let PRE = null;   // output of everything before the noise stage { key, data, w, h }
+let CACHE = null; // after seam carving { key, w, h, data, mask }
+let PRE = null;   // everything before grain { key, data, w, h }
 let CLEAN = null; // cleaned source { key, data }
 
 self.onmessage = (e) => {
@@ -29,42 +32,94 @@ function progress(id, label, frac) { self.postMessage({ type: 'progress', id, la
 
 function carveKey(C) { return `${Math.round(+C.dw || 0)}|${Math.round(+C.dh || 0)}|${C.energy}`; }
 
+function toF32(d) { return d instanceof Float32Array ? d : Float32Array.from(d); }
+function toU8(d) { return d instanceof Uint8ClampedArray ? d : Uint8ClampedArray.from(d); }
+
+// The single rounding to 8-bit. Values that are already whole numbers pass through untouched;
+// everything else gets a 1-LSB triangular dither (optional) so smooth gradients can't band.
+function quantize(d, dither) {
+  const out = new Uint8ClampedArray(d.length);
+  if (!dither) { out.set(d); for (let i = 3; i < out.length; i += 4) out[i] = 255; return out; }
+  const rnd = mulberry32(0x1234567);
+  for (let i = 0; i < d.length; i++) {
+    if ((i & 3) === 3) { out[i] = 255; continue; }
+    const v = d[i], r = Math.round(v);
+    out[i] = Math.abs(v - r) < 1e-3 ? r : v + (rnd() + rnd() - 1);
+  }
+  return out;
+}
+
 function runJob(id, P) {
   if (!SRC) throw new Error('No image loaded');
   const t0 = performance.now();
+  const on = (k) => !(P[k] && P[k].on === false);
+
+  // clean-up (first position) — cached
   const C = P.clean || {};
-  const cleanOn = cleanActive(C);
+  const cleanOn = on('clean') && cleanActive(C);
   const startClean = cleanOn && C.position !== 'end';
   const ck = startClean ? JSON.stringify(C) : '';
   if (!CLEAN || CLEAN.key !== ck) {
-    CLEAN = { key: ck, data: startClean ? cleanup(SRC.data.slice(), SRC.w, SRC.h, C, id) : SRC.data };
+    CLEAN = { key: ck, data: startClean ? cleanup(toF32(SRC.data).slice(), SRC.w, SRC.h, C, id) : SRC.data };
     CACHE = null;
   }
-  const key = carveKey(P.carve) + '#' + ck;
+
+  // seam carving — cached
+  const carveP = on('carve') ? (P.carve || {}) : { dw: 0, dh: 0, energy: (P.carve || {}).energy };
+  const key = carveKey(carveP) + '#' + ck;
   let recarved = false;
   if (!CACHE || CACHE.key !== key) {
-    CACHE = carve({ w: SRC.w, h: SRC.h, data: CLEAN.data }, P.carve, id);
+    CACHE = carve({ w: SRC.w, h: SRC.h, data: CLEAN.data }, carveP, id);
     CACHE.key = key;
     recarved = true;
   }
+
+  // lens/CA -> colour -> resample -> clean-up (late) -> sharpen — cached
+  const lensOn = on('lens'), colorOn = on('color'), resizeOn = on('resize');
+  const scaleOn = resizeOn && !!(P.scale && P.scale.on), sharpOn = resizeOn && !!(P.sharpen && P.sharpen.on);
   const endClean = cleanOn && C.position === 'end';
-  const preKey = key + '|' + JSON.stringify([P.lens, P.ca, P.color, P.scale, endClean ? C : 0]);
+  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, colorOn && P.color, scaleOn && P.scale, sharpOn && P.sharpen, endClean ? C : 0]);
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
-    progress(id, 'Resampling', 0.5);
-    const out = resample(CACHE.data, w, h, P.lens, P.ca, id);
-    colorRoundtrip(out, w, h, P.color, id);
-    const fin = rescale(out, w, h, P.scale, id);
+    let out = lensOn ? resample(CACHE.data, w, h, P.lens, P.ca, id) : CACHE.data.slice();
+    out = toF32(out);
+    if (colorOn) colorRoundtrip(out, w, h, P.color, id);
+    const fin = scaleOn ? rescale(out, w, h, P.scale, id) : { data: out, w, h };
+    fin.data = toF32(fin.data);
     if (endClean) cleanup(fin.data, fin.w, fin.h, C, id);
+    if (sharpOn) sharpenImage(fin.data, fin.w, fin.h, P.sharpen);
     PRE = { key: preKey, data: fin.data, w: fin.w, h: fin.h };
   }
+
+  // grain — not cached (fast, and depends on the painted mask)
   const outData = PRE.data.slice();
-  addNoise(outData, PRE.w, PRE.h, P.noise, id);
-  sensorSim(outData, PRE.w, PRE.h, P.sensor, P.noise, id);
-  const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: outData.buffer, ms: performance.now() - t0, carveKey: key };
-  const transfer = [outData.buffer];
+  if (on('grain')) {
+    addNoise(outData, PRE.w, PRE.h, P.noise, id);
+    sensorSim(outData, PRE.w, PRE.h, P.sensor, P.noise, id);
+  }
+  const u8 = quantize(outData, !(P.final && P.final.dither === false));
+  const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: u8.buffer, ms: performance.now() - t0, carveKey: key };
+  const transfer = [u8.buffer];
   if (recarved) { const mk = CACHE.mask.slice(); msg.mask = mk.buffer; transfer.push(mk.buffer); }
   self.postMessage(msg, transfer);
+}
+
+// Unsharp mask on luminance only (no colour fringes), with a soft threshold so flat areas and
+// fine noise are left alone.
+function sharpenImage(d, w, h, S) {
+  const amt = +S.amount || 0;
+  if (!(amt > 0)) return;
+  const r = Math.max(0.3, +S.radius || 0.8), thr = Math.max(0, +S.threshold || 0);
+  const N = w * h, Y = new Float32Array(N);
+  for (let p = 0, i = 0; p < N; p++, i += 4) Y[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  const B = blurPlane(Y, w, h, r);
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    let dl = Y[p] - B[p];
+    if (thr > 0) { const a = Math.abs(dl); dl = a <= thr ? 0 : (dl > 0 ? a - thr : thr - a); }
+    if (dl === 0) continue;
+    const k = amt * dl;
+    for (let c = 0; c < 3; c++) { const v = d[i + c] + k; d[i + c] = v < 0 ? 0 : v > 255 ? 255 : v; }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -79,7 +134,7 @@ function carve(src, C, id) {
   const mask = new Uint8Array(W0 * H0); // 1 = removed, 2 = duplicated (inserted next to)
   if (!dw && !dh) return { w: W0, h: H0, data: src.data.slice(), mask };
 
-  let pix = new Uint32Array(src.data.slice().buffer);
+  let pix = new Uint32Array(toU8(src.data).slice().buffer);
   let oi = new Int32Array(W0 * H0);
   for (let i = 0; i < oi.length; i++) oi[i] = i;
   let w = W0, h = H0;
@@ -277,6 +332,42 @@ function bil(d, w, h, x, y, c) {
   return a + (b - a) * fy;
 }
 
+function cl255(v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+function nea(d, w, h, x, y, c) {
+  let xi = Math.round(x), yi = Math.round(y);
+  xi = xi < 0 ? 0 : xi > w - 1 ? w - 1 : xi; yi = yi < 0 ? 0 : yi > h - 1 ? h - 1 : yi;
+  return d[(yi * w + xi) * 4 + c];
+}
+// Lanczos-3 via a kernel lookup table
+const LZ_RES = 1024, LZ = new Float64Array(6 * LZ_RES + 1);
+for (let i = 0; i <= 6 * LZ_RES; i++) {
+  const t = i / LZ_RES - 3;
+  LZ[i] = t === 0 ? 1 : Math.abs(t) >= 3 ? 0 : (3 * Math.sin(Math.PI * t) * Math.sin(Math.PI * t / 3)) / (Math.PI * Math.PI * t * t);
+}
+const LWX = new Float64Array(6), LWY = new Float64Array(6), LIX = new Int32Array(6), LIY = new Int32Array(6);
+function lz3(d, w, h, x, y, c) {
+  if (x < 0) x = 0; else if (x > w - 1) x = w - 1;
+  if (y < 0) y = 0; else if (y > h - 1) y = h - 1;
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  if (fx === 0 && fy === 0) return d[(y0 * w + x0) * 4 + c];
+  let sx = 0, sy = 0;
+  for (let k = 0; k < 6; k++) {
+    const ox = k - 2;
+    LWX[k] = LZ[Math.round((ox - fx + 3) * LZ_RES)]; sx += LWX[k];
+    LWY[k] = LZ[Math.round((ox - fy + 3) * LZ_RES)]; sy += LWY[k];
+    const xi = x0 + ox, yi = y0 + ox;
+    LIX[k] = xi < 0 ? 0 : xi > w - 1 ? w - 1 : xi; LIY[k] = yi < 0 ? 0 : yi > h - 1 ? h - 1 : yi;
+  }
+  let s = 0;
+  for (let j = 0; j < 6; j++) {
+    const wy = LWY[j]; if (wy === 0) continue;
+    const r = LIY[j] * w;
+    let a = 0;
+    for (let k = 0; k < 6; k++) a += LWX[k] * d[(r + LIX[k]) * 4 + c];
+    s += wy * a;
+  }
+  return s / (sx * sy);
+}
 const WX = new Float64Array(4), WY = new Float64Array(4), IX = new Int32Array(4), IY = new Int32Array(4);
 function cubicW(t, o) {
   const t2 = t * t, t3 = t2 * t;
@@ -581,8 +672,7 @@ function resample(data, w, h, L, A, id) {
   const ecOn = !!EC.on && (+EC.count || 0) >= 1 && (+EC.decay || 0) > 0;
   const clOn = !!CL.on && ['cbx', 'cby', 'crx', 'cry', 'bleed', 'soft'].some(k => (+CL[k] || 0) !== 0);
   const pfOn = !!PF.on && (+PF.amount || 0) > 0;
-  const byOn = !!(A.bayer && A.bayer.on);
-  const postOn = axOn || smOn || ecOn || clOn || pfOn || byOn;
+  const postOn = axOn || smOn || ecOn || clOn || pfOn;
 
   const lensOn = k1 !== 0 || k2 !== 0;
   const caOn = sh.some(s => s[0] !== 0 || s[1] !== 0) || scl.some(s => s !== 0) || D !== 0 || irrOn || postOn;
@@ -596,11 +686,12 @@ function resample(data, w, h, L, A, id) {
     encLut();
     src = new Float32Array(data.length);
     for (let i = 0; i < data.length; i += 4) {
-      src[i] = LIN[data[i]] * 255; src[i + 1] = LIN[data[i + 1]] * 255; src[i + 2] = LIN[data[i + 2]] * 255;
+      src[i] = linOf(data[i]) * 255; src[i + 1] = linOf(data[i + 1]) * 255; src[i + 2] = linOf(data[i + 2]) * 255;
     }
   }
 
-  const sample = L.interp === 'bilinear' ? bil : bic;
+  const sample = L.interp === 'bilinear' ? bil : L.interp === 'nearest' ? nea : L.interp === 'lanczos3' ? lz3 : bic;
+  const bandSample = L.interp === 'nearest' ? nea : bil;
   const R = Math.sqrt(w * w + h * h) / 2, invR = 1 / R, iz = 1 / z;
 
   // radial falloff curve g(r): r = 0 at centre, 1 at the corner
@@ -683,7 +774,7 @@ function resample(data, w, h, L, A, id) {
 
   // ---- main pass ----
   const N = w * h;
-  const out = new Uint8ClampedArray(N * 4);
+  const out = new Float32Array(N * 4);
   const P = postOn ? [new Float32Array(N), new Float32Array(N), new Float32Array(N)] : null;
   const V = [0, 0, 0];
   let last = 0;
@@ -705,7 +796,7 @@ function resample(data, w, h, L, A, id) {
             const wb = wt[b];
             if (wb === 0) continue;
             const d = (scl[c] + D * e[b]) * gg * R;
-            acc += wb * bil(src, w, h, bx - ux * d, by - uy * d, c);
+            acc += wb * bandSample(src, w, h, bx - ux * d, by - uy * d, c);
           }
           V[c] = acc;
         }
@@ -713,7 +804,7 @@ function resample(data, w, h, L, A, id) {
       const p = y * w + x;
       if (P) { P[0][p] = V[0]; P[1][p] = V[1]; P[2][p] = V[2]; }
       else if (linOn) { const o = p * 4; out[o] = encPx(V[0]); out[o + 1] = encPx(V[1]); out[o + 2] = encPx(V[2]); out[o + 3] = 255; }
-      else { const o = p * 4; out[o] = V[0]; out[o + 1] = V[1]; out[o + 2] = V[2]; out[o + 3] = 255; }
+      else { const o = p * 4; out[o] = cl255(V[0]); out[o + 1] = cl255(V[1]); out[o + 2] = cl255(V[2]); out[o + 3] = 255; }
     }
     if (id != null && (y & 31) === 0) { const t = performance.now(); if (t - last > 100) { last = t; progress(id, 'Lens / CA', 0.3 + 0.4 * y / h); } }
   }
@@ -793,13 +884,6 @@ function resample(data, w, h, L, A, id) {
     }
   }
 
-  // ---- sensor: Bayer re-mosaic + demosaic (on linear data, like a raw pipeline) ----
-  if (byOn) {
-    if (id != null) progress(id, 'Bayer demosaic', 0.88);
-    const aa = +A.bayer.aa || 0;
-    if (aa > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, aa); // optical low-pass (AA) filter
-    bayerRoundtrip(P, w, h, A.bayer.pattern, A.bayer.method);
-  }
   // back to gamma-encoded values for the display-space effects below
   if (linOn) for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
 
@@ -858,7 +942,7 @@ function resample(data, w, h, L, A, id) {
     }
   }
 
-  for (let p = 0, o = 0; p < N; p++, o += 4) { out[o] = P[0][p]; out[o + 1] = P[1][p]; out[o + 2] = P[2][p]; out[o + 3] = 255; }
+  for (let p = 0, o = 0; p < N; p++, o += 4) { out[o] = cl255(P[0][p]); out[o + 1] = cl255(P[1][p]); out[o + 2] = cl255(P[2][p]); out[o + 3] = 255; }
   return out;
 }
 
@@ -868,6 +952,12 @@ function resample(data, w, h, L, A, id) {
 
 const LIN = new Float64Array(256);
 for (let i = 0; i < 256; i++) { const c = i / 255; LIN[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+// sRGB value (0..255, may be fractional) -> linear 0..1
+function linOf(v) {
+  if ((v | 0) === v && v >= 0 && v <= 255) return LIN[v];
+  const c = v <= 0 ? 0 : v >= 255 ? 1 : v / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
 function enc(v) { v = v < 0 ? 0 : v > 1 ? 1 : v; return v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055; }
 function dec(v) { v = v < 0 ? 0 : v > 1 ? 1 : v; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
 function levels(bits) { return Math.pow(2, +bits || 8) - 1; }
@@ -879,16 +969,16 @@ function qz(v, lo, hi, L) {
 function stLinear(d, bits) {
   const L = levels(bits);
   for (let i = 0; i < d.length; i += 4) {
-    d[i]     = enc(qz(LIN[d[i]], 0, 1, L)) * 255;
-    d[i + 1] = enc(qz(LIN[d[i + 1]], 0, 1, L)) * 255;
-    d[i + 2] = enc(qz(LIN[d[i + 2]], 0, 1, L)) * 255;
+    d[i]     = enc(qz(linOf(d[i]), 0, 1, L)) * 255;
+    d[i + 1] = enc(qz(linOf(d[i + 1]), 0, 1, L)) * 255;
+    d[i + 2] = enc(qz(linOf(d[i + 2]), 0, 1, L)) * 255;
   }
 }
 
 function stP3(d, bits) {
   const L = levels(bits);
   for (let i = 0; i < d.length; i += 4) {
-    const r = LIN[d[i]], g = LIN[d[i + 1]], b = LIN[d[i + 2]];
+    const r = linOf(d[i]), g = linOf(d[i + 1]), b = linOf(d[i + 2]);
     let pr = 0.8224621 * r + 0.1775380 * g;
     let pg = 0.0331941 * r + 0.9668058 * g;
     let pb = 0.0170827 * r + 0.0723974 * g + 0.9105199 * b;
@@ -906,7 +996,7 @@ function labFi(f) { const f3 = f * f * f; return f3 > EPS ? f3 : (116 * f - 16) 
 function stLab(d, bits) {
   const L = levels(bits);
   for (let i = 0; i < d.length; i += 4) {
-    const r = LIN[d[i]], g = LIN[d[i + 1]], b = LIN[d[i + 2]];
+    const r = linOf(d[i]), g = linOf(d[i + 1]), b = linOf(d[i + 2]);
     const X = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
     const Y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
     const Z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
@@ -1119,14 +1209,14 @@ function rescale(d, w, h, S, id) {
   }
 
   // vertical pass: (fw x h) -> (fw x fh)
-  const out = new Uint8ClampedArray(fw * fh * 4);
+  const out = new Float32Array(fw * fh * 4);
   const col = new Float32Array(h * 3), upC = new Float32Array(uh * 3), dc = new Float32Array(fh * 3);
   for (let x = 0; x < fw; x++) {
     for (let y = 0; y < h; y++) { const s = (y * fw + x) * 3; col[y * 3] = mid[s]; col[y * 3 + 1] = mid[s + 1]; col[y * 3 + 2] = mid[s + 2]; }
     apply1d(col, upC, cVu);
     if (q) quant8(upC);
     apply1d(upC, dc, cVd);
-    for (let y = 0; y < fh; y++) { const o = (y * fw + x) * 4; out[o] = dc[y * 3]; out[o + 1] = dc[y * 3 + 1]; out[o + 2] = dc[y * 3 + 2]; out[o + 3] = 255; }
+    for (let y = 0; y < fh; y++) { const o = (y * fw + x) * 4; out[o] = cl255(dc[y * 3]); out[o + 1] = cl255(dc[y * 3 + 1]); out[o + 2] = cl255(dc[y * 3 + 2]); out[o + 3] = 255; }
     if ((x & 31) === 0) tick(0.5 + 0.5 * x / fw);
   }
   return { data: out, w: fw, h: fh };
@@ -1196,7 +1286,7 @@ function rasterMask(strokes, w, h) {
 }
 
 function addNoise(d, w, h, N, id) {
-  if (!N) return;
+  if (!N || N.on === false) return;
   const amp = +N.amount || 0;
   if (!(amp > 0)) return;
   const scope = N.scope || 'all';
@@ -1281,7 +1371,7 @@ function addNoise(d, w, h, N, id) {
 /* ------------------------------------------------------------------ */
 
 function cleanActive(C) {
-  return !!(C && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on)));
+  return !!(C && C.on !== false && ((C.deblock && C.deblock.on) || (C.pattern && C.pattern.on) || (C.deband && C.deband.on)));
 }
 
 function cleanup(d, w, h, C, id) {
@@ -1361,7 +1451,7 @@ function deband(d, w, h, D) {
         const dt = (n1 - n2) * grain;
         for (let c = 0; c < 3; c++) {
           const m = (src[s0 + c] + src[s1 + c] + src[s2 + c] + src[s3 + c]) / 4;
-          d[i + c] = m + dt + (rnd() - 0.5) * 0.5;
+          d[i + c] = cl255(m + dt + (rnd() - 0.5) * 0.5);
         }
       }
     }
@@ -1491,7 +1581,7 @@ function depattern(d, w, h, Q, id) {
       if (t - last > 100) { last = t; progress(id, 'Removing patterns', done / (tilesX * tilesY)); }
     }
   }
-  for (let p = 0, i = 0; p < w * h; p++, i += 4) { d[i] = out[p * 3]; d[i + 1] = out[p * 3 + 1]; d[i + 2] = out[p * 3 + 2]; }
+  for (let p = 0, i = 0; p < w * h; p++, i += 4) { d[i] = cl255(out[p * 3]); d[i + 1] = cl255(out[p * 3 + 1]); d[i + 2] = cl255(out[p * 3 + 2]); }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1517,11 +1607,10 @@ function sensorSim(d, w, h, S, NZ, id) {
   const N = w * h, full = S.mode === 'full';
   const P = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   const L8 = new Float32Array(256); for (let v = 0; v < 256; v++) L8[v] = LIN[v] * 255;
-  { const A0 = P[0], A1 = P[1], A2 = P[2]; for (let p = 0, i = 0; p < N; p++, i += 4) { A0[p] = L8[d[i]]; A1[p] = L8[d[i + 1]]; A2[p] = L8[d[i + 2]]; } }
+  const lin = (v) => ((v | 0) === v && v >= 0 && v <= 255 ? L8[v] : linOf(v) * 255);
+  { const A0 = P[0], A1 = P[1], A2 = P[2]; for (let p = 0, i = 0; p < N; p++, i += 4) { A0[p] = lin(d[i]); A1[p] = lin(d[i + 1]); A2[p] = lin(d[i + 2]); } }
   const EL = ENC_LUT, K = 65536 / 255;
   const E = (v) => { const t = v * K; if (!(t > 0)) return 0; if (t >= 65536) return 255; const i = t | 0; return EL[i] + (EL[i + 1] - EL[i]) * (t - i); };
-  const opt = +S.optical || 0;
-  if (opt > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, opt);
   // clean reference in gamma space
   const Cg = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   for (let c = 0; c < 3; c++) { const A = P[c], B = Cg[c]; for (let p = 0; p < N; p++) B[p] = E(A[p]); }
@@ -1537,7 +1626,7 @@ function sensorSim(d, w, h, S, NZ, id) {
   const shot = Math.max(0, +S.shot || 0), read = Math.max(0, +S.read || 0);
   const gainB = [1 + (+S.rgain || 0) / 100, 1, 1 + (+S.bgain || 0) / 100];
   let mask = null;
-  if (S.useMask && NZ && NZ.scope !== 'all') {
+  if (NZ && NZ.scope && NZ.scope !== 'all') {
     mask = rasterMask(NZ.strokes || [], w, h);
     if (NZ.scope === 'outside') for (let i = 0; i < N; i++) mask[i] = 1 - mask[i];
   }
@@ -1604,13 +1693,6 @@ function sensorSim(d, w, h, S, NZ, id) {
     const bs = Math.max(0.5, +S.blotchSize || 2.5);
     const Bb = blurPlane(Cb, w, h, bs), Br = blurPlane(Cr, w, h, bs);
     for (let p = 0; p < N; p++) { Cb[p] = (1 - cnr) * Cb[p] + bl * Bb[p]; Cr[p] = (1 - cnr) * Cr[p] + bl * Br[p]; }
-  }
-
-  // optional in-camera sharpening of the image itself
-  const is = +S.imgSharpen || 0;
-  if (is > 0) {
-    const r = Math.max(0.3, +S.imgSharpenR || 0.8);
-    for (let c = 0; c < 3; c++) { const B = blurPlane(Cg[c], w, h, r), A = Cg[c]; for (let p = 0; p < N; p++) A[p] += is * (A[p] - B[p]); }
   }
 
   { const C0 = Cg[0], C1 = Cg[1], C2 = Cg[2];
