@@ -2,8 +2,8 @@
 /*
  * ie2 processing worker.
  * Pipeline (each stage can be switched off and is then skipped entirely):
- *   clean-up -> seam carving -> lens + chromatic aberration -> colour roundtrip ->
- *   resample (upscale -> downscale) -> sharpen -> grain (synthetic noise, camera sensor) -> 8-bit
+ *   clean-up -> seam carving -> lens + chromatic aberration -> resample (upscale -> downscale) ->
+ *   sharpen -> camera grain -> 8-bit
  * Pixels stay in floating point between stages; they are rounded to 8-bit exactly once, at the end.
  */
 
@@ -36,7 +36,7 @@ function toF32(d) { return d instanceof Float32Array ? d : Float32Array.from(d);
 function toU8(d) { return d instanceof Uint8ClampedArray ? d : Uint8ClampedArray.from(d); }
 
 // The single rounding to 8-bit. Values that are already whole numbers pass through untouched;
-// everything else gets a 1-LSB triangular dither (optional) so smooth gradients can't band.
+// everything else gets an invisible 1-LSB triangular dither so smooth gradients can't band.
 function quantize(d, dither) {
   const out = new Uint8ClampedArray(d.length);
   if (!dither) { out.set(d); for (let i = 3; i < out.length; i += 4) out[i] = 255; return out; }
@@ -54,13 +54,12 @@ function runJob(id, P) {
   const t0 = performance.now();
   const on = (k) => !(P[k] && P[k].on === false);
 
-  // clean-up (first position) — cached
+  // clean-up (always first) — cached
   const C = P.clean || {};
   const cleanOn = on('clean') && cleanActive(C);
-  const startClean = cleanOn && C.position !== 'end';
-  const ck = startClean ? JSON.stringify(C) : '';
+  const ck = cleanOn ? JSON.stringify(C) : '';
   if (!CLEAN || CLEAN.key !== ck) {
-    CLEAN = { key: ck, data: startClean ? cleanup(toF32(SRC.data).slice(), SRC.w, SRC.h, C, id) : SRC.data };
+    CLEAN = { key: ck, data: cleanOn ? cleanup(toF32(SRC.data).slice(), SRC.w, SRC.h, C, id) : SRC.data };
     CACHE = null;
   }
 
@@ -74,30 +73,24 @@ function runJob(id, P) {
     recarved = true;
   }
 
-  // lens/CA -> colour -> resample -> clean-up (late) -> sharpen — cached
-  const lensOn = on('lens'), colorOn = on('color'), resizeOn = on('resize');
+  // lens/CA -> resample -> sharpen — cached
+  const lensOn = on('lens'), resizeOn = on('resize');
   const scaleOn = resizeOn && !!(P.scale && P.scale.on), sharpOn = resizeOn && !!(P.sharpen && P.sharpen.on);
-  const endClean = cleanOn && C.position === 'end';
-  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, colorOn && P.color, scaleOn && P.scale, sharpOn && P.sharpen, endClean ? C : 0]);
+  const preKey = key + '|' + JSON.stringify([lensOn && P.lens, lensOn && P.ca, scaleOn && P.scale, sharpOn && P.sharpen]);
   if (recarved || !PRE || PRE.key !== preKey) {
     const { w, h } = CACHE;
     let out = lensOn ? resample(CACHE.data, w, h, P.lens, P.ca, id) : CACHE.data.slice();
     out = toF32(out);
-    if (colorOn) colorRoundtrip(out, w, h, P.color, id);
     const fin = scaleOn ? rescale(out, w, h, P.scale, id) : { data: out, w, h };
     fin.data = toF32(fin.data);
-    if (endClean) cleanup(fin.data, fin.w, fin.h, C, id);
     if (sharpOn) sharpenImage(fin.data, fin.w, fin.h, P.sharpen);
     PRE = { key: preKey, data: fin.data, w: fin.w, h: fin.h };
   }
 
-  // grain — not cached (fast, and depends on the painted mask)
+  // camera grain — last, after all resampling
   const outData = PRE.data.slice();
-  if (on('grain')) {
-    addNoise(outData, PRE.w, PRE.h, P.noise, id);
-    sensorSim(outData, PRE.w, PRE.h, P.sensor, P.noise, id);
-  }
-  const u8 = quantize(outData, !(P.final && P.final.dither === false));
+  sensorSim(outData, PRE.w, PRE.h, P.sensor, id);
+  const u8 = quantize(outData, true);
   const msg = { type: 'result', id, w: PRE.w, h: PRE.h, buffer: u8.buffer, ms: performance.now() - t0, carveKey: key };
   const transfer = [u8.buffer];
   if (recarved) { const mk = CACHE.mask.slice(); msg.mask = mk.buffer; transfer.push(mk.buffer); }
@@ -615,16 +608,6 @@ function demosaicMosaic(M, w, h, cfa, method, guide) {
   return P;
 }
 
-/* Bayer re-mosaic + demosaic of whole planes (used by the CA stage) */
-function bayerRoundtrip(P, w, h, pattern, method, onMosaic) {
-  const cfa = cfaOf(pattern), N = w * h, M = new Float32Array(N);
-  const col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) M[y * w + x] = P[col(x, y)][y * w + x];
-  if (onMosaic) onMosaic(M, col);
-  const R = demosaicMosaic(M, w, h, cfa, method || 'mhc', M);
-  for (let c = 0; c < 3; c++) { const a = R[c], b = P[c]; for (let p = 0; p < N; p++) b[p] = a[p] < 0 ? 0 : a[p]; }
-}
-
 /* 16-bit LUT linear(0..1) -> sRGB(0..255) */
 let ENC_LUT = null;
 function encLut() {
@@ -947,7 +930,7 @@ function resample(data, w, h, L, A, id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 4. Colour-space roundtripping                                        */
+/* sRGB transfer helpers                                                */
 /* ------------------------------------------------------------------ */
 
 const LIN = new Float64Array(256);
@@ -959,164 +942,6 @@ function linOf(v) {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 function enc(v) { v = v < 0 ? 0 : v > 1 ? 1 : v; return v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055; }
-function dec(v) { v = v < 0 ? 0 : v > 1 ? 1 : v; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
-function levels(bits) { return Math.pow(2, +bits || 8) - 1; }
-function qz(v, lo, hi, L) {
-  if (v < lo) v = lo; else if (v > hi) v = hi;
-  return lo + Math.round(((v - lo) / (hi - lo)) * L) / L * (hi - lo);
-}
-
-function stLinear(d, bits) {
-  const L = levels(bits);
-  for (let i = 0; i < d.length; i += 4) {
-    d[i]     = enc(qz(linOf(d[i]), 0, 1, L)) * 255;
-    d[i + 1] = enc(qz(linOf(d[i + 1]), 0, 1, L)) * 255;
-    d[i + 2] = enc(qz(linOf(d[i + 2]), 0, 1, L)) * 255;
-  }
-}
-
-function stP3(d, bits) {
-  const L = levels(bits);
-  for (let i = 0; i < d.length; i += 4) {
-    const r = linOf(d[i]), g = linOf(d[i + 1]), b = linOf(d[i + 2]);
-    let pr = 0.8224621 * r + 0.1775380 * g;
-    let pg = 0.0331941 * r + 0.9668058 * g;
-    let pb = 0.0170827 * r + 0.0723974 * g + 0.9105199 * b;
-    pr = dec(qz(enc(pr), 0, 1, L)); pg = dec(qz(enc(pg), 0, 1, L)); pb = dec(qz(enc(pb), 0, 1, L));
-    const sr = 1.2249401 * pr - 0.2249404 * pg;
-    const sg = -0.0420569 * pr + 1.0420571 * pg;
-    const sb = -0.0196376 * pr - 0.0786361 * pg + 1.0982735 * pb;
-    d[i] = enc(sr) * 255; d[i + 1] = enc(sg) * 255; d[i + 2] = enc(sb) * 255;
-  }
-}
-
-const XN = 0.95047, YN = 1.0, ZN = 1.08883, EPS = 216 / 24389, KAP = 24389 / 27;
-function labF(t) { return t > EPS ? Math.cbrt(t) : (KAP * t + 16) / 116; }
-function labFi(f) { const f3 = f * f * f; return f3 > EPS ? f3 : (116 * f - 16) / KAP; }
-function stLab(d, bits) {
-  const L = levels(bits);
-  for (let i = 0; i < d.length; i += 4) {
-    const r = linOf(d[i]), g = linOf(d[i + 1]), b = linOf(d[i + 2]);
-    const X = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
-    const Y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
-    const Z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
-    const fx = labF(X / XN), fy = labF(Y / YN), fz = labF(Z / ZN);
-    let l = 116 * fy - 16, a = 500 * (fx - fy), bb = 200 * (fy - fz);
-    l = qz(l, 0, 100, L); a = qz(a, -128, 128, L); bb = qz(bb, -128, 128, L);
-    const gy = (l + 16) / 116, gx = gy + a / 500, gz = gy - bb / 200;
-    const X2 = labFi(gx) * XN, Y2 = labFi(gy) * YN, Z2 = labFi(gz) * ZN;
-    const r2 = 3.2404542 * X2 - 1.5371385 * Y2 - 0.4985314 * Z2;
-    const g2 = -0.9692660 * X2 + 1.8760108 * Y2 + 0.0415560 * Z2;
-    const b2 = 0.0556434 * X2 - 0.2040259 * Y2 + 1.0572252 * Z2;
-    d[i] = enc(r2) * 255; d[i + 1] = enc(g2) * 255; d[i + 2] = enc(b2) * 255;
-  }
-}
-
-function hueOf(r, g, b, mx, dl) {
-  if (!dl) return 0;
-  let h;
-  if (mx === r) h = ((g - b) / dl) % 6;
-  else if (mx === g) h = (b - r) / dl + 2;
-  else h = (r - g) / dl + 4;
-  h *= 60;
-  return h < 0 ? h + 360 : h;
-}
-const OUT = new Float64Array(3);
-function fromHC(h, c, m) {
-  const hp = (h % 360) / 60, x = c * (1 - Math.abs((hp % 2) - 1));
-  let r = 0, g = 0, b = 0;
-  if (hp < 1) { r = c; g = x; } else if (hp < 2) { r = x; g = c; } else if (hp < 3) { g = c; b = x; }
-  else if (hp < 4) { g = x; b = c; } else if (hp < 5) { r = x; b = c; } else { r = c; b = x; }
-  OUT[0] = r + m; OUT[1] = g + m; OUT[2] = b + m;
-}
-function stHSV(d, bits) {
-  const L = levels(bits);
-  for (let i = 0; i < d.length; i += 4) {
-    const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), dl = mx - mn;
-    let h = hueOf(r, g, b, mx, dl), s = mx ? dl / mx : 0, v = mx;
-    h = qz(h, 0, 360, L); s = qz(s, 0, 1, L); v = qz(v, 0, 1, L);
-    const c = v * s;
-    fromHC(h, c, v - c);
-    d[i] = OUT[0] * 255; d[i + 1] = OUT[1] * 255; d[i + 2] = OUT[2] * 255;
-  }
-}
-function stHSL(d, bits) {
-  const L = levels(bits);
-  for (let i = 0; i < d.length; i += 4) {
-    const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), dl = mx - mn;
-    let l = (mx + mn) / 2;
-    let h = hueOf(r, g, b, mx, dl);
-    let s = dl ? dl / (1 - Math.abs(2 * l - 1)) : 0;
-    h = qz(h, 0, 360, L); s = qz(s, 0, 1, L); l = qz(l, 0, 1, L);
-    const c = (1 - Math.abs(2 * l - 1)) * s;
-    fromHC(h, c, l - c / 2);
-    d[i] = OUT[0] * 255; d[i + 1] = OUT[1] * 255; d[i + 2] = OUT[2] * 255;
-  }
-}
-
-function stYcc(d, w, h, Y) {
-  const bits = +Y.bits || 8;
-  const Kr = Y.matrix === '709' ? 0.2126 : Y.matrix === '2020' ? 0.2627 : 0.299;
-  const Kb = Y.matrix === '709' ? 0.0722 : Y.matrix === '2020' ? 0.0593 : 0.114;
-  const Kg = 1 - Kr - Kb;
-  const N = w * h;
-  const YP = new Float32Array(N), CB = new Float32Array(N), CR = new Float32Array(N);
-  let qY, qC;
-  if (Y.range === 'limited') {
-    const s = Math.pow(2, bits - 8), LY = 219 * s, LC = 224 * s;
-    qY = v => Math.round((v < 0 ? 0 : v > 1 ? 1 : v) * LY) / LY;
-    qC = c => Math.round((c < -0.5 ? -0.5 : c > 0.5 ? 0.5 : c) * LC) / LC;
-  } else {
-    const L = levels(bits);
-    qY = v => Math.round((v < 0 ? 0 : v > 1 ? 1 : v) * L) / L;
-    qC = c => Math.round(((c < -0.5 ? -0.5 : c > 0.5 ? 0.5 : c) + 0.5) * L) / L - 0.5;
-  }
-  for (let p = 0, i = 0; p < N; p++, i += 4) {
-    const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
-    const yy = Kr * r + Kg * g + Kb * b;
-    YP[p] = qY(yy);
-    CB[p] = (b - yy) / (2 * (1 - Kb));
-    CR[p] = (r - yy) / (2 * (1 - Kr));
-  }
-  const sub = Y.sub || '444';
-  const bx = sub === '444' ? 1 : 2, by = sub === '420' ? 2 : 1;
-  for (let y0 = 0; y0 < h; y0 += by) {
-    for (let x0 = 0; x0 < w; x0 += bx) {
-      let sb = 0, sr = 0, n = 0;
-      for (let yy = y0; yy < Math.min(h, y0 + by); yy++)
-        for (let xx = x0; xx < Math.min(w, x0 + bx); xx++) { const p = yy * w + xx; sb += CB[p]; sr += CR[p]; n++; }
-      const qb = qC(sb / n), qr = qC(sr / n);
-      for (let yy = y0; yy < Math.min(h, y0 + by); yy++)
-        for (let xx = x0; xx < Math.min(w, x0 + bx); xx++) { const p = yy * w + xx; CB[p] = qb; CR[p] = qr; }
-    }
-  }
-  for (let p = 0, i = 0; p < N; p++, i += 4) {
-    const yy = YP[p];
-    const r = yy + 2 * (1 - Kr) * CR[p];
-    const b = yy + 2 * (1 - Kb) * CB[p];
-    const g = (yy - Kr * r - Kb * b) / Kg;
-    d[i] = r * 255; d[i + 1] = g * 255; d[i + 2] = b * 255;
-  }
-}
-
-function colorRoundtrip(d, w, h, C, id) {
-  if (!C) return;
-  const it = Math.max(0, Math.round(+C.iterations || 0));
-  const on = s => C[s] && C[s].on;
-  if (!it || !['linear', 'p3', 'lab', 'hsv', 'hsl', 'ycc'].some(on)) return;
-  for (let k = 0; k < it; k++) {
-    progress(id, 'Colour roundtrip', (k + 0.5) / it);
-    if (on('linear')) stLinear(d, C.linear.bits);
-    if (on('p3')) stP3(d, C.p3.bits);
-    if (on('lab')) stLab(d, C.lab.bits);
-    if (on('hsv')) stHSV(d, C.hsv.bits);
-    if (on('hsl')) stHSL(d, C.hsl.bits);
-    if (on('ycc')) stYcc(d, w, h, C.ycc);
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* 5. Upscale -> downscale roundtrip                                    */
 /* ------------------------------------------------------------------ */
@@ -1223,7 +1048,7 @@ function rescale(d, w, h, S, id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 6. Noise distribution (with painted mask)                            */
+/* Random helpers                                                       */
 /* ------------------------------------------------------------------ */
 
 function mulberry32(a) {
@@ -1245,125 +1070,6 @@ function vnoise(x, y, s) {
   const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
   const a = hash2(xi, yi, s), b = hash2(xi + 1, yi, s), c = hash2(xi, yi + 1, s), d = hash2(xi + 1, yi + 1, s);
   return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
-}
-
-// Rasterise brush strokes (normalised coords) into a 0..1 mask at w x h
-function rasterMask(strokes, w, h) {
-  const m = new Float32Array(w * h);
-  for (const s of strokes) {
-    const R = Math.max(0.7072, (+s.r || 0) * w);
-    const inner = R * Math.min(1, Math.max(0, +s.h || 0));
-    const op = Math.min(1, Math.max(0, s.o == null ? 1 : +s.o));
-    const erase = s.mode === 'erase';
-    const pts = s.pts || [];
-    const stamp = (cx, cy) => {
-      const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(w - 1, Math.ceil(cx + R));
-      const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(h - 1, Math.ceil(cy + R));
-      for (let y = y0; y <= y1; y++) {
-        const dy = y + 0.5 - cy;
-        for (let x = x0; x <= x1; x++) {
-          const dx = x + 0.5 - cx, d = Math.sqrt(dx * dx + dy * dy);
-          if (d >= R) continue;
-          let a = d <= inner ? 1 : 1 - (d - inner) / (R - inner);
-          a = a * a * (3 - 2 * a) * op;
-          const i = y * w + x;
-          if (erase) { const v = 1 - a; if (v < m[i]) m[i] = v; } else if (a > m[i]) m[i] = a;
-        }
-      }
-    };
-    if (pts.length < 2) continue;
-    let px = pts[0] * w, py = pts[1] * h;
-    stamp(px, py);
-    const step = Math.max(0.35, R * 0.2);
-    for (let k = 2; k + 1 < pts.length; k += 2) {
-      const qx = pts[k] * w, qy = pts[k + 1] * h;
-      const len = Math.hypot(qx - px, qy - py), n = Math.ceil(len / step);
-      for (let j = 1; j <= n; j++) stamp(px + (qx - px) * j / n, py + (qy - py) * j / n);
-      px = qx; py = qy;
-    }
-  }
-  return m;
-}
-
-function addNoise(d, w, h, N, id) {
-  if (!N || N.on === false) return;
-  const amp = +N.amount || 0;
-  if (!(amp > 0)) return;
-  const scope = N.scope || 'all';
-  let mask = null;
-  if (scope !== 'all') {
-    if (scope === 'inside' && !(N.strokes && N.strokes.length)) return;
-    progress(id, 'Noise mask', 0.2);
-    mask = rasterMask(N.strokes || [], w, h);
-  }
-  progress(id, 'Noise', 0.5);
-  const type = N.type || 'gaussian';
-  const dens = Math.min(1, Math.max(0, (N.density == null ? 100 : +N.density) / 100));
-  const ch = Math.min(1, Math.max(0, (+N.chroma || 0) / 100));
-  const g = Math.max(1, +N.grain || 1);
-  const irr = Math.min(1, Math.max(0, (+N.irregular || 0) / 100));
-  const iS = Math.max(1, +N.irrScale || 32);
-  const seed = Math.round(+N.seed || 1);
-
-  const rA = mulberry32(seed * 2654435761), rD = mulberry32((seed ^ 0x5bd1e995) * 2246822519);
-  let spare = null;
-  const gauss = () => {
-    if (spare !== null) { const v = spare; spare = null; return v; }
-    let u = rA(); if (u < 1e-12) u = 1e-12;
-    const v = rA(), r = Math.sqrt(-2 * Math.log(u));
-    spare = r * Math.sin(2 * Math.PI * v);
-    return r * Math.cos(2 * Math.PI * v);
-  };
-  const draw = type === 'uniform' ? () => (rA() * 2 - 1) * 1.7320508
-    : type === 'laplacian' ? () => { const u = rA() - 0.5, a = Math.max(1e-12, 1 - 2 * Math.abs(u)); return (u < 0 ? 1 : -1) * Math.log(a) / Math.SQRT2; }
-    : type === 'impulse' ? () => (rA() < 0.5 ? -1 : 1)
-    : gauss;
-  const shot = type === 'shot';
-
-  // Coarse fields for grain > 1
-  let F = null, gw = 0, gh = 0, comp = 1;
-  if (g > 1) {
-    gw = Math.ceil(w / g) + 2; gh = Math.ceil(h / g) + 2;
-    F = [new Float32Array(gw * gh), new Float32Array(gw * gh), new Float32Array(gw * gh), new Float32Array(gw * gh)];
-    for (let i = 0; i < gw * gh; i++) { F[0][i] = draw(); F[1][i] = draw(); F[2][i] = draw(); F[3][i] = draw(); }
-    comp = 1 + 0.5 * Math.min(1, g - 1);
-  }
-  const sampleF = (f, x, y) => {
-    const gx = x / g, gy = y / g, xi = gx | 0, yi = gy | 0, fx = gx - xi, fy = gy - yi, o = yi * gw + xi;
-    const a = f[o] + (f[o + 1] - f[o]) * fx, b = f[o + gw] + (f[o + gw + 1] - f[o + gw]) * fx;
-    return (a + (b - a) * fy) * comp;
-  };
-
-  let last = 0;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x, i = p * 4;
-      // consume randoms in a fixed order so the pattern is stable while you paint
-      let nm, n0, n1, n2;
-      if (F) { nm = sampleF(F[0], x, y); n0 = sampleF(F[1], x, y); n1 = sampleF(F[2], x, y); n2 = sampleF(F[3], x, y); }
-      else { nm = draw(); n0 = draw(); n1 = draw(); n2 = draw(); }
-      const dr = rD();
-      let wgt = 1;
-      if (mask) { wgt = scope === 'inside' ? mask[p] : 1 - mask[p]; if (wgt <= 0) continue; }
-      let mult = 1;
-      if (irr > 0) {
-        const V = vnoise(x / iS, y / iS, seed) * 0.65 + vnoise(2 * x / iS, 2 * y / iS, seed + 7) * 0.35;
-        mult = 1 + irr * (2 * V - 1) * 1.6;
-        if (mult <= 0) continue;
-      }
-      if (dr >= dens * Math.min(1, mult)) continue;
-      const A = amp * wgt * mult;
-      const a0 = (1 - ch) * nm + ch * n0, a1 = (1 - ch) * nm + ch * n1, a2 = (1 - ch) * nm + ch * n2;
-      if (shot) {
-        d[i] = d[i] + a0 * A * Math.sqrt(Math.max(d[i], 1) / 128);
-        d[i + 1] = d[i + 1] + a1 * A * Math.sqrt(Math.max(d[i + 1], 1) / 128);
-        d[i + 2] = d[i + 2] + a2 * A * Math.sqrt(Math.max(d[i + 2], 1) / 128);
-      } else {
-        d[i] = d[i] + a0 * A; d[i + 1] = d[i + 1] + a1 * A; d[i + 2] = d[i + 2] + a2 * A;
-      }
-    }
-    if ((y & 63) === 0) { const t = performance.now(); if (t - last > 80) { last = t; progress(id, 'Noise', 0.5 + 0.5 * y / h); } }
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1585,51 +1291,49 @@ function depattern(d, w, h, Q, id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 7. Sensor simulation: camera-pipeline grain                          */
+/* Camera grain: noise sent through a camera pipeline                   */
 /* ------------------------------------------------------------------ */
 /*
- * Grain-only mode (default) leaves the image's own detail untouched and sends only the noise
- * through a camera pipeline:
- *   1. per-photosite shot (signal-dependent) + read noise on a virtual Bayer mosaic, in linear light,
- *      with extra noise on red/blue sites;
- *   2. demosaic of that noise mosaic — edge-directed, steered by the clean image's own edges, so
- *      each photosite's noise spreads into its neighbours along structures, not across them;
- *   3. transfer to gamma space (noise ends up strongest in the shadows);
- *   4. in-camera processing of the noise: luma NR (removes the finest scale), sharpening (lifts
- *      mid frequencies), chroma NR that leaves low-frequency colour blotches.
- * Full re-mosaic mode also passes the image through the mosaic/demosaic, adding real demosaic
- * artefacts; the in-camera processing then shapes those too.
+ * The image's own pixels are never re-sampled; only the noise goes through the pipeline:
+ *   1. per-photosite noise on a virtual Bayer mosaic, in linear light:
+ *        shot noise  ∝ sqrt(signal)   (photon noise)
+ *        read noise  = constant floor (electronics) — after the sRGB curve this is what makes grain
+ *                      accumulate in the shadows, as on a real sensor;
+ *   2. edge-directed demosaic of that noise, steered by the clean image's own edges, so each
+ *      photosite's noise spreads into its neighbours along structures;
+ *   3. sRGB transfer (strongest in shadows);
+ *   4. in-camera luma NR + sharpening (grain lands at mid frequencies) and chroma NR that leaves
+ *      soft low-frequency colour blotches.
+ * Simple controls: amount (overall), shadows (read-noise floor), colour (colour-noise share).
  */
-function sensorSim(d, w, h, S, NZ, id) {
+function sensorSim(d, w, h, S, id) {
   if (!S || !S.on) return;
-  if (id != null) progress(id, 'Sensor', 0.88);
+  const amount = Math.max(0, S.amount == null ? 1 : +S.amount);
+  const shot = Math.max(0, +S.shot || 0) * amount;
+  const read = Math.max(0, +S.read || 0) * amount * Math.max(0, S.shadows == null ? 1 : +S.shadows);
+  const colour = Math.max(0, S.colour == null ? 1 : +S.colour);
+  if (!(shot > 0 || read > 0)) return;
+  if (id != null) progress(id, 'Grain', 0.88);
   encLut();
-  const N = w * h, full = S.mode === 'full';
+  const N = w * h;
   const P = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   const L8 = new Float32Array(256); for (let v = 0; v < 256; v++) L8[v] = LIN[v] * 255;
   const lin = (v) => ((v | 0) === v && v >= 0 && v <= 255 ? L8[v] : linOf(v) * 255);
   { const A0 = P[0], A1 = P[1], A2 = P[2]; for (let p = 0, i = 0; p < N; p++, i += 4) { A0[p] = lin(d[i]); A1[p] = lin(d[i + 1]); A2[p] = lin(d[i + 2]); } }
   const EL = ENC_LUT, K = 65536 / 255;
   const E = (v) => { const t = v * K; if (!(t > 0)) return 0; if (t >= 65536) return 255; const i = t | 0; return EL[i] + (EL[i + 1] - EL[i]) * (t - i); };
-  // clean reference in gamma space
   const Cg = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   for (let c = 0; c < 3; c++) { const A = P[c], B = Cg[c]; for (let p = 0; p < N; p++) B[p] = E(A[p]); }
 
-  const cfa = cfaOf(S.pattern), col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
+  const cfa = cfaOf('RGGB');
   const Mc = new Float32Array(N);
   for (let y = 0; y < h; y++) {
     const r = y * w, cA = P[cfa[(y & 1) << 1]], cB = P[cfa[((y & 1) << 1) | 1]];
     for (let x = 0; x < w; x += 2) { Mc[r + x] = cA[r + x]; if (x + 1 < w) Mc[r + x + 1] = cB[r + x + 1]; }
   }
 
-  // per-photosite noise
-  const shot = Math.max(0, +S.shot || 0), read = Math.max(0, +S.read || 0);
-  const gainB = [1 + (+S.rgain || 0) / 100, 1, 1 + (+S.bgain || 0) / 100];
-  let mask = null;
-  if (NZ && NZ.scope && NZ.scope !== 'all') {
-    mask = rasterMask(NZ.strokes || [], w, h);
-    if (NZ.scope === 'outside') for (let i = 0; i < N; i++) mask[i] = 1 - mask[i];
-  }
+  // 1. photosite noise (red and blue sites get less light -> more noise)
+  const gainB = [1 + (S.rgain == null ? 30 : +S.rgain) / 100, 1, 1 + (S.bgain == null ? 50 : +S.bgain) / 100];
   const rnd = mulberry32(((Math.round(+S.seed || 1) * 2654435761) ^ 0x9e3779b9) >>> 0);
   let spare = null;
   const gauss = () => {
@@ -1639,61 +1343,33 @@ function sensorSim(d, w, h, S, NZ, id) {
     spare = r * Math.sin(6.283185307179586 * v);
     return r * Math.cos(6.283185307179586 * v);
   };
-  const Nm = new Float32Array(N);
-  if (shot > 0 || read > 0) {
-    const s2 = shot * shot, r2 = read * read;
-    for (let y = 0; y < h; y++) {
-      const gA = gainB[cfa[(y & 1) << 1]], gB = gainB[cfa[((y & 1) << 1) | 1]];
-      for (let x = 0; x < w; x++) {
-        const p = y * w + x, n = gauss(), v = Mc[p], g = (x & 1) ? gB : gA;
-        const sd = Math.sqrt(s2 * g * (v > 0 ? v : 0) + r2 * g * g);
-        Nm[p] = mask ? n * sd * mask[p] : n * sd;
-      }
+  const Nm = new Float32Array(N), s2 = shot * shot, r2 = read * read;
+  for (let y = 0; y < h; y++) {
+    const gA = gainB[cfa[(y & 1) << 1]], gB = gainB[cfa[((y & 1) << 1) | 1]];
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x, v = Mc[p], g = (x & 1) ? gB : gA;
+      Nm[p] = gauss() * Math.sqrt(s2 * g * (v > 0 ? v : 0) + r2 * g * g);
     }
   }
 
-  // demosaic, then the noise (or noise + demosaic error) in gamma space
-  const interp = S.interp || 'edge';
-  let nG;
-  if (interp === 'none' && !full) {
-    nG = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
-    // independent per-pixel noise, no CFA correlation
-    for (let c = 0; c < 3; c++) for (let p = 0; p < N; p++) {
-      const v = P[c][p], g = gainB[c], sd = Math.sqrt(shot * shot * g * (v > 0 ? v : 0) + read * read * g * g);
-      nG[c][p] = E(v + gauss() * sd * (mask ? mask[p] : 1)) - Cg[c][p];
-    }
-  } else {
-    if (id != null) progress(id, 'Sensor: demosaic', 0.91);
-    let R;
-    if (full) {
-      const Mn = new Float32Array(N); for (let p = 0; p < N; p++) Mn[p] = Mc[p] + Nm[p];
-      const guide = new Float32Array(N); for (let p = 0; p < N; p++) guide[p] = E(Mn[p]);
-      R = demosaicMosaic(Mn, w, h, cfa, interp === 'none' ? 'edge' : interp, guide);
-      for (let c = 0; c < 3; c++) { const A = R[c], B = Cg[c]; for (let p = 0; p < N; p++) A[p] = E(A[p]) - B[p]; }
-      nG = R;
-    } else {
-      const guide = new Float32Array(N); for (let p = 0; p < N; p++) guide[p] = E(Mc[p]);
-      R = demosaicMosaic(Nm, w, h, cfa, interp, guide);
-      for (let c = 0; c < 3; c++) { const A = P[c], Rn = R[c], B = Cg[c]; for (let p = 0; p < N; p++) Rn[p] = E(A[p] + Rn[p]) - B[p]; P[c] = null; }
-      nG = R;
-    }
-  }
+  // 2 + 3. edge-directed demosaic of the noise, then into sRGB
+  if (id != null) progress(id, 'Grain: demosaic', 0.91);
+  const guide = new Float32Array(N); for (let p = 0; p < N; p++) guide[p] = E(Mc[p]);
+  const nG = demosaicMosaic(Nm, w, h, cfa, 'edge', guide);
+  for (let c = 0; c < 3; c++) { const A = P[c], Rn = nG[c], B = Cg[c]; for (let p = 0; p < N; p++) Rn[p] = E(A[p] + Rn[p]) - B[p]; P[c] = null; }
 
-  // in-camera processing of the noise, in luma/chroma
-  if (id != null) progress(id, 'Sensor: in-camera processing', 0.95);
-  // in place: nG[0] -> Cr, nG[1] -> Y, nG[2] -> Cb
+  // 4. in-camera processing of the noise (in place: nG[0] -> Cr, nG[1] -> Y, nG[2] -> Cb)
+  if (id != null) progress(id, 'Grain: in-camera processing', 0.95);
   const Cr = nG[0], Yn = nG[1], Cb = nG[2];
   for (let p = 0; p < N; p++) { const r = Cr[p], g = Yn[p], b = Cb[p], yy = 0.299 * r + 0.587 * g + 0.114 * b; Yn[p] = yy; Cb[p] = b - yy; Cr[p] = r - yy; }
-  const lnr = Math.min(1, Math.max(0, (+S.lumaNR || 0) / 100));
+  const lnr = Math.min(1, Math.max(0, (S.lumaNR == null ? 70 : +S.lumaNR) / 100));
   if (lnr > 0) { const B = blurPlane(Yn, w, h, 0.5 + 0.7 * lnr); for (let p = 0; p < N; p++) Yn[p] += (B[p] - Yn[p]) * lnr; }
-  const sh = +S.sharpen || 0;
-  if (sh > 0) { const B = blurPlane(Yn, w, h, Math.max(0.3, +S.sharpenR || 1)); for (let p = 0; p < N; p++) Yn[p] += sh * (Yn[p] - B[p]); }
-  const cnr = Math.min(1, Math.max(0, (+S.chromaNR || 0) / 100)), bl = Math.max(0, +S.blotch || 0);
-  if (cnr > 0 || bl > 0) {
-    const bs = Math.max(0.5, +S.blotchSize || 2.5);
-    const Bb = blurPlane(Cb, w, h, bs), Br = blurPlane(Cr, w, h, bs);
-    for (let p = 0; p < N; p++) { Cb[p] = (1 - cnr) * Cb[p] + bl * Bb[p]; Cr[p] = (1 - cnr) * Cr[p] + bl * Br[p]; }
-  }
+  const sh = S.sharpen == null ? 1 : +S.sharpen;
+  if (sh > 0) { const B = blurPlane(Yn, w, h, Math.max(0.3, +S.sharpenR || 1.6)); for (let p = 0; p < N; p++) Yn[p] += sh * (Yn[p] - B[p]); }
+  const cnr = Math.min(1, Math.max(0, (S.chromaNR == null ? 90 : +S.chromaNR) / 100)), bl = Math.max(0, S.blotch == null ? 2 : +S.blotch);
+  const bs = Math.max(0.5, +S.blotchSize || 3);
+  const Bb = blurPlane(Cb, w, h, bs), Br = blurPlane(Cr, w, h, bs);
+  for (let p = 0; p < N; p++) { Cb[p] = colour * ((1 - cnr) * Cb[p] + bl * Bb[p]); Cr[p] = colour * ((1 - cnr) * Cr[p] + bl * Br[p]); }
 
   { const C0 = Cg[0], C1 = Cg[1], C2 = Cg[2];
     for (let p = 0, i = 0; p < N; p++, i += 4) {
@@ -1900,4 +1576,4 @@ function encodeJPEG(rgba, w, h, opts) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
+if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, carve, resample, autoZoom, rescale, cleanup, deband, deblock, depattern, quantize };
