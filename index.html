@@ -15,10 +15,7 @@
   <input id="file" type="file" accept="image/*,.heic,.heif,.tif,.tiff,.avif,.webp,.bmp,.ico,.svg,.jxl" hidden>
   <div id="meta" class="meta">No image loaded</div>
   <div class="spacer"></div>
-  <label class="look">Look
-    <select id="look" title="Start from a look, then fine-tune"><option value="">Choose…</option></select>
-  </label>
-  <button id="resetall" class="btn ghost" type="button" title="Back to the untouched image">Reset all</button>
+  <button id="resetall" class="btn ghost" type="button" title="Back to the untouched image">Reset</button>
   <button id="export" class="btn primary" type="button" disabled>Export JPG</button>
 </header>
 
@@ -28,11 +25,8 @@
       <div id="views" class="seg">
         <button data-view="result" class="on" type="button">Result</button>
         <button data-view="original" type="button">Original</button>
-        <button data-view="diff" type="button">Diff</button>
-        <button data-view="seams" type="button">Seams</button>
         <button data-view="jpeg" type="button" title="Decoded export file — shows what survives compression">JPEG</button>
       </div>
-      <label id="ampwrap" class="amp" hidden>Amplify <input id="amp" type="range" min="1" max="128" step="1" value="16"><span id="ampv">×16</span></label>
       <div class="spacer"></div>
       <button id="hold" class="btn ghost small" type="button" title="Hold (or hold Space) to see the original">Hold to compare</button>
       <select id="zoom" title="Zoom">
@@ -51,7 +45,7 @@
       </div>
       <button id="drop" class="drop" type="button">
         <strong>Drop, paste or click to open an image</strong>
-        <ol class="steps"><li>Open an image</li><li>Pick a <b>Look</b> at the top (e.g. Natural camera)</li><li>Fine-tune any stage on the right, top to bottom</li><li>Check the <b>JPEG</b> view, then <b>Export JPG</b></li></ol>
+        <ol class="steps"><li>Open an image</li><li>Set the few controls on the right, top to bottom</li><li>Check the <b>JPEG</b> view, then <b>Export JPG</b></li></ol>
         <span>Processed locally in your browser — nothing is uploaded.</span>
       </button>
     </div>
@@ -62,10 +56,7 @@
     </div>
   </section>
 
-  <aside id="panel" class="panel">
-    <nav id="rail" class="rail" aria-label="Stages"></nav>
-    <div id="panes" class="panes"></div>
-  </aside>
+  <aside id="panel" class="panel simple"></aside>
 </main>
 
 <script src="app.js"></script>
