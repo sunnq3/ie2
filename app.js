@@ -189,7 +189,7 @@ let worker = null, jobId = 0, inflight = null, pending = false, timer = 0;
 
 function makeWorker() {
   if (worker) worker.terminate();
-  worker = new Worker('worker.js');
+  worker = new Worker('worker.js?v=35662d5');
   worker.onmessage = onWorkerMessage;
   worker.onerror = (e) => { setStatus('Worker error: ' + (e.message || e), true); inflight = null; hideBar(); };
   if (orig) { const copy = orig.data.slice(); worker.postMessage({ type: 'load', w: orig.width, h: orig.height, buffer: copy.buffer }, [copy.buffer]); }
@@ -310,7 +310,7 @@ let encWorker = null, encSeq = 0, encCache = null, encPending = null, jpegPrevie
 const encWaiters = new Map();
 function getEncWorker() {
   if (!encWorker) {
-    encWorker = new Worker('worker.js');
+    encWorker = new Worker('worker.js?v=35662d5');
     encWorker.onmessage = (e) => {
       const m = e.data, r = encWaiters.get(m.id); if (!r) return;
       encWaiters.delete(m.id);
