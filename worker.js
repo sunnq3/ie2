@@ -347,20 +347,19 @@ function boxH(s, d, w, h, r) {
   }
 }
 function boxV(s, d, w, h, r) {
-  const k = 1 / (2 * r + 1);
-  for (let x = 0; x < w; x++) {
-    let sum = (r + 1) * s[x];
-    for (let j = 1; j <= r; j++) sum += s[Math.min(j, h - 1) * w + x];
-    for (let y = 0; y < h; y++) {
-      d[y * w + x] = sum * k;
-      sum += s[Math.min(y + r + 1, h - 1) * w + x] - s[Math.max(y - r, 0) * w + x];
-    }
+  // running column sums, walked row by row (cache-friendly)
+  const k = 1 / (2 * r + 1), sum = new Float64Array(w);
+  for (let x = 0; x < w; x++) sum[x] = (r + 1) * s[x];
+  for (let j = 1; j <= r; j++) { const row = Math.min(j, h - 1) * w; for (let x = 0; x < w; x++) sum[x] += s[row + x]; }
+  for (let y = 0; y < h; y++) {
+    const o = y * w, add = Math.min(y + r + 1, h - 1) * w, sub = Math.max(y - r, 0) * w;
+    for (let x = 0; x < w; x++) { d[o + x] = sum[x] * k; sum[x] += s[add + x] - s[sub + x]; }
   }
 }
 function blurPlane(src, w, h, sigma) {
   if (!(sigma > 0.05)) return src.slice();
   const tmp = new Float32Array(w * h);
-  if (sigma < 2.5) {
+  if (sigma < 1.2) {
     const r = Math.max(1, Math.ceil(sigma * 3)), K = new Float32Array(2 * r + 1);
     let s = 0;
     for (let i = -r; i <= r; i++) { K[i + r] = Math.exp(-(i * i) / (2 * sigma * sigma)); s += K[i + r]; }
@@ -434,55 +433,105 @@ function spectralBands(N, balance, type) {
   return { e, wt, ebar };
 }
 
-/* Bayer re-mosaic + demosaic (Malvar-He-Cutler or bilinear) on float planes */
-function bayerRoundtrip(P, w, h, pattern, method, onMosaic) {
+/* ---- Bayer helpers ---------------------------------------------------- */
+function cfaOf(pattern) {
   const pat = (pattern || 'RGGB').toUpperCase(), idx = { R: 0, G: 1, B: 2 };
-  const cfa = [idx[pat[0]], idx[pat[1]], idx[pat[2]], idx[pat[3]]];
+  return [idx[pat[0]], idx[pat[1]], idx[pat[2]], idx[pat[3]]];
+}
+// 2-px mirror-reflect padding (reflection keeps the CFA phase at the borders)
+function padReflect(A, w, h) {
+  const W2 = w + 4, Q = new Float32Array(W2 * (h + 4));
+  const rx = (x) => { x = x < 0 ? -x : x >= w ? 2 * w - 2 - x : x; return x < 0 ? 0 : x >= w ? w - 1 : x; };
+  const ry = (y) => { y = y < 0 ? -y : y >= h ? 2 * h - 2 - y : y; return y < 0 ? 0 : y >= h ? h - 1 : y; };
+  const l1 = rx(-1), l2 = rx(-2), r1 = rx(w), r2 = rx(w + 1);
+  for (let y = -2; y < h + 2; y++) {
+    const sr = ry(y) * w, row = (y + 2) * W2;
+    Q.set(A.subarray(sr, sr + w), row + 2);
+    Q[row] = A[sr + l2]; Q[row + 1] = A[sr + l1]; Q[row + w + 2] = A[sr + r1]; Q[row + w + 3] = A[sr + r2];
+  }
+  return Q;
+}
+
+/*
+ * Demosaic a single-channel CFA mosaic M into three planes.
+ *  'edge'     edge-directed (Hamilton-Adams style): green is interpolated along the direction with
+ *             the smaller gradient, measured on the guide mosaic; red/blue via colour differences.
+ *  'mhc'      Malvar-He-Cutler 5x5 linear filters.
+ *  'bilinear' plain neighbour averages.
+ * For a fixed guide every method is linear in M, so it can be applied to a noise mosaic on its own.
+ */
+function demosaicMosaic(M, w, h, cfa, method, guide) {
+  const N = w * h, P0 = new Float32Array(N), P1 = new Float32Array(N), P2 = new Float32Array(N), P = [P0, P1, P2];
+  const W2 = w + 4, Wd = 2 * W2, Q = padReflect(M, w, h);
+  const colAt = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
+  if (method === 'edge') {
+    const Gd = padReflect(guide || M, w, h);
+    // pass 1: green everywhere
+    const Gp = new Float32Array(N);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const q = (y + 2) * W2 + x + 2, p = y * w + x;
+      if (colAt(x, y) === 1) { Gp[p] = Q[q]; continue; }
+      const C = Q[q];
+      const gh = (Q[q - 1] + Q[q + 1]) / 2 + (2 * C - Q[q - 2] - Q[q + 2]) / 4;
+      const gv = (Q[q - W2] + Q[q + W2]) / 2 + (2 * C - Q[q - Wd] - Q[q + Wd]) / 4;
+      const c = Gd[q];
+      const dH = Math.abs(Gd[q - 1] - Gd[q + 1]) + Math.abs(2 * c - Gd[q - 2] - Gd[q + 2]);
+      const dV = Math.abs(Gd[q - W2] - Gd[q + W2]) + Math.abs(2 * c - Gd[q - Wd] - Gd[q + Wd]);
+      const wH = 1 / ((1 + dH) * (1 + dH)), wV = 1 / ((1 + dV) * (1 + dV));
+      Gp[p] = (wH * gh + wV * gv) / (wH + wV);
+    }
+    const G = padReflect(Gp, w, h);
+    // pass 2/3: red and blue from colour differences (X - G) of the nearest same-colour sites
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const q = (y + 2) * W2 + x + 2, p = y * w + x, c = colAt(x, y), g = G[q];
+      P1[p] = g;
+      if (c === 1) {
+        const hc = colAt(x + 1, y), vc = colAt(x, y + 1);
+        P[hc][p] = g + ((Q[q - 1] - G[q - 1]) + (Q[q + 1] - G[q + 1])) / 2;
+        P[vc][p] = g + ((Q[q - W2] - G[q - W2]) + (Q[q + W2] - G[q + W2])) / 2;
+      } else {
+        P[c][p] = Q[q];
+        const o = 2 - c;
+        P[o][p] = g + ((Q[q - W2 - 1] - G[q - W2 - 1]) + (Q[q - W2 + 1] - G[q - W2 + 1]) +
+                       (Q[q + W2 - 1] - G[q + W2 - 1]) + (Q[q + W2 + 1] - G[q + W2 + 1])) / 4;
+      }
+    }
+    return P;
+  }
+  const mhc = method !== 'bilinear', out = [0, 0, 0];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const c = colAt(x, y), q = (y + 2) * W2 + x + 2, C = Q[q], p = y * w + x;
+    out[0] = out[1] = out[2] = 0; out[c] = C;
+    const l = Q[q - 1], r = Q[q + 1], u = Q[q - W2], d = Q[q + W2];
+    const dg = Q[q - W2 - 1] + Q[q - W2 + 1] + Q[q + W2 - 1] + Q[q + W2 + 1];
+    if (c !== 1) {
+      const o = 2 - c;
+      if (mhc) {
+        const far = Q[q - 2] + Q[q + 2] + Q[q - Wd] + Q[q + Wd];
+        out[1] = (4 * C + 2 * (l + r + u + d) - far) / 8;
+        out[o] = (6 * C + 2 * dg - 1.5 * far) / 8;
+      } else { out[1] = (l + r + u + d) / 4; out[o] = dg / 4; }
+    } else {
+      const hc = colAt(x + 1, y), vc = colAt(x, y + 1);
+      if (mhc) {
+        const fh = Q[q - 2] + Q[q + 2], fv = Q[q - Wd] + Q[q + Wd];
+        out[hc] = (5 * C + 4 * (l + r) - fh - dg + 0.5 * fv) / 8;
+        out[vc] = (5 * C + 4 * (u + d) - fv - dg + 0.5 * fh) / 8;
+      } else { out[hc] = (l + r) / 2; out[vc] = (u + d) / 2; }
+    }
+    P0[p] = out[0]; P1[p] = out[1]; P2[p] = out[2];
+  }
+  return P;
+}
+
+/* Bayer re-mosaic + demosaic of whole planes (used by the CA stage) */
+function bayerRoundtrip(P, w, h, pattern, method, onMosaic) {
+  const cfa = cfaOf(pattern), N = w * h, M = new Float32Array(N);
   const col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
-  const N = w * h, M = new Float32Array(N);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) M[y * w + x] = P[col(x, y)][y * w + x];
   if (onMosaic) onMosaic(M, col);
-  // 2-px mirror-padded copy (reflection keeps the CFA phase at the borders)
-  const W2 = w + 4, H2 = h + 4, Q = new Float32Array(W2 * H2);
-  const rx = (x) => (x < 0 ? -x : x >= w ? 2 * w - 2 - x : x), ry = (y) => (y < 0 ? -y : y >= h ? 2 * h - 2 - y : y);
-  for (let y = -2; y < h + 2; y++) {
-    const sy = Math.min(h - 1, Math.max(0, ry(y))), row = (y + 2) * W2;
-    for (let x = -2; x < w + 2; x++) Q[row + x + 2] = M[sy * w + Math.min(w - 1, Math.max(0, rx(x)))];
-  }
-  const mhc = method !== 'bilinear';
-  const P0 = P[0], P1 = P[1], P2 = P[2], out = [0, 0, 0];
-  const W1 = W2, Wd = 2 * W2;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const c = cfa[((y & 1) << 1) | (x & 1)], q = (y + 2) * W2 + x + 2, C = Q[q], p = y * w + x;
-      out[0] = out[1] = out[2] = 0;
-      out[c] = C;
-      const l = Q[q - 1], r = Q[q + 1], u = Q[q - W1], d = Q[q + W1];
-      if (c !== 1) {
-        const o = 2 - c, dg = Q[q - W1 - 1] + Q[q - W1 + 1] + Q[q + W1 - 1] + Q[q + W1 + 1];
-        if (mhc) {
-          const far = Q[q - 2] + Q[q + 2] + Q[q - Wd] + Q[q + Wd];
-          out[1] = (4 * C + 2 * (l + r + u + d) - far) / 8;
-          out[o] = (6 * C + 2 * dg - 1.5 * far) / 8;
-        } else {
-          out[1] = (l + r + u + d) / 4;
-          out[o] = dg / 4;
-        }
-      } else {
-        const hc = cfa[((y & 1) << 1) | ((x + 1) & 1)], vc = cfa[(((y + 1) & 1) << 1) | (x & 1)];
-        if (mhc) {
-          const dg = Q[q - W1 - 1] + Q[q - W1 + 1] + Q[q + W1 - 1] + Q[q + W1 + 1];
-          const fh = Q[q - 2] + Q[q + 2], fv = Q[q - Wd] + Q[q + Wd];
-          out[hc] = (5 * C + 4 * (l + r) - fh - dg + 0.5 * fv) / 8;
-          out[vc] = (5 * C + 4 * (u + d) - fv - dg + 0.5 * fh) / 8;
-        } else {
-          out[hc] = (l + r) / 2;
-          out[vc] = (u + d) / 2;
-        }
-      }
-      P0[p] = out[0] < 0 ? 0 : out[0]; P1[p] = out[1] < 0 ? 0 : out[1]; P2[p] = out[2] < 0 ? 0 : out[2];
-    }
-  }
+  const R = demosaicMosaic(M, w, h, cfa, method || 'mhc', M);
+  for (let c = 0; c < 3; c++) { const a = R[c], b = P[c]; for (let p = 0; p < N; p++) b[p] = a[p] < 0 ? 0 : a[p]; }
 }
 
 /* 16-bit LUT linear(0..1) -> sRGB(0..255) */
@@ -1446,24 +1495,47 @@ function depattern(d, w, h, Q, id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 7. Sensor simulation: raw-domain noise + demosaic                    */
+/* 7. Sensor simulation: camera-pipeline grain                          */
 /* ------------------------------------------------------------------ */
-/* Runs last. Converts to linear light, optional optical low-pass (AA), builds the Bayer mosaic,
-   adds photon (shot, signal-dependent) + read noise per photosite, demosaics like a camera and
-   applies in-camera chroma noise reduction. The demosaic correlates the noise over ~2 px, which is
-   what real camera grain looks like and why it survives JPEG much better than 1-px white noise. */
+/*
+ * Grain-only mode (default) leaves the image's own detail untouched and sends only the noise
+ * through a camera pipeline:
+ *   1. per-photosite shot (signal-dependent) + read noise on a virtual Bayer mosaic, in linear light,
+ *      with extra noise on red/blue sites;
+ *   2. demosaic of that noise mosaic — edge-directed, steered by the clean image's own edges, so
+ *      each photosite's noise spreads into its neighbours along structures, not across them;
+ *   3. transfer to gamma space (noise ends up strongest in the shadows);
+ *   4. in-camera processing of the noise: luma NR (removes the finest scale), sharpening (lifts
+ *      mid frequencies), chroma NR that leaves low-frequency colour blotches.
+ * Full re-mosaic mode also passes the image through the mosaic/demosaic, adding real demosaic
+ * artefacts; the in-camera processing then shapes those too.
+ */
 function sensorSim(d, w, h, S, NZ, id) {
   if (!S || !S.on) return;
-  if (id != null) progress(id, 'Sensor', 0.9);
+  if (id != null) progress(id, 'Sensor', 0.88);
   encLut();
-  const N = w * h;
+  const N = w * h, full = S.mode === 'full';
   const P = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
-  for (let p = 0, i = 0; p < N; p++, i += 4) { P[0][p] = LIN[d[i]] * 255; P[1][p] = LIN[d[i + 1]] * 255; P[2][p] = LIN[d[i + 2]] * 255; }
-  const aa = +S.aa || 0;
-  if (aa > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, aa);
+  const L8 = new Float32Array(256); for (let v = 0; v < 256; v++) L8[v] = LIN[v] * 255;
+  { const A0 = P[0], A1 = P[1], A2 = P[2]; for (let p = 0, i = 0; p < N; p++, i += 4) { A0[p] = L8[d[i]]; A1[p] = L8[d[i + 1]]; A2[p] = L8[d[i + 2]]; } }
+  const EL = ENC_LUT, K = 65536 / 255;
+  const E = (v) => { const t = v * K; if (!(t > 0)) return 0; if (t >= 65536) return 255; const i = t | 0; return EL[i] + (EL[i + 1] - EL[i]) * (t - i); };
+  const opt = +S.optical || 0;
+  if (opt > 0.05) for (let c = 0; c < 3; c++) P[c] = blurPlane(P[c], w, h, opt);
+  // clean reference in gamma space
+  const Cg = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+  for (let c = 0; c < 3; c++) { const A = P[c], B = Cg[c]; for (let p = 0; p < N; p++) B[p] = E(A[p]); }
 
+  const cfa = cfaOf(S.pattern), col = (x, y) => cfa[((y & 1) << 1) | (x & 1)];
+  const Mc = new Float32Array(N);
+  for (let y = 0; y < h; y++) {
+    const r = y * w, cA = P[cfa[(y & 1) << 1]], cB = P[cfa[((y & 1) << 1) | 1]];
+    for (let x = 0; x < w; x += 2) { Mc[r + x] = cA[r + x]; if (x + 1 < w) Mc[r + x + 1] = cB[r + x + 1]; }
+  }
+
+  // per-photosite noise
   const shot = Math.max(0, +S.shot || 0), read = Math.max(0, +S.read || 0);
-  const gainB = [1 + (+S.rgain || 0) / 100, 1, 1 + (+S.bgain || 0) / 100]; // red/blue photosites get less light -> more noise
+  const gainB = [1 + (+S.rgain || 0) / 100, 1, 1 + (+S.bgain || 0) / 100];
   let mask = null;
   if (S.useMask && NZ && NZ.scope !== 'all') {
     mask = rasterMask(NZ.strokes || [], w, h);
@@ -1478,42 +1550,74 @@ function sensorSim(d, w, h, S, NZ, id) {
     spare = r * Math.sin(6.283185307179586 * v);
     return r * Math.cos(6.283185307179586 * v);
   };
-  const addNoiseMosaic = (M, col) => {
-    if (!(shot > 0 || read > 0)) return;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      const p = y * w + x, n = gauss();
-      if (mask && mask[p] <= 0) continue;
-      const v = M[p], g = gainB[col(x, y)];
-      const sd = Math.sqrt(shot * shot * g * (v > 0 ? v : 0) + read * read * g * g);
-      M[p] = v + n * sd * (mask ? mask[p] : 1);
+  const Nm = new Float32Array(N);
+  if (shot > 0 || read > 0) {
+    const s2 = shot * shot, r2 = read * read;
+    for (let y = 0; y < h; y++) {
+      const gA = gainB[cfa[(y & 1) << 1]], gB = gainB[cfa[((y & 1) << 1) | 1]];
+      for (let x = 0; x < w; x++) {
+        const p = y * w + x, n = gauss(), v = Mc[p], g = (x & 1) ? gB : gA;
+        const sd = Math.sqrt(s2 * g * (v > 0 ? v : 0) + r2 * g * g);
+        Nm[p] = mask ? n * sd * mask[p] : n * sd;
+      }
     }
-  };
-  if (S.demosaic === 'none') {
-    // noise only, no CFA: per-channel independent noise (white, 1 px)
-    for (let c = 0; c < 3; c++) addNoiseMosaic(P[c], () => c);
-  } else {
-    bayerRoundtrip(P, w, h, S.pattern, S.demosaic, addNoiseMosaic);
   }
-  for (let c = 0; c < 3; c++) { const Pc = P[c]; for (let p = 0; p < N; p++) Pc[p] = encPx(Pc[p]); }
 
-  // in-camera chroma noise reduction (YCbCr, blur the chroma only)
-  const nr = Math.min(1, Math.max(0, (+S.chromaNR || 0) / 100));
-  if (nr > 0) {
-    const Kr = 0.299, Kb = 0.114, Kg = 1 - Kr - Kb;
-    const Y = new Float32Array(N), Cb = new Float32Array(N), Cr = new Float32Array(N);
-    for (let p = 0; p < N; p++) {
-      const yy = Kr * P[0][p] + Kg * P[1][p] + Kb * P[2][p];
-      Y[p] = yy; Cb[p] = P[2][p] - yy; Cr[p] = P[0][p] - yy;
+  // demosaic, then the noise (or noise + demosaic error) in gamma space
+  const interp = S.interp || 'edge';
+  let nG;
+  if (interp === 'none' && !full) {
+    nG = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+    // independent per-pixel noise, no CFA correlation
+    for (let c = 0; c < 3; c++) for (let p = 0; p < N; p++) {
+      const v = P[c][p], g = gainB[c], sd = Math.sqrt(shot * shot * g * (v > 0 ? v : 0) + read * read * g * g);
+      nG[c][p] = E(v + gauss() * sd * (mask ? mask[p] : 1)) - Cg[c][p];
     }
-    const sig = 0.6 + 2.4 * nr;
-    const Cb2 = blurPlane(Cb, w, h, sig), Cr2 = blurPlane(Cr, w, h, sig);
-    for (let p = 0; p < N; p++) {
-      const cb = Cb[p] + (Cb2[p] - Cb[p]) * nr, cr = Cr[p] + (Cr2[p] - Cr[p]) * nr, yy = Y[p];
-      const r = yy + cr, b = yy + cb;
-      P[0][p] = r; P[2][p] = b; P[1][p] = (yy - Kr * r - Kb * b) / Kg;
+  } else {
+    if (id != null) progress(id, 'Sensor: demosaic', 0.91);
+    let R;
+    if (full) {
+      const Mn = new Float32Array(N); for (let p = 0; p < N; p++) Mn[p] = Mc[p] + Nm[p];
+      const guide = new Float32Array(N); for (let p = 0; p < N; p++) guide[p] = E(Mn[p]);
+      R = demosaicMosaic(Mn, w, h, cfa, interp === 'none' ? 'edge' : interp, guide);
+      for (let c = 0; c < 3; c++) { const A = R[c], B = Cg[c]; for (let p = 0; p < N; p++) A[p] = E(A[p]) - B[p]; }
+      nG = R;
+    } else {
+      const guide = new Float32Array(N); for (let p = 0; p < N; p++) guide[p] = E(Mc[p]);
+      R = demosaicMosaic(Nm, w, h, cfa, interp, guide);
+      for (let c = 0; c < 3; c++) { const A = P[c], Rn = R[c], B = Cg[c]; for (let p = 0; p < N; p++) Rn[p] = E(A[p] + Rn[p]) - B[p]; P[c] = null; }
+      nG = R;
     }
   }
-  for (let p = 0, i = 0; p < N; p++, i += 4) { d[i] = P[0][p]; d[i + 1] = P[1][p]; d[i + 2] = P[2][p]; d[i + 3] = 255; }
+
+  // in-camera processing of the noise, in luma/chroma
+  if (id != null) progress(id, 'Sensor: in-camera processing', 0.95);
+  // in place: nG[0] -> Cr, nG[1] -> Y, nG[2] -> Cb
+  const Cr = nG[0], Yn = nG[1], Cb = nG[2];
+  for (let p = 0; p < N; p++) { const r = Cr[p], g = Yn[p], b = Cb[p], yy = 0.299 * r + 0.587 * g + 0.114 * b; Yn[p] = yy; Cb[p] = b - yy; Cr[p] = r - yy; }
+  const lnr = Math.min(1, Math.max(0, (+S.lumaNR || 0) / 100));
+  if (lnr > 0) { const B = blurPlane(Yn, w, h, 0.5 + 0.7 * lnr); for (let p = 0; p < N; p++) Yn[p] += (B[p] - Yn[p]) * lnr; }
+  const sh = +S.sharpen || 0;
+  if (sh > 0) { const B = blurPlane(Yn, w, h, Math.max(0.3, +S.sharpenR || 1)); for (let p = 0; p < N; p++) Yn[p] += sh * (Yn[p] - B[p]); }
+  const cnr = Math.min(1, Math.max(0, (+S.chromaNR || 0) / 100)), bl = Math.max(0, +S.blotch || 0);
+  if (cnr > 0 || bl > 0) {
+    const bs = Math.max(0.5, +S.blotchSize || 2.5);
+    const Bb = blurPlane(Cb, w, h, bs), Br = blurPlane(Cr, w, h, bs);
+    for (let p = 0; p < N; p++) { Cb[p] = (1 - cnr) * Cb[p] + bl * Bb[p]; Cr[p] = (1 - cnr) * Cr[p] + bl * Br[p]; }
+  }
+
+  // optional in-camera sharpening of the image itself
+  const is = +S.imgSharpen || 0;
+  if (is > 0) {
+    const r = Math.max(0.3, +S.imgSharpenR || 0.8);
+    for (let c = 0; c < 3; c++) { const B = blurPlane(Cg[c], w, h, r), A = Cg[c]; for (let p = 0; p < N; p++) A[p] += is * (A[p] - B[p]); }
+  }
+
+  { const C0 = Cg[0], C1 = Cg[1], C2 = Cg[2];
+    for (let p = 0, i = 0; p < N; p++, i += 4) {
+      const yy = Yn[p], r = yy + Cr[p], b = yy + Cb[p], g = (yy - 0.299 * r - 0.114 * b) / 0.587;
+      d[i] = C0[p] + r; d[i + 1] = C1[p] + g; d[i + 2] = C2[p] + b; d[i + 3] = 255;
+    } }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1714,4 +1818,4 @@ function encodeJPEG(rgba, w, h, opts) {
 }
 
 // Expose for headless testing
-if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };
+if (typeof module !== 'undefined') module.exports = { encodeJPEG, sensorSim, demosaicMosaic, cfaOf, blurPlane, spectralBands, bayerRoundtrip, carve, resample, colorRoundtrip, autoZoom, rescale, addNoise, rasterMask, cleanup, deband, deblock, depattern };

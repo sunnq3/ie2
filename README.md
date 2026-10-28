@@ -28,7 +28,11 @@ Everything runs locally in the browser (Web Worker); images are never uploaded.
 
 6. **Noise distribution** — Gaussian, uniform, Laplacian, impulse (± specks) or shot (brightness-dependent) noise. Amount in 8-bit levels (0.01 steps), density, colour vs. mono, grain size, irregularity (patchy low-frequency modulation with adjustable patch size) and a seed. Apply it to the whole image, only to painted areas, or everywhere except painted areas. Paint the mask on the image with a soft brush (size, hardness, opacity), erase with Alt-drag or the Erase tool, Undo / Clear. The mask is shown as a thin outline (or tinted, or hidden) so the result underneath stays visible. Shortcuts: B paint, E erase, [ ] brush size (Shift for fine), Ctrl/⌘+Z undo, Esc stop painting.
 
-7. **Sensor grain (raw camera look)** — runs last. Linear light → optical AA filter → Bayer mosaic (RGGB/BGGR/GRBG/GBRG) → per-photosite shot (signal-dependent) + read noise, extra noise on red/blue sites → demosaic (Malvar-He-Cutler, bilinear, or none) → in-camera chroma noise reduction. Optionally limited by the noise mask. The demosaic correlates the grain over ~2 px like real camera noise, so it survives compression.
+7. **Sensor grain (camera pipeline)** — runs last.
+   - *Grain only* (default): the image's own pixels are not re-sampled. Only the noise goes through a camera pipeline: per-photosite shot (signal-dependent) + read noise on a virtual Bayer mosaic in linear light (extra on red/blue sites) → demosaic of that noise (edge-directed, steered by the clean image's edges; or Malvar-He-Cutler / bilinear / none) → gamma transfer (strongest in shadows) → in-camera luma NR (removes the finest scale), sharpening (lifts mid frequencies) and chroma NR that leaves low-frequency colour blotches.
+   - *Full re-mosaic*: the image itself also goes through mosaic/demosaic, adding real demosaic artefacts.
+   - Optional in-camera image sharpening and optical blur; can follow the noise mask.
+   - Measured at equal strength, this grain keeps 2–4× more of itself through JPEG 4:2:0 (q80–92) than 1-px noise, and ~10× more through WebP q80.
 
 **Export JPG** uses a built-in baseline encoder (optimized Huffman tables):
 - Quality 1–100 (IJG scaling), chroma 4:4:4 / 4:2:2 / 4:2:0 — browsers' own export is 4:2:0, which halves colour resolution.

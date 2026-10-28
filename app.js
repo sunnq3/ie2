@@ -36,7 +36,12 @@ const DEFAULTS = {
   scale: { up: 1, upMethod: 'bicubic', final: 100, downMethod: 'lanczos3', quant: true },
   noise: { amount: 0, type: 'gaussian', density: 100, chroma: 0, grain: 1, irregular: 0, irrScale: 32, seed: 1, scope: 'all' },
   brush: { size: 24, hard: 50, opacity: 100, mode: 'add', display: 'outline' },
-  sensor: { on: false, shot: 0.05, read: 0.02, rgain: 30, bgain: 50, chromaNR: 60, aa: 0.3, demosaic: 'mhc', pattern: 'RGGB', seed: 1, useMask: false },
+  sensor: {
+    on: false, mode: 'noise', shot: 0.08, read: 0.025, rgain: 30, bgain: 50, seed: 1,
+    interp: 'edge', pattern: 'RGGB',
+    lumaNR: 70, sharpen: 1.0, sharpenR: 1.6, chromaNR: 90, blotch: 2, blotchSize: 3,
+    imgSharpen: 0, imgSharpenR: 0.8, optical: 0, useMask: false,
+  },
   out: { quality: 92, sub: '444', hf: 30, dither: 60, name: '' },
 };
 const NOPROCESS = ['out.', 'brush.'];
@@ -213,19 +218,31 @@ const SCHEMA = [
     ],
   },
   {
-    id: 'sensor', title: '7 · Sensor grain (raw camera look)',
-    note: 'Runs last. Rebuilds the image like a camera: linear light → AA filter → Bayer colour filter → photon (shot) + read noise per photosite → demosaic → in-camera chroma noise reduction. The grain comes out correlated over ~2 px like real camera noise, which survives JPEG far better than 1-px noise.',
+    id: 'sensor', title: '7 · Sensor grain (camera pipeline)',
+    note: 'Grain-only mode leaves your image’s detail untouched: only the noise goes through a camera pipeline — per-photosite shot + read noise in linear light, an edge-directed demosaic steered by your image’s own edges, then in-camera luma NR, sharpening and chroma NR. The result has its energy at mid frequencies plus low-frequency colour blotches, strongest in shadows — the kind of grain compression keeps.',
     controls: [
-      { k: 'sensor.on', label: 'Simulate camera sensor', type: 'check' },
-      { k: 'sensor.shot', label: 'Shot noise', type: 'range', min: 0, max: 0.5, step: 0.001, sub: true },
+      { k: 'sensor.on', label: 'Simulate camera sensor grain', type: 'check' },
+      { k: 'sensor.mode', label: 'Mode', type: 'select', sub: true, options: [['noise', 'Grain only (detail untouched)'], ['full', 'Full re-mosaic (artefacts)']] },
+      { type: 'head', k: 'sensor._h1', label: 'Photosite noise', sub: true },
+      { k: 'sensor.shot', label: 'Shot noise', type: 'range', min: 0, max: 0.6, step: 0.001, sub: true },
       { k: 'sensor.read', label: 'Read noise', type: 'range', min: 0, max: 0.3, step: 0.001, sub: true },
       { k: 'sensor.rgain', label: 'Red sites +', type: 'range', min: 0, max: 150, step: 1, unit: '%', sub: true },
       { k: 'sensor.bgain', label: 'Blue sites +', type: 'range', min: 0, max: 150, step: 1, unit: '%', sub: true },
-      { k: 'sensor.chromaNR', label: 'Chroma NR', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
-      { k: 'sensor.aa', label: 'AA filter', type: 'range', min: 0, max: 1.5, step: 0.01, unit: 'px', sub: true },
-      { k: 'sensor.demosaic', label: 'Demosaic', type: 'select', sub: true, options: [['mhc', 'Malvar-He-Cutler (in-camera)'], ['bilinear', 'Bilinear (softer)'], ['none', 'None (1-px noise, no CFA)']] },
-      { k: 'sensor.pattern', label: 'Pattern', type: 'select', sub: true, options: [['RGGB', 'RGGB'], ['BGGR', 'BGGR'], ['GRBG', 'GRBG'], ['GBRG', 'GBRG']] },
       { k: 'sensor.seed', label: 'Seed', type: 'range', min: 1, max: 9999, step: 1, extra: 'seed', sub: true },
+      { type: 'head', k: 'sensor._h2', label: 'Demosaic', sub: true },
+      { k: 'sensor.interp', label: 'Method', type: 'select', sub: true, options: [['edge', 'Edge-directed'], ['mhc', 'Malvar-He-Cutler'], ['bilinear', 'Bilinear'], ['none', 'None (1-px noise)']] },
+      { k: 'sensor.pattern', label: 'Pattern', type: 'select', sub: true, options: [['RGGB', 'RGGB'], ['BGGR', 'BGGR'], ['GRBG', 'GRBG'], ['GBRG', 'GBRG']] },
+      { type: 'head', k: 'sensor._h3', label: 'In-camera processing (grain only)', sub: true },
+      { k: 'sensor.lumaNR', label: 'Luma NR', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
+      { k: 'sensor.sharpen', label: 'Sharpening', type: 'range', min: 0, max: 3, step: 0.01, sub: true },
+      { k: 'sensor.sharpenR', label: 'Radius', type: 'range', min: 0.3, max: 4, step: 0.01, unit: 'px', sub: true },
+      { k: 'sensor.chromaNR', label: 'Chroma NR', type: 'range', min: 0, max: 100, step: 1, unit: '%', sub: true },
+      { k: 'sensor.blotch', label: 'Blotches', type: 'range', min: 0, max: 5, step: 0.01, unit: '×', sub: true },
+      { k: 'sensor.blotchSize', label: 'Blotch size', type: 'range', min: 0.5, max: 10, step: 0.1, unit: 'px', sub: true },
+      { type: 'head', k: 'sensor._h4', label: 'Image', sub: true },
+      { k: 'sensor.imgSharpen', label: 'Sharpen', type: 'range', min: 0, max: 2, step: 0.01, sub: true },
+      { k: 'sensor.imgSharpenR', label: 'Radius', type: 'range', min: 0.3, max: 3, step: 0.01, unit: 'px', sub: true },
+      { k: 'sensor.optical', label: 'Optical blur', type: 'range', min: 0, max: 1.5, step: 0.01, unit: 'px', sub: true },
       { k: 'sensor.useMask', label: 'Only where the noise mask allows (section 6)', type: 'check', sub: true },
     ],
   },
@@ -340,6 +357,7 @@ function makeControl(c) {
     CTRL[c.k] = { set: (v) => { t.value = v; }, el: t };
   } else if (c.type === 'head') {
     row.textContent = c.label;
+    if (c.k) row.dataset.k = c.k;
     return row;
   } else if (c.type === 'buttons') {
     for (const [act, text] of c.buttons) {
@@ -399,7 +417,7 @@ function syncSubs() {
 
 function resetSection(sec) {
   for (const c of sec.controls) {
-    if (!c.k || c.k === 'out.name') continue;
+    if (!c.k || c.type === 'head' || c.k === 'out.name') continue;
     setPath(params, c.k, clone(getPath(DEFAULTS, c.k)));
   }
   syncUI(); saveParams();
