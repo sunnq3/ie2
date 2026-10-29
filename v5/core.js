@@ -71,6 +71,19 @@ void main() {
   vec3 c = u_mode < .5 ? r : u_mode < 1.5 ? a : (uv.x < u_split ? a : r);
   o = vec4(clamp(c, 0., 1.), 1.);
 }`,
+    // crop / rotate / flip in one resample. Output pixel -> frame -> undo fine rotation -> undo flip
+    // -> undo quarter turns -> source; Catmull-Rom, so unrotated crops and 90° turns copy pixels exactly.
+    geo: `uniform vec2 u_frame, u_cs, u_flip; uniform vec4 u_crop; uniform int u_turns;
+vec4 cr(float t) { float t2 = t * t, t3 = t2 * t; return vec4(-.5 * t3 + t2 - .5 * t, 1.5 * t3 - 2.5 * t2 + 1., -1.5 * t3 + 2. * t2 + .5 * t, .5 * t3 - .5 * t2); }
+void main() {
+  vec2 f = u_crop.xy + P() - u_frame * .5;
+  vec2 a = vec2(f.x * u_cs.x + f.y * u_cs.y, -f.x * u_cs.y + f.y * u_cs.x) * u_flip;
+  for (int k = 0; k < 3; k++) { if (k >= u_turns) break; a = vec2(a.y, -a.x); }
+  vec2 t = a + u_srcRes * .5 - .5, fr = fract(t); ivec2 i = ivec2(floor(t));
+  vec4 wx = cr(fr.x), wy = cr(fr.y); vec3 c = vec3(0.);
+  for (int y = 0; y < 4; y++) { vec3 row = vec3(0.); for (int x = 0; x < 4; x++) row += wx[x] * px(i + ivec2(x - 1, y - 1)); c += wy[y] * row; }
+  o = vec4(clamp(c, 0., 1.), 1.);
+}`,
     out8: `uniform float u_dither;
 void main() {
   vec2 p = P(); vec3 c = clamp(texelFetch(u_src, ivec2(p), 0).rgb, 0., 1.);
@@ -123,6 +136,7 @@ void main() {
         if (a.length === 1) gl.uniform1i(l, a[0]); else if (a.length === 2) gl.uniform2i(l, a[0], a[1]); else gl.uniform3i(l, a[0], a[1], a[2]);
       } else if (v.length === 2 && !(v instanceof Float32Array)) gl.uniform2f(l, v[0], v[1]);
       else if (v.length === 3 && !(v instanceof Float32Array)) gl.uniform3f(l, v[0], v[1], v[2]);
+      else if (v.length === 4 && !(v instanceof Float32Array)) gl.uniform4f(l, v[0], v[1], v[2], v[3]);
       else gl.uniform1fv(l, v);
     }
 
@@ -197,10 +211,12 @@ void main() {
     }
 
     /* ---------- image state ---------- */
-    let base = null, result = null, W = 0, H = 0;
+    // src: the opened image. base: src after crop / rotate (what effects and comparisons start from).
+    let src = null, base = null, result = null, W = 0, H = 0;
     function load(source, w, h) {
       if (result && result !== base) put(result);
-      if (base) { base.pinned = false; destroy(base); }
+      if (base && base !== src) destroy(base);
+      if (src) destroy(src);
       drain();
       W = w; H = h;
       canvas.width = w; canvas.height = h;
@@ -210,10 +226,48 @@ void main() {
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
       made = null;
-      base = pass(SH.ingest, up, {}, {});
-      base.pinned = true;
+      src = pass(SH.ingest, up, {}, {});
+      src.pinned = true;
       destroy(up);
-      result = base;
+      base = result = src;
+    }
+
+    /* Geometry: g = { turns: 0-3 (90° clockwise), angle: degrees (clockwise), flipH, flipV,
+       crop: [x, y, w, h] normalised to the frame }. The frame is the largest rectangle with the
+       turned image's aspect that fits inside the rotated image, at the source's own pixel scale,
+       so rotating never leaves empty corners and never enlarges pixels. */
+    function frameOf(g) {
+      const t = (g.turns | 0) & 3, W1 = t & 1 ? src.h : src.w, H1 = t & 1 ? src.w : src.h;
+      const th = Math.abs(+g.angle || 0) * Math.PI / 180, c = Math.cos(th), s = Math.sin(th);
+      const k = Math.max(c + (H1 / W1) * s, (W1 / H1) * s + c);
+      // when tilted, stay a couple of pixels clear of the rotated edge so no corner touches it
+      const f = s > 0 ? Math.max(0.5, 1 - 4 * k / Math.min(W1, H1)) : 1;
+      return { W1, H1, Fw: W1 / k * f, Fh: H1 / k * f };
+    }
+    function cropBox(g, fr, crop) {
+      const c = crop || g.crop || [0, 0, 1, 1];
+      const x = Math.max(0, Math.round(c[0] * fr.Fw)), y = Math.max(0, Math.round(c[1] * fr.Fh));
+      const w = Math.max(1, Math.min(Math.round(c[2] * fr.Fw), Math.floor(fr.Fw + 1e-6) - x));
+      const h = Math.max(1, Math.min(Math.round(c[3] * fr.Fh), Math.floor(fr.Fh + 1e-6) - y));
+      return { x, y, w, h };
+    }
+    function setGeometry(g, crop) {
+      if (!src) return;
+      const fr = frameOf(g), b = cropBox(g, fr, crop), t = (g.turns | 0) & 3, ang = +g.angle || 0;
+      const identity = !t && !ang && !g.flipH && !g.flipV && !b.x && !b.y && b.w === src.w && b.h === src.h;
+      if (result !== base) put(result);
+      if (base !== src) destroy(base);
+      if (b.w !== W || b.h !== H) drain();
+      made = null;
+      if (identity) base = src;
+      else {
+        const r = ang * Math.PI / 180;
+        base = pass(SH.geo, src, { u_frame: [fr.Fw, fr.Fh], u_crop: [b.x, b.y, b.w, b.h], u_cs: [Math.cos(r), Math.sin(r)],
+          u_flip: [g.flipH ? -1 : 1, g.flipV ? -1 : 1], u_turns: { i: t } }, { w: b.w, h: b.h });
+        base.pinned = true;
+      }
+      result = base; W = b.w; H = b.h;
+      canvas.width = W; canvas.height = H;
     }
 
     // chain: [{ fx, p }] in pipeline order
@@ -255,7 +309,7 @@ void main() {
       return new ImageData(buf, W, H);
     }
 
-    return { gl, maxTex, load, process, show, exportPixels, get size() { return [W, H]; } };
+    return { gl, maxTex, load, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
   }
 
   return { create, LIB, SH };

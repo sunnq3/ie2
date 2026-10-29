@@ -22,7 +22,7 @@ Ten presets combine them (early-2000s digicam, phone night mode, re-shared ten t
 
 ## Use
 
-Open, drop or paste an image, or start from the built-in test scene. Switch effects on in the rack, compare with **Split** (drag the divider) or hold **Space** for the original. Scroll to zoom, drag to pan, **F** fits, **1** is actual pixels. Export as PNG, JPEG or WebP.
+Open, drop or paste an image, or start from the built-in test scene. **Crop & rotate** (or **C**) opens a crop box with aspect presets, 90° turns, flips and a straighten slider; straightening zooms in just enough that no empty corners ever show, and crops / turns without tilt copy pixels exactly. Switch effects on in the rack, compare with **Split** (drag the divider) or hold **Space** for the original. Scroll to zoom, drag to pan, **F** fits, **1** is actual pixels. Export as PNG, JPEG or WebP.
 
 Requires WebGL2 with float render targets (any current desktop or mobile browser). Images larger than 24 MP are worked on as a scaled copy.
 

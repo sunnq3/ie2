@@ -101,6 +101,7 @@ input[type=checkbox] { accent-color: var(--acc); }
 
 /* viewer */
 .view { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.vbar, .cbar { grid-row: 1; } .stage { grid-row: 2; }
 .vbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
 .seg { display: inline-flex; border: 1.5px solid var(--ink); border-radius: 3px; overflow: hidden; height: 30px; }
 .seg button { border: 0; background: var(--card); padding: 0 11px; }
@@ -136,6 +137,40 @@ body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-off
 .chain i { color: var(--acc); font-style: normal; padding: 0 4px; }
 #status.err { color: var(--acc); }
 .fatal { position: fixed; inset: 0; display: grid; place-items: center; background: var(--paper); z-index: 50; padding: 20px; text-align: center; font: 14px var(--mono); }
+
+/* crop & rotate */
+.cbar { display: none; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; background: var(--ink); color: var(--paper); }
+body.cropping .vbar { display: none; }
+body.cropping .cbar { display: flex; }
+.cbar .b { border-color: var(--paper); background: transparent; color: var(--paper); }
+.cbar .b:hover { background: #2e2c28; }
+.cbar .b.go { background: var(--acc); border-color: var(--acc); color: #fff; }
+.cbar select { background: var(--ink); color: var(--paper); border-color: var(--paper); }
+.cbar .ttl { font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; margin-right: 4px; }
+.straight { display: inline-flex; align-items: center; gap: 8px; font: 12px var(--mono); }
+.straight input[type=range] { width: 150px; }
+.cbar .b.ic { padding: 0 9px; font-size: 15px; }
+.straight input[type=range]::-webkit-slider-runnable-track { background: var(--paper); }
+.straight input[type=range]::-moz-range-track { background: var(--paper); }
+.straight input[type=range]::-webkit-slider-thumb { background: var(--acc); border-color: var(--acc); }
+.straight input[type=range]::-moz-range-thumb { background: var(--acc); border-color: var(--acc); }
+.straight .pr-v { width: 52px; background: transparent; color: var(--paper); border-color: #55524b; }
+body.cropping .rack { pointer-events: none; opacity: .4; }
+body.cropping .split, body.cropping .split-tags { display: none; }
+body.cropping .stage { cursor: default; }
+.cbox { position: absolute; display: none; z-index: 3; border: 1.5px solid #fff; box-shadow: 0 0 0 9999px rgba(18, 17, 15, .66); cursor: move; touch-action: none; }
+body.cropping .cbox { display: block; }
+.cbox .gl { position: absolute; background: rgba(255, 255, 255, .45); pointer-events: none; }
+.cbox .gl.v { top: 0; bottom: 0; width: 1px; } .cbox .gl.h { left: 0; right: 0; height: 1px; }
+.cbox .k { position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; background: #fff; border: 1.5px solid var(--ink); border-radius: 2px; }
+.cbox .k[data-k=nw] { left: 0; top: 0; cursor: nwse-resize; } .cbox .k[data-k=ne] { left: 100%; top: 0; cursor: nesw-resize; }
+.cbox .k[data-k=sw] { left: 0; top: 100%; cursor: nesw-resize; } .cbox .k[data-k=se] { left: 100%; top: 100%; cursor: nwse-resize; }
+.cbox .k[data-k=n] { left: 50%; top: 0; width: 28px; height: 8px; margin: -4px 0 0 -14px; cursor: ns-resize; }
+.cbox .k[data-k=s] { left: 50%; top: 100%; width: 28px; height: 8px; margin: -4px 0 0 -14px; cursor: ns-resize; }
+.cbox .k[data-k=w] { left: 0; top: 50%; width: 8px; height: 28px; margin: -14px 0 0 -4px; cursor: ew-resize; }
+.cbox .k[data-k=e] { left: 100%; top: 50%; width: 8px; height: 28px; margin: -14px 0 0 -4px; cursor: ew-resize; }
+.cbox.lock .k[data-k=n], .cbox.lock .k[data-k=s], .cbox.lock .k[data-k=w], .cbox.lock .k[data-k=e] { display: none; }
+.cdim { position: absolute; left: 50%; bottom: -26px; transform: translateX(-50%); font: 11px var(--mono); color: #fff; white-space: nowrap; pointer-events: none; }
 
 @media (max-width: 860px) {
   body { overflow: auto; display: block; }
@@ -173,6 +208,7 @@ body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-off
   <section class="view">
     <div class="vbar">
       <div class="seg" id="modes"><button data-m="0" class="on" type="button">Result</button><button data-m="2" type="button">Split</button><button data-m="1" type="button">Original</button></div>
+      <button class="b" id="cropbtn" type="button" title="Crop, straighten, turn and flip (C)" disabled>Crop &amp; rotate</button>
       <div class="grow"></div>
       <button class="b q" id="zout" type="button" title="Zoom out">−</button>
       <span class="zoomv" id="zv">–</span>
@@ -180,10 +216,31 @@ body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-off
       <button class="b q" id="zfit" type="button" title="Fit (F)">Fit</button>
       <button class="b q" id="z1" type="button" title="Actual pixels (1)">1:1</button>
     </div>
+    <div class="cbar" id="cbar">
+      <span class="ttl">Crop</span>
+      <select id="aspect" title="Aspect ratio">
+        <option value="free">Free</option><option value="orig">Original</option><option value="1">1 : 1</option>
+        <option value="0.8">4 : 5</option><option value="1.25">5 : 4</option><option value="1.5">3 : 2</option><option value="0.6667">2 : 3</option>
+        <option value="1.7778">16 : 9</option><option value="0.5625">9 : 16</option>
+      </select>
+      <button class="b ic" id="tccw" type="button" title="Turn 90° left">⟲</button>
+      <button class="b ic" id="tcw" type="button" title="Turn 90° right">⟳</button>
+      <button class="b ic" id="fliph" type="button" title="Flip left–right">⇆</button>
+      <button class="b ic" id="flipv" type="button" title="Flip top–bottom">⇅</button>
+      <label class="straight" title="Straighten. The image zooms in just enough that no empty corners show. Double-click to level.">Straighten
+        <input id="angle" type="range" min="-45" max="45" step="0.1" value="0"><input id="anglev" class="pr-v" type="text" inputmode="decimal" value="0.0">°</label>
+      <div class="grow"></div>
+      <button class="b" id="creset" type="button">Reset</button>
+      <button class="b" id="ccancel" type="button">Cancel</button>
+      <button class="b go" id="cdone" type="button">Done</button>
+    </div>
     <div class="stage" id="stage">
       <div class="frame" id="frame"><canvas id="cv" width="1" height="1"></canvas></div>
       <div class="split-tags"><span id="tagL">Original</span><span id="tagR">Result</span></div>
       <div class="split" id="split"></div>
+      <div class="cbox" id="cbox"><i class="gl v" style="left:33.333%"></i><i class="gl v" style="left:66.667%"></i><i class="gl h" style="top:33.333%"></i><i class="gl h" style="top:66.667%"></i>
+        <span class="k" data-k="nw"></span><span class="k" data-k="n"></span><span class="k" data-k="ne"></span><span class="k" data-k="e"></span>
+        <span class="k" data-k="se"></span><span class="k" data-k="s"></span><span class="k" data-k="sw"></span><span class="k" data-k="w"></span><span class="cdim" id="cdim"></span></div>
       <div class="drop" id="drop">
         <div class="drop-card">
           <h1>Thirty ways an image gets marked by the machines that make and show it.</h1>

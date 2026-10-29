@@ -155,7 +155,7 @@ function request(processToo) { if (processToo) needProcess = true; if (!frameReq
 function frame() {
   frameReq = 0;
   if (!loaded || !gpu) return;
-  if (needProcess) {
+  if (needProcess && !cropping) {
     needProcess = false;
     const chain = EFFECTS.filter(e => state.fx[e.id].on).map(e => ({ fx: e, p: state.fx[e.id] }));
     try { gpu.process(chain, state.seed); say(chain.length ? `${chain.length} effect${chain.length > 1 ? 's' : ''}` : 'original'); }
@@ -176,6 +176,7 @@ function place() {
   $('#split').style.left = x + 'px';
   $('#tagL').style.right = (stage.clientWidth - x + 8) + 'px';
   $('#tagR').style.left = (x + 8) + 'px';
+  if (cropping) placeCrop();
 }
 function fit() {
   if (!loaded) return;
@@ -202,13 +203,20 @@ stage.addEventListener('wheel', (e) => {
 let drag = null;
 stage.addEventListener('pointerdown', (e) => {
   if (!loaded || e.button !== 0 || e.target.closest('.drop')) return;
-  const onSplit = e.target === $('#split');
+  if (cropping && e.target.closest('#cbox')) {
+    const k = e.target.dataset.k || 'move';
+    drag = { crop: k, x: e.clientX, y: e.clientY, c0: edit.crop.slice() };
+    stage.setPointerCapture(e.pointerId);
+    return;
+  }
+  const onSplit = !cropping && e.target === $('#split');
   drag = { split: onSplit, x: e.clientX, y: e.clientY, tx, ty };
   stage.setPointerCapture(e.pointerId);
   if (!onSplit) stage.classList.add('panning');
 });
 stage.addEventListener('pointermove', (e) => {
   if (!drag) return;
+  if (drag.crop) { dragCrop(e); return; }
   if (drag.split) {
     const r = stage.getBoundingClientRect();
     split = Math.min(1, Math.max(0, (e.clientX - r.left - tx) / (cv.width * z)));
@@ -229,11 +237,14 @@ function setMode(m) {
 document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => setMode(+b.dataset.m)));
 
 window.addEventListener('keydown', (e) => {
+  if (cropping && e.key === 'Escape') { endCrop(false); return; }
+  if (cropping && e.key === 'Enter' && document.activeElement.tagName !== 'SELECT') { e.preventDefault(); endCrop(true); return; }
   if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  if (e.key === 'c' && loaded) { cropping ? endCrop(true) : startCrop(); return; }
   if (e.code === 'Space') { e.preventDefault(); if (!holdOrig) { holdOrig = true; request(false); } }
   else if (e.key === 'f') fit();
   else if (e.key === '1') zoomAt(1, ...centre());
-  else if (e.key === 's') setMode(mode === 2 ? 0 : 2);
+  else if (e.key === 's' && !cropping) setMode(mode === 2 ? 0 : 2);
 });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space' && holdOrig) { holdOrig = false; request(false); } });
 
@@ -252,11 +263,13 @@ function useSource(src, w0, h0, name) {
     const c = document.createElement('canvas'); c.width = w; c.height = h;
     const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, w, h); s = c;
   }
+  if (cropping) endCrop(false);
   gpu.load(s, w, h);
-  loaded = true; baseName = name;
-  $('#meta').textContent = `${name} · ${w}×${h}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
+  geo = freshGeo();
+  loaded = true; baseName = name; sourceNote = `${name} · ${w}×${h}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
+  updateMeta();
   $('#drop').classList.add('gone');
-  $('#save').disabled = false;
+  $('#save').disabled = false; $('#cropbtn').disabled = false;
   fit(); request(true);
 }
 async function openFile(file) {
@@ -331,6 +344,7 @@ $('#fmt').addEventListener('change', () => { $('#qwrap').hidden = $('#fmt').valu
 $('#q').addEventListener('input', () => { $('#qv').textContent = $('#q').value; });
 $('#save').addEventListener('click', () => {
   if (!loaded) return;
+  if (cropping) endCrop(true);
   request(true); frame();
   const img = gpu.exportPixels(!state.fx.posterize.on);
   const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
@@ -344,6 +358,110 @@ $('#save').addEventListener('click', () => {
     say(`saved ${a.download} · ${(blob.size / 1024).toFixed(0)} KB`);
   }, mime, +$('#q').value / 100);
 });
+
+/* ---------------- crop & rotate ---------------- */
+/* geo = what is applied; edit = the working copy while the crop bar is open. The crop rectangle is
+   kept normalised to the "frame": the largest rectangle (same aspect as the image) that fits inside
+   the rotated picture, so straightening never shows empty corners. */
+const freshGeo = () => ({ turns: 0, angle: 0, flipH: false, flipV: false, crop: [0, 0, 1, 1], aspect: 'free' });
+let geo = freshGeo(), edit = null, cropping = false, sourceNote = '';
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+function updateMeta() {
+  if (!loaded) return;
+  const [w, h] = gpu.size, [sw, sh] = gpu.source;
+  $('#meta').textContent = sourceNote + (w !== sw || h !== sh || geo.angle || geo.turns || geo.flipH || geo.flipV ? ` → ${w}×${h}` : '');
+}
+function startCrop() {
+  if (!loaded || cropping) return;
+  cropping = true; edit = JSON.parse(JSON.stringify(geo));
+  holdOrig = false;
+  document.body.classList.add('cropping');
+  $('#aspect').value = edit.aspect;
+  syncAngle();
+  preview(); fit();
+}
+function endCrop(apply) {
+  if (!cropping) return;
+  cropping = false;
+  if (apply) geo = edit;
+  edit = null; drag = null;
+  document.body.classList.remove('cropping');
+  gpu.setGeometry(geo);
+  updateMeta(); fit(); request(true);
+  if (apply) say(`cropped to ${gpu.size[0]}×${gpu.size[1]}`);
+}
+// While editing, show the whole frame (no crop) so the crop box can be moved anywhere in it.
+function preview() { gpu.setGeometry(edit, [0, 0, 1, 1]); placeCrop(); request(false); }
+function ratio() {
+  if (edit.aspect === 'free') return 0;
+  return edit.aspect === 'orig' ? cv.width / cv.height : +edit.aspect;
+}
+function applyAspect() {
+  const R = ratio(), fw = cv.width, fh = cv.height;
+  $('#cbox').classList.toggle('lock', !!R);
+  if (!R) return;
+  const c = edit.crop, cx = (c[0] + c[2] / 2) * fw, cy = (c[1] + c[3] / 2) * fh;
+  let w = Math.min(fw, fh * R), h = w / R;
+  const x = clamp(cx - w / 2, 0, fw - w), y = clamp(cy - h / 2, 0, fh - h);
+  edit.crop = [x / fw, y / fh, w / fw, h / fh];
+}
+function placeCrop() {
+  if (!edit) return;
+  const c = edit.crop, b = $('#cbox'), fw = cv.width, fh = cv.height;
+  b.style.left = (tx + c[0] * fw * z) + 'px'; b.style.top = (ty + c[1] * fh * z) + 'px';
+  b.style.width = (c[2] * fw * z) + 'px'; b.style.height = (c[3] * fh * z) + 'px';
+  $('#cdim').textContent = `${Math.round(c[2] * fw)} × ${Math.round(c[3] * fh)}`;
+  b.classList.toggle('lock', !!ratio());
+}
+function dragCrop(e) {
+  const fw = cv.width, fh = cv.height, dx = (e.clientX - drag.x) / z / fw, dy = (e.clientY - drag.y) / z / fh;
+  const [x0, y0, w0, h0] = drag.c0, k = drag.crop, R = ratio();
+  if (k === 'move') { edit.crop = [clamp(x0 + dx, 0, 1 - w0), clamp(y0 + dy, 0, 1 - h0), w0, h0]; placeCrop(); return; }
+  const mw = Math.min(1, 24 / fw), mh = Math.min(1, 24 / fh);
+  let l = x0, t = y0, r = x0 + w0, b = y0 + h0;
+  if (R && k.length === 2) {
+    // aspect locked: the opposite corner stays put; size follows the pointer, held to the ratio
+    const ax = k.includes('w') ? r : l, ay = k.includes('n') ? b : t;
+    const px = (k.includes('w') ? l + dx : r + dx), py = (k.includes('n') ? t + dy : b + dy);
+    let W = Math.abs(px - ax) * fw, H = Math.abs(py - ay) * fh;
+    W = Math.max(24, (W + H * R) / 2); H = W / R;
+    const maxW = (k.includes('w') ? ax : 1 - ax) * fw, maxH = (k.includes('n') ? ay : 1 - ay) * fh;
+    if (W > maxW) { W = maxW; H = W / R; }
+    if (H > maxH) { H = maxH; W = H * R; }
+    const wn = W / fw, hn = H / fh;
+    l = k.includes('w') ? ax - wn : ax; t = k.includes('n') ? ay - hn : ay;
+    edit.crop = [l, t, wn, hn];
+  } else {
+    if (k.includes('w')) l = clamp(x0 + dx, 0, r - mw);
+    if (k.includes('e')) r = clamp(x0 + w0 + dx, l + mw, 1);
+    if (k.includes('n')) t = clamp(y0 + dy, 0, b - mh);
+    if (k.includes('s')) b = clamp(y0 + h0 + dy, t + mh, 1);
+    edit.crop = [l, t, r - l, b - t];
+  }
+  placeCrop();
+}
+function turn(cw) {
+  const [x, y, w, h] = edit.crop;
+  edit.turns = (edit.turns + (cw ? 1 : 3)) & 3;
+  edit.crop = cw ? [1 - y - h, x, h, w] : [y, 1 - x - w, h, w];
+  preview(); applyAspect(); fit();
+}
+function syncAngle() { $('#angle').value = edit.angle; $('#anglev').value = (+edit.angle).toFixed(1); }
+function setAngle(v) { edit.angle = clamp(Math.round(v * 10) / 10, -45, 45); syncAngle(); preview(); applyAspect(); placeCrop(); }
+
+$('#cropbtn').addEventListener('click', startCrop);
+$('#cdone').addEventListener('click', () => endCrop(true));
+$('#ccancel').addEventListener('click', () => endCrop(false));
+$('#creset').addEventListener('click', () => { edit = freshGeo(); $('#aspect').value = 'free'; syncAngle(); preview(); fit(); });
+$('#tcw').addEventListener('click', () => turn(true));
+$('#tccw').addEventListener('click', () => turn(false));
+$('#fliph').addEventListener('click', () => { const c = edit.crop; edit.flipH = !edit.flipH; edit.crop = [1 - c[0] - c[2], c[1], c[2], c[3]]; preview(); });
+$('#flipv').addEventListener('click', () => { const c = edit.crop; edit.flipV = !edit.flipV; edit.crop = [c[0], 1 - c[1] - c[3], c[2], c[3]]; preview(); });
+$('#aspect').addEventListener('change', (e) => { edit.aspect = e.target.value; applyAspect(); placeCrop(); });
+$('#angle').addEventListener('input', (e) => setAngle(+e.target.value));
+$('#angle').addEventListener('dblclick', () => setAngle(0));
+$('#anglev').addEventListener('change', (e) => { const v = parseFloat(e.target.value); setAngle(Number.isFinite(v) ? v : 0); });
 
 /* ---------------- go ---------------- */
 buildRack();
