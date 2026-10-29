@@ -85,6 +85,8 @@ void main() {
   for (int y = 0; y < 4; y++) { vec3 row = vec3(0.); for (int x = 0; x < 4; x++) row += wx[x] * px(i + ivec2(x - 1, y - 1)); c += wy[y] * row; }
   o = vec4(clamp(c, 0., 1.), 1.);
 }`,
+    // orientation probe for the on-screen canvas: top half red, left half green (as displayed)
+    probe: `void main() { vec2 p = gl_FragCoord.xy / u_res; o = vec4(p.y > .5 ? 1. : 0., p.x < .5 ? 1. : 0., 0., 1.); }`,
     out8: `uniform float u_dither;
 void main() {
   vec2 p = P(); vec3 c = clamp(texelFetch(u_src, ivec2(p), 0).rgb, 0., 1.);
@@ -300,6 +302,9 @@ void main() {
       pass(SH.show, result, { u_mode: mode, u_split: split, u_dither: dither ? 1 : 0 }, { target: null, w: W, h: H, tex: { u_b: base } });
     }
 
+    // Draw the probe on the visible canvas; the caller reads it back to learn how this browser copies it.
+    function probe() { if (!base) return; made = null; pass(SH.probe, base, {}, { target: null, w: W, h: H }); }
+
     function exportPixels(dither) {
       made = null;
       const t = pass(SH.out8, result, { u_dither: dither ? 1 : 0 }, { fmt: 'u8' });
@@ -310,7 +315,7 @@ void main() {
       return new ImageData(buf, W, H);
     }
 
-    return { gl, maxTex, load, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
+    return { gl, maxTex, load, probe, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
   }
 
   return { create, LIB, SH };

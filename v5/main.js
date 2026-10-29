@@ -349,17 +349,28 @@ $('#save').addEventListener('click', () => {
   if (!loaded) return;
   if (cropping) endCrop(true);
   request(true); frame();
-  // Save the on-screen canvas itself, drawn at full resolution in Result view: the file is exactly the
-  // picture you are looking at, so it can never come out turned or flipped relative to the screen.
+  // Some browser / GPU combinations (e.g. Direct3D-backed WebGL on Windows) copy a WebGL canvas
+  // upside down or mirrored. Draw a probe with a known top-left, read it back exactly the way the
+  // export does, and undo whatever flip this machine applies.
+  gpu.probe();
+  const pc = document.createElement('canvas'); pc.width = pc.height = 4;
+  const px2 = pc.getContext('2d', { willReadFrequently: true }); px2.drawImage(cv, 0, 0, 4, 4);
+  const pd = px2.getImageData(0, 0, 1, 1).data, flipV = pd[0] < 128, flipH = pd[1] < 128;
+  // the picture itself, full resolution, Result view
   gpu.show(0, split, !state.fx.posterize.on);
+  const out = document.createElement('canvas'); out.width = cv.width; out.height = cv.height;
+  const ox = out.getContext('2d');
+  ox.setTransform(flipH ? -1 : 1, 0, 0, flipV ? -1 : 1, flipH ? out.width : 0, flipV ? out.height : 0);
+  ox.drawImage(cv, 0, 0);
+  request(false);
   const fmt = $('#fmt').value, mime = 'image/' + fmt, ext = fmt === 'jpeg' ? 'jpg' : fmt;
   say('encoding ' + ext + '…');
-  cv.toBlob((blob) => {
-    request(false);
+  const fixed = flipV || flipH ? ' (browser flip corrected)' : '';
+  out.toBlob((blob) => {
     if (!blob) { say('export failed', true); return; }
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${baseName}_v5.${ext}`;
     document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    say(`saved ${a.download} · ${(blob.size / 1024).toFixed(0)} KB`);
+    say(`saved ${a.download} · ${(blob.size / 1024).toFixed(0)} KB${fixed}`);
   }, mime, +$('#q').value / 100);
 });
 
