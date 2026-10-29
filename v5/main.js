@@ -250,19 +250,22 @@ window.addEventListener('keyup', (e) => { if (e.code === 'Space' && holdOrig) { 
 
 /* ---------------- loading ---------------- */
 let baseName = 'image';
+// Decode through <img>: every browser applies the photo's EXIF orientation there. ImageBitmaps are
+// only a fallback, because some browsers ignore the orientation tag or flip them on GPU upload.
 async function decode(file) {
-  try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (e) { /* fall through */ }
-  const img = new Image(); img.src = URL.createObjectURL(file); await img.decode(); return img;
+  const url = URL.createObjectURL(file);
+  try { const img = new Image(); img.src = url; await img.decode(); return img; }
+  catch (e) { return await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+  finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
 }
 function useSource(src, w0, h0, name) {
   if (!gpu) return;
   const cap = Math.min(gpu.maxTex, 8192), k = Math.min(1, cap / Math.max(w0, h0), Math.sqrt(24e6 / (w0 * h0)));
-  let w = w0, h = h0, s = src;
-  if (k < 1) {
-    w = Math.max(1, Math.round(w0 * k)); h = Math.max(1, Math.round(h0 * k));
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, w, h); s = c;
-  }
+  // Always go through a plain 2D canvas: it is drawn upright in every browser, and a canvas uploads
+  // to WebGL the same way everywhere (no browser-specific flips of images or bitmaps).
+  const w = k < 1 ? Math.max(1, Math.round(w0 * k)) : w0, h = k < 1 ? Math.max(1, Math.round(h0 * k)) : h0;
+  const s = document.createElement('canvas'); s.width = w; s.height = h;
+  const x = s.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, w, h);
   if (cropping) endCrop(false);
   gpu.load(s, w, h);
   geo = freshGeo();
@@ -277,7 +280,7 @@ async function openFile(file) {
   say('opening…');
   try {
     const src = await decode(file);
-    useSource(src, src.width, src.height, (file.name || 'pasted').replace(/\.[^.]+$/, '') || 'image');
+    useSource(src, src.naturalWidth || src.width, src.naturalHeight || src.height, (file.name || 'pasted').replace(/\.[^.]+$/, '') || 'image');
   } catch (e) { say('this browser can’t decode that file', true); }
 }
 $('#open').addEventListener('click', () => $('#file').click());
