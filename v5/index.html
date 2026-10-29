@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ie2 v5 · artifact lab</title>
+<meta name="description" content="Thirty optical, sensor, processing, compression, analog-video and display artifacts, rendered on the GPU in your browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231b1a17'/%3E%3Crect x='7' y='9' width='4' height='14' fill='%23e4471b'/%3E%3Crect x='14' y='9' width='4' height='14' fill='%2338b26b'/%3E%3Crect x='21' y='9' width='4' height='14' fill='%233f63ff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #efebe3; --card: #f8f6f1; --sunk: #e6e1d7; --ink: #1b1a17; --mute: #6f6a60; --faint: #9a9488;
+  --rule: #d6d0c4; --acc: #e4471b; --acc-ink: #fff; --blue: #2f4fe0; --stage: #2a2927;
+  --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--paper); color: var(--ink); font: 13px/1.4 var(--sans); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+
+/* top bar */
+.bar { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1.5px solid var(--ink); flex-wrap: wrap; }
+.logo { display: flex; align-items: baseline; gap: 6px; margin-right: 10px; user-select: none; }
+.logo b { font: 700 21px/1 var(--mono); letter-spacing: -1.5px; }
+.logo span { font: 600 10px/1 var(--mono); background: var(--acc); color: var(--acc-ink); padding: 3px 5px; border-radius: 2px; letter-spacing: .04em; }
+.logo em { font: 400 11px/1 var(--mono); color: var(--mute); font-style: normal; margin-left: 2px; }
+.b { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); white-space: nowrap; user-select: none; }
+.b:hover { background: #fff; }
+.b.go { background: var(--ink); color: var(--paper); }
+.b.go:hover { background: #000; }
+.b:disabled { opacity: .35; cursor: not-allowed; }
+.b.q { border-color: transparent; background: transparent; color: var(--mute); }
+.b.q:hover { color: var(--ink); background: var(--sunk); }
+.meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.grow { flex: 1; }
+select { height: 30px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); padding: 0 6px; }
+.exp { display: inline-flex; align-items: center; gap: 6px; }
+.exp label { font: 11px var(--mono); color: var(--mute); display: inline-flex; align-items: center; gap: 4px; }
+.exp input[type=range] { width: 70px; }
+
+/* main */
+main { display: grid; grid-template-columns: 384px minmax(0, 1fr); min-height: 0; }
+
+/* rack */
+.rack { border-right: 1.5px solid var(--ink); display: flex; flex-direction: column; min-height: 0; background: var(--paper); }
+.rack-top { display: flex; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--rule); align-items: center; }
+.rack-top input { flex: 1; min-width: 0; height: 30px; border: 1.5px solid var(--ink); border-radius: 3px; padding: 0 9px; background: var(--card); }
+.rack-top input:focus, select:focus, .pr-v:focus { outline: 2px solid var(--acc); outline-offset: 1px; }
+.fxlist { overflow-y: auto; min-height: 0; flex: 1; padding-bottom: 30px; }
+.grp-h { all: unset; box-sizing: border-box; cursor: pointer; display: flex; align-items: center; gap: 8px; width: 100%; padding: 12px 14px 8px; position: sticky; top: 0; background: var(--paper); z-index: 2; }
+.grp-n { font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; flex: 1; }
+.grp-c { font: 500 10.5px/1 var(--mono); color: var(--acc); }
+.chev { width: 8px; height: 8px; border-right: 1.5px solid var(--ink); border-bottom: 1.5px solid var(--ink); transform: rotate(45deg) translate(-2px, -2px); transition: transform .15s; }
+.grp.shut .chev { transform: rotate(-45deg); }
+.grp.shut .grp-b { display: none; }
+.grp-b { padding: 0 10px 6px; display: grid; gap: 6px; }
+.fx { background: var(--card); border: 1px solid var(--rule); border-radius: 4px; }
+.fx.on { border-color: var(--ink); box-shadow: 2px 2px 0 var(--ink); }
+.fx[hidden], .grp[hidden] { display: none; }
+.fx-h { display: flex; align-items: center; gap: 9px; padding: 8px 9px 2px; }
+.fx-n { all: unset; cursor: pointer; flex: 1; font-weight: 600; font-size: 13px; }
+.fx-r { all: unset; cursor: pointer; color: var(--faint); font: 13px var(--mono); padding: 0 3px; visibility: hidden; }
+.fx.on .fx-r { visibility: visible; }
+.fx-r:hover { color: var(--acc); }
+.fx-i { margin: 0; padding: 0 10px 8px 47px; color: var(--mute); font-size: 11.5px; line-height: 1.35; }
+.fx-p { display: none; padding: 6px 10px 10px; border-top: 1px dashed var(--rule); }
+.fx.on:not(.folded) .fx-p { display: grid; gap: 4px; }
+.fx.folded .fx-i { display: none; }
+
+.sw { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
+.sw input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.sw i { position: absolute; inset: 0; border: 1.5px solid var(--ink); border-radius: 10px; background: var(--paper); transition: background .12s; pointer-events: none; }
+.sw i::after { content: ''; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; border-radius: 50%; background: var(--ink); transition: transform .12s; }
+.sw input:checked + i { background: var(--acc); border-color: var(--acc); }
+.sw input:checked + i::after { transform: translateX(13px); background: #fff; }
+.sw input:focus-visible + i { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.pr { display: grid; grid-template-columns: 112px minmax(0, 1fr) 52px 26px; gap: 8px; align-items: center; min-height: 24px; }
+.pr-l { color: var(--mute); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; user-select: none; }
+.pr.rng .pr-l { cursor: pointer; }
+.pr.mod .pr-l { color: var(--ink); font-weight: 500; }
+.pr-v { width: 100%; height: 22px; border: 1px solid var(--rule); border-radius: 3px; background: var(--paper); font: 11.5px var(--mono); text-align: right; padding: 0 5px; }
+.pr-u { font: 10.5px var(--mono); color: var(--faint); }
+.pr.sel { grid-template-columns: 112px minmax(0, 1fr); }
+.pr.sel select { height: 24px; font-size: 12px; min-width: 0; border-width: 1px; }
+.pr.chk { grid-template-columns: 1fr; }
+.pr.chk label { display: flex; gap: 7px; align-items: center; font-size: 12px; color: var(--mute); cursor: pointer; }
+.pr.chk.mod label { color: var(--ink); }
+input[type=range] { -webkit-appearance: none; appearance: none; height: 18px; background: transparent; margin: 0; width: 100%; cursor: pointer; }
+input[type=range]::-webkit-slider-runnable-track { height: 2px; background: var(--ink); }
+input[type=range]::-moz-range-track { height: 2px; background: var(--ink); }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -5px; border-radius: 50%; background: var(--card); border: 1.5px solid var(--ink); }
+input[type=range]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: var(--card); border: 1.5px solid var(--ink); }
+.pr.mod input[type=range]::-webkit-slider-thumb { background: var(--acc); border-color: var(--acc); }
+.pr.mod input[type=range]::-moz-range-thumb { background: var(--acc); border-color: var(--acc); }
+input[type=checkbox] { accent-color: var(--acc); }
+
+/* viewer */
+.view { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.vbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1.5px solid var(--ink); border-radius: 3px; overflow: hidden; height: 30px; }
+.seg button { border: 0; background: var(--card); padding: 0 11px; }
+.seg button + button { border-left: 1.5px solid var(--ink); }
+.seg button.on { background: var(--ink); color: var(--paper); }
+.zoomv { font: 12px var(--mono); min-width: 48px; text-align: center; color: var(--mute); }
+.stage { position: relative; overflow: hidden; background: var(--stage); cursor: grab; touch-action: none;
+  background-image: radial-gradient(circle, #3a3936 1px, transparent 1.2px); background-size: 18px 18px; }
+.stage.panning { cursor: grabbing; }
+.frame { position: absolute; left: 0; top: 0; transform-origin: 0 0; line-height: 0; }
+#cv { display: block; box-shadow: 0 0 0 1px #000, 0 18px 50px rgba(0,0,0,.45); }
+#cv.px { image-rendering: pixelated; }
+.split { position: absolute; top: 0; bottom: 0; width: 22px; margin-left: -11px; cursor: ew-resize; display: none; z-index: 3; }
+.split::before { content: ''; position: absolute; left: 10px; top: 0; bottom: 0; width: 2px; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.35); }
+.split::after { content: '◂ ▸'; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; color: var(--ink); font: 600 10px/1 var(--mono); padding: 6px 5px; border-radius: 3px; white-space: nowrap; }
+.split-tags { position: absolute; top: 10px; left: 0; right: 0; display: none; pointer-events: none; z-index: 2; }
+.split-tags span { position: absolute; font: 600 10px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; background: rgba(27,26,23,.85); color: #fff; padding: 4px 6px; border-radius: 2px; }
+body.splitting .split, body.splitting .split-tags { display: block; }
+
+.drop { position: absolute; inset: 0; display: grid; place-items: center; z-index: 5; background: var(--stage); }
+.drop.gone { display: none; }
+body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-offset: -14px; }
+.drop-card { background: var(--paper); border: 1.5px solid var(--ink); box-shadow: 6px 6px 0 var(--acc); border-radius: 4px; padding: 26px 28px; max-width: 440px; text-align: left; }
+.drop-card h1 { margin: 0 0 6px; font: 700 22px/1.15 var(--sans); letter-spacing: -.3px; }
+.drop-card p { margin: 0 0 16px; color: var(--mute); }
+.drop-card .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.drop-card small { display: block; margin-top: 14px; color: var(--faint); font: 11px var(--mono); }
+
+/* footer */
+.foot { display: flex; align-items: center; gap: 12px; padding: 6px 14px; border-top: 1.5px solid var(--ink); font: 11.5px var(--mono); color: var(--mute); min-height: 30px; }
+.chain { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chain b { color: var(--ink); font-weight: 600; }
+.chain i { color: var(--acc); font-style: normal; padding: 0 4px; }
+#status.err { color: var(--acc); }
+.fatal { position: fixed; inset: 0; display: grid; place-items: center; background: var(--paper); z-index: 50; padding: 20px; text-align: center; font: 14px var(--mono); }
+
+@media (max-width: 860px) {
+  body { overflow: auto; display: block; }
+  main { grid-template-columns: 1fr; }
+  .view { grid-row: 1; height: 62vh; }
+  .rack { border-right: 0; border-top: 1.5px solid var(--ink); }
+  .fxlist { overflow: visible; }
+  .meta { order: 9; flex-basis: 100%; }
+}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="logo"><b>ie2</b><span>V5</span><em>artifact lab</em></div>
+  <button class="b" id="open" type="button">Open…</button>
+  <input id="file" type="file" accept="image/*" hidden>
+  <div class="meta" id="meta">no image</div>
+  <div class="grow"></div>
+  <select id="preset" title="Start from a preset"><option value="">Presets…</option></select>
+  <button class="b q" id="reseed" type="button" title="New random pattern for every noise-based effect">Reseed</button>
+  <button class="b q" id="alloff" type="button" title="Switch every effect off (settings kept)">All off</button>
+  <div class="exp">
+    <select id="fmt" title="Export format"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></select>
+    <label id="qwrap" hidden>q <input id="q" type="range" min="50" max="100" value="95"><span id="qv">95</span></label>
+    <button class="b go" id="save" type="button" disabled>Export</button>
+  </div>
+</header>
+
+<main>
+  <aside class="rack">
+    <div class="rack-top"><input id="find" type="search" placeholder="Filter 30 effects…" autocomplete="off"><button class="b q" id="resetall" type="button" title="All effects off and back to default settings">Reset</button></div>
+    <div class="fxlist" id="fxlist"></div>
+  </aside>
+
+  <section class="view">
+    <div class="vbar">
+      <div class="seg" id="modes"><button data-m="0" class="on" type="button">Result</button><button data-m="2" type="button">Split</button><button data-m="1" type="button">Original</button></div>
+      <div class="grow"></div>
+      <button class="b q" id="zout" type="button" title="Zoom out">−</button>
+      <span class="zoomv" id="zv">–</span>
+      <button class="b q" id="zin" type="button" title="Zoom in">+</button>
+      <button class="b q" id="zfit" type="button" title="Fit (F)">Fit</button>
+      <button class="b q" id="z1" type="button" title="Actual pixels (1)">1:1</button>
+    </div>
+    <div class="stage" id="stage">
+      <div class="frame" id="frame"><canvas id="cv" width="1" height="1"></canvas></div>
+      <div class="split-tags"><span id="tagL">Original</span><span id="tagR">Result</span></div>
+      <div class="split" id="split"></div>
+      <div class="drop" id="drop">
+        <div class="drop-card">
+          <h1>Thirty ways an image gets marked by the machines that make and show it.</h1>
+          <p>Lens and film quirks, sensor faults, phone processing, compression, VHS, CRTs and LCDs, all rendered on your GPU. Nothing is uploaded.</p>
+          <div class="row"><button class="b go" id="open2" type="button">Open an image</button><button class="b" id="chart" type="button">Use the test scene</button></div>
+          <small>or drop / paste an image anywhere</small>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="chain" id="chain">chain: <b>empty</b></div>
+  <span id="status">ready</span>
+</footer>
+
+<script src="core.js"></script>
+<script src="rack.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
