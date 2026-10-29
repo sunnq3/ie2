@@ -349,12 +349,13 @@ $('#save').addEventListener('click', () => {
   if (!loaded) return;
   if (cropping) endCrop(true);
   request(true); frame();
-  const img = gpu.exportPixels(!state.fx.posterize.on);
-  const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
-  c.getContext('2d').putImageData(img, 0, 0);
+  // Save the on-screen canvas itself, drawn at full resolution in Result view: the file is exactly the
+  // picture you are looking at, so it can never come out turned or flipped relative to the screen.
+  gpu.show(0, split, !state.fx.posterize.on);
   const fmt = $('#fmt').value, mime = 'image/' + fmt, ext = fmt === 'jpeg' ? 'jpg' : fmt;
   say('encoding ' + ext + '…');
-  c.toBlob((blob) => {
+  cv.toBlob((blob) => {
+    request(false);
     if (!blob) { say('export failed', true); return; }
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${baseName}_v5.${ext}`;
     document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);

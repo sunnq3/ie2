@@ -64,11 +64,12 @@ void main() {
   for (int k = -R; k <= R; k++) { float w = exp(-float(k * k) * k2); s += w * texelFetch(u_src, clamp(i + u_dir * k, ivec2(0), mx), 0); ws += w; }
   o = s / ws;
 }`,
-    show: `uniform sampler2D u_b; uniform float u_split, u_mode;
+    show: `uniform sampler2D u_b; uniform float u_split, u_mode, u_dither;
 void main() {
   vec2 uv = vec2(gl_FragCoord.x / u_res.x, 1. - gl_FragCoord.y / u_res.y);
   vec3 r = texture(u_src, uv).rgb, a = texture(u_b, uv).rgb;
   vec3 c = u_mode < .5 ? r : u_mode < 1.5 ? a : (uv.x < u_split ? a : r);
+  c += u_dither * vec3(rnd(P(), 1.) + rnd(P(), 2.) - 1., rnd(P(), 3.) + rnd(P(), 4.) - 1., rnd(P(), 5.) + rnd(P(), 6.) - 1.) / 255.;
   o = vec4(clamp(c, 0., 1.), 1.);
 }`,
     // crop / rotate / flip in one resample. Output pixel -> frame -> undo fine rotation -> undo flip
@@ -293,10 +294,10 @@ void main() {
       return performance.now() - t0;
     }
 
-    function show(mode, split) {
+    function show(mode, split, dither) {
       if (!base) return;
       made = null;
-      pass(SH.show, result, { u_mode: mode, u_split: split }, { target: null, w: W, h: H, tex: { u_b: base } });
+      pass(SH.show, result, { u_mode: mode, u_split: split, u_dither: dither ? 1 : 0 }, { target: null, w: W, h: H, tex: { u_b: base } });
     }
 
     function exportPixels(dither) {

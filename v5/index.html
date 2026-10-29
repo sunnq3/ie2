@@ -136,6 +136,7 @@ body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-off
 .chain b { color: var(--ink); font-weight: 600; }
 .chain i { color: var(--acc); font-style: normal; padding: 0 4px; }
 #status.err { color: var(--acc); }
+.build { color: var(--faint); border-left: 1px solid var(--rule); padding-left: 10px; }
 .fatal { position: fixed; inset: 0; display: grid; place-items: center; background: var(--paper); z-index: 50; padding: 20px; text-align: center; font: 14px var(--mono); }
 
 /* crop & rotate */
@@ -256,10 +257,11 @@ body.cropping .cbox { display: block; }
 <footer class="foot">
   <div class="chain" id="chain">chain: <b>empty</b></div>
   <span id="status">ready</span>
+  <span class="build" title="If this number is older than expected, hard-refresh the page">build 7</span>
 </footer>
 
-<script src="core.js"></script>
-<script src="rack.js"></script>
-<script src="main.js"></script>
+<script src="core.js?b=7"></script>
+<script src="rack.js?b=7"></script>
+<script src="main.js?b=7"></script>
 </body>
 </html>
