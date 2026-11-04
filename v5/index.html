@@ -38,9 +38,17 @@ button { cursor: pointer; }
 .meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .grow { flex: 1; }
 select { height: 30px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); padding: 0 6px; }
-.exp { display: inline-flex; align-items: center; gap: 6px; }
-.exp label { font: 11px var(--mono); color: var(--mute); display: inline-flex; align-items: center; gap: 4px; }
-.exp input[type=range] { width: 70px; }
+.exp { position: relative; display: inline-flex; }
+.xpop { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; width: 330px; background: var(--card); border: 1.5px solid var(--ink); box-shadow: 4px 4px 0 var(--acc); border-radius: 4px; padding: 12px; display: grid; gap: 8px; }
+.xpop[hidden] { display: none; }
+.xpop h4 { margin: 0; font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+.xrow { display: grid; grid-template-columns: 82px minmax(0, 1fr); align-items: center; gap: 8px; font-size: 12px; color: var(--mute); }
+.xrow[hidden] { display: none; }
+.xrow select { height: 28px; font-size: 12px; border-width: 1px; min-width: 0; }
+.xrow .qv { display: grid; grid-template-columns: minmax(0, 1fr) 30px; gap: 6px; align-items: center; color: var(--ink); font: 12px var(--mono); }
+.xnote { margin: 0; color: var(--mute); font-size: 11.5px; line-height: 1.35; }
+#xsize { font: 12px var(--mono); color: var(--ink); }
+#xsave { justify-content: center; }
 
 /* main */
 main { display: grid; grid-template-columns: 384px minmax(0, 1fr); min-height: 0; }
@@ -61,6 +69,27 @@ main { display: grid; grid-template-columns: 384px minmax(0, 1fr); min-height: 0
 .fx { background: var(--card); border: 1px solid var(--rule); border-radius: 4px; }
 .fx.on { border-color: var(--ink); box-shadow: 2px 2px 0 var(--ink); }
 .fx[hidden], .grp[hidden] { display: none; }
+
+/* intensity, advanced settings, real-range bands, survival badges */
+.inten { display: grid; grid-template-columns: auto minmax(0, 1fr) 40px; gap: 10px; align-items: center; padding: 8px 14px 10px; border-bottom: 1px solid var(--rule); font-size: 12px; color: var(--mute); }
+.inten b { font: 500 11.5px var(--mono); color: var(--ink); text-align: right; }
+.fx-more { all: unset; cursor: pointer; justify-self: start; font: 500 11px var(--mono); color: var(--mute); padding: 4px 0 2px; text-decoration: underline; text-underline-offset: 3px; }
+.fx-more:hover { color: var(--ink); }
+.fx-adv { display: none; gap: 4px; }
+.fx.adv-open .fx-adv { display: grid; }
+input[type=range].band::-webkit-slider-runnable-track { background: linear-gradient(90deg, var(--ink) 0 0) 0 50% / 100% 2px no-repeat, linear-gradient(90deg, transparent var(--lo), rgba(56, 160, 92, .28) var(--lo) var(--hi), transparent var(--hi)) 0 50% / 100% 10px no-repeat; height: 10px; }
+input[type=range].band::-moz-range-track { background: linear-gradient(90deg, var(--ink) 0 0) 0 50% / 100% 2px no-repeat, linear-gradient(90deg, transparent var(--lo), rgba(56, 160, 92, .28) var(--lo) var(--hi), transparent var(--hi)) 0 50% / 100% 10px no-repeat; height: 10px; }
+input[type=range].band::-webkit-slider-thumb { margin-top: -1px; }
+.pr.beyond .pr-l { color: #b25e00; }
+.pr.beyond .pr-l::after { content: ' ·  beyond real'; font: 500 10px var(--mono); }
+.badge { font: 600 9.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 3px 5px; border-radius: 2px; border: 1px solid; white-space: nowrap; cursor: help; }
+.badge.ok { color: #23703f; border-color: #8fc6a2; background: #e6f3ea; }
+.badge.lost { color: #6f6a60; border-color: #c9c3b6; background: #ece8df; }
+.badge.strong { color: #9a4b00; border-color: #e3b27c; background: #fbeedd; }
+.badge.stale { opacity: .45; }
+.msum { white-space: nowrap; }
+.b.tog.on { background: var(--ink); color: var(--paper); }
+.viewnote { font: 11px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
 /* merge */
 .merge { margin: 10px 10px 4px; background: var(--card); border: 1.5px solid var(--ink); box-shadow: 3px 3px 0 var(--acc); border-radius: 4px; padding: 10px; display: grid; gap: 8px; }
@@ -216,15 +245,25 @@ body.cropping .cbox { display: block; }
   <button class="b q" id="reseed" type="button" title="New random pattern for every noise-based effect">Reseed</button>
   <button class="b q" id="alloff" type="button" title="Switch every effect off (settings kept)">All off</button>
   <div class="exp">
-    <select id="fmt" title="Export format"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></select>
-    <label id="qwrap" hidden>q <input id="q" type="range" min="50" max="100" value="95"><span id="qv">95</span></label>
-    <button class="b go" id="save" type="button" disabled>Export</button>
+    <button class="b go" id="save" type="button" disabled aria-haspopup="true">Export…</button>
+    <div class="xpop" id="xpop" hidden>
+      <h4>Save as</h4>
+      <div class="xrow"><span>Format</span><select id="xfmt"><option value="jpeg">JPEG</option><option value="png">PNG (lossless)</option><option value="png16">PNG 16-bit (lossless)</option></select></div>
+      <div class="xrow xjpeg"><span>Quality</span><span class="qv"><input id="xq" type="range" min="50" max="100" step="1" aria-label="JPEG quality"><b id="xqv"></b></span></div>
+      <div class="xrow xjpeg"><span>Colour</span><select id="xsub"><option value="444">4:4:4 · full colour (best)</option><option value="422">4:2:2 · half colour</option><option value="420">4:2:0 · quarter colour (smallest)</option></select></div>
+      <div class="xrow"><span>Size</span><select id="xlong"><option value="0">Full size</option><option value="4096">4096 px long edge</option><option value="3000">3000 px</option><option value="2048">2048 px</option><option value="1600">1600 px</option><option value="1080">1080 px</option></select></div>
+      <div class="xrow"><span>Check on</span><select id="xcheck"><option value="none">Nothing, just the file</option><option value="instagram">Instagram ≈</option><option value="whatsapp">WhatsApp ≈</option><option value="facebook">Facebook ≈</option><option value="x">X ≈</option><option value="messages">Messages ≈</option></select></div>
+      <p class="xnote">The preview and the survival badges show the image as this file holds it, and, with an app chosen, roughly what that app does to it after upload (apps change their processing, so treat it as an estimate).</p>
+      <div id="xsize"></div>
+      <button class="b go" id="xsave" type="button">Save file</button>
+    </div>
   </div>
 </header>
 
 <main>
   <aside class="rack">
-    <div class="rack-top"><input id="find" type="search" placeholder="Filter 30 effects…" autocomplete="off"><button class="b q" id="resetall" type="button" title="All effects off and back to default settings">Reset</button></div>
+    <div class="rack-top"><input id="find" type="search" placeholder="Filter effects…" autocomplete="off"><button class="b q" id="resetall" type="button" title="All effects off and back to default settings">Reset</button></div>
+    <div class="inten" title="Scales every effect's strength together. Double-click for 100%."><span>Overall intensity</span><input id="inten" type="range" min="0" max="150" step="1" aria-label="Overall intensity"><b id="intenv"></b></div>
     <div class="fxlist" id="fxlist"><section class="merge" id="merge" hidden></section></div>
   </aside>
 
@@ -232,6 +271,8 @@ body.cropping .cbox { display: block; }
     <div class="vbar">
       <div class="seg" id="modes"><button data-m="0" class="on" type="button">Result</button><button data-m="2" type="button">Split</button><button data-m="1" type="button">Original</button></div>
       <button class="b" id="cropbtn" type="button" title="Crop, straighten, turn and flip (C)" disabled>Crop &amp; rotate</button>
+      <button class="b tog" id="assaved" type="button" title="Show the image exactly as the export will save it (set in Export…)">As saved</button>
+      <span class="viewnote" id="viewnote"></span>
       <div class="grow"></div>
       <button class="b q" id="zout" type="button" title="Zoom out">−</button>
       <span class="zoomv" id="zv">–</span>
@@ -278,12 +319,14 @@ body.cropping .cbox { display: block; }
 
 <footer class="foot">
   <div class="chain" id="chain">chain: <b>empty</b></div>
+  <span id="msum" class="msum" title="Survival after export, for the effects that are on"></span>
   <span id="status">ready</span>
-  <span class="build" title="If this number is older than expected, hard-refresh the page">build 9</span>
+  <span class="build" title="If this number is older than expected, hard-refresh the page">build 10</span>
 </footer>
 
-<script src="core.js?b=9"></script>
-<script src="rack.js?b=9"></script>
-<script src="main.js?b=9"></script>
+<script src="core.js?b=10"></script>
+<script src="rack.js?b=10"></script>
+<script src="export.js?b=10"></script>
+<script src="main.js?b=10"></script>
 </body>
 </html>

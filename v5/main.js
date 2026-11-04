@@ -6,8 +6,8 @@ const KEY = 'ie2.v5.state';
 
 /* ---------------- state ---------------- */
 function freshState() {
-  const st = { seed: 1, fx: {} };
-  for (const e of EFFECTS) { const p = { on: false }; for (const q of e.params) p[q.k] = q.d; st.fx[e.id] = p; }
+  const st = { seed: 1, intensity: 100, fx: {} };
+  for (const e of EFFECTS) { const p = { on: !!e.defOn }; for (const q of e.params) p[q.k] = q.d; st.fx[e.id] = p; }
   return st;
 }
 function restore() {
@@ -16,6 +16,7 @@ function restore() {
     const s = JSON.parse(localStorage.getItem(KEY) || 'null');
     if (s && s.fx) {
       st.seed = Number.isFinite(+s.seed) ? +s.seed : 1;
+      st.intensity = Number.isFinite(+s.intensity) ? Math.min(150, Math.max(0, +s.intensity)) : 100;
       for (const id in st.fx) if (s.fx[id]) for (const k in st.fx[id]) if (typeof s.fx[id][k] === typeof st.fx[id][k]) st.fx[id][k] = s.fx[id][k];
     }
   } catch (e) { /* storage unavailable */ }
@@ -52,7 +53,7 @@ function buildRack() {
 
 function buildEffect(e) {
   const el = document.createElement('article'); el.className = 'fx'; el.dataset.id = e.id;
-  el.innerHTML = '<header class="fx-h"><label class="sw"><input type="checkbox"><i></i></label><button type="button" class="fx-n"></button><button type="button" class="fx-r" title="Back to this effect’s defaults">↺</button></header><p class="fx-i"></p><div class="fx-p"></div>';
+  el.innerHTML = '<header class="fx-h"><label class="sw"><input type="checkbox"><i></i></label><button type="button" class="fx-n"></button><span class="badge" hidden></span><button type="button" class="fx-r" title="Back to this effect’s defaults">↺</button></header><p class="fx-i"></p><div class="fx-p"></div>';
   const cb = $('input', el), nm = $('.fx-n', el);
   nm.textContent = e.name; $('.fx-i', el).textContent = e.info;
   cb.setAttribute('aria-label', e.name);
@@ -63,24 +64,42 @@ function buildEffect(e) {
     else el.classList.toggle('folded');
   });
   $('.fx-r', el).addEventListener('click', () => { for (const q of e.params) st()[q.k] = q.d; sync(); changed(); });
-  const rows = e.params.map(q => buildParam(e, q, $('.fx-p', el)));
+  const host = $('.fx-p', el), adv = e.params.filter(q => q.adv);
+  const rows = e.params.filter(q => !q.adv).map(q => buildParam(e, q, host, sync));
+  if (adv.length) {
+    const more = document.createElement('button'); more.type = 'button'; more.className = 'fx-more'; more.textContent = 'More settings';
+    const box = document.createElement('div'); box.className = 'fx-adv';
+    more.addEventListener('click', () => { el.classList.toggle('adv-open'); more.textContent = el.classList.contains('adv-open') ? 'Fewer settings' : 'More settings'; });
+    host.append(more, box);
+    rows.push(...adv.map(q => buildParam(e, q, box, sync)));
+  }
   function sync() { cb.checked = st().on; el.classList.toggle('on', st().on); rows.forEach(r => r()); }
-  views[e.id] = { el, sync };
+  views[e.id] = { el, sync, badge: $('.badge', el) };
   sync();
   return el;
 }
 
-function buildParam(e, q, host) {
+function buildParam(e, q, host, syncEffect) {
   const row = document.createElement('div'); row.className = 'pr';
   const st = () => state.fx[e.id];
-  const mark = () => row.classList.toggle('mod', st()[q.k] !== q.d);
+  const mark = () => {
+    const v = st()[q.k];
+    row.classList.toggle('mod', v !== q.d);
+    row.classList.toggle('beyond', !!q.real && (v < q.real[0] - 1e-9 || v > q.real[1] + 1e-9));
+  };
   let sync;
   if (q.o) {
     row.classList.add('sel');
     const lab = document.createElement('span'); lab.className = 'pr-l'; lab.textContent = q.l;
     const s = document.createElement('select');
     for (const [v, t] of q.o) s.add(new Option(t, v));
-    s.addEventListener('change', () => { st()[q.k] = s.value; mark(); changed(); });
+    s.addEventListener('change', () => {
+      st()[q.k] = s.value;
+      // choices like "Camera" or "Like (platform)" set the effect's other settings to match
+      const set = e.sets && e.sets.k === q.k && e.sets.from[s.value];
+      if (set) { Object.assign(st(), set); syncEffect(); }
+      mark(); changed();
+    });
     row.append(lab, s);
     sync = () => { s.value = st()[q.k]; mark(); };
   } else if (q.b) {
@@ -94,16 +113,22 @@ function buildParam(e, q, host) {
     row.classList.add('rng');
     const lab = document.createElement('span'); lab.className = 'pr-l'; lab.textContent = q.l; lab.title = 'Double-click to reset';
     const r = document.createElement('input'); r.type = 'range'; r.min = q.min; r.max = q.max; r.step = q.step; r.setAttribute('aria-label', q.l);
+    if (q.real) {   // shade the range real cameras / devices produce
+      const pc = (v) => (100 * (v - q.min) / (q.max - q.min)).toFixed(2) + '%';
+      r.style.setProperty('--lo', pc(q.real[0])); r.style.setProperty('--hi', pc(q.real[1])); r.classList.add('band');
+      row.title = 'Shaded: the range real ' + (e.group === 'analog' || e.group === 'display' ? 'devices' : 'cameras') + ' produce';
+    }
     const n = document.createElement('input'); n.type = 'text'; n.className = 'pr-v'; n.inputMode = 'decimal'; n.spellcheck = false;
     const u = document.createElement('span'); u.className = 'pr-u'; u.textContent = q.u || '';
-    r.addEventListener('input', () => { st()[q.k] = +r.value; n.value = show(r.value, q.step); mark(); changed(); });
+    const fmtv = (v) => q.show ? q.show(+v) : show(v, q.step);
+    r.addEventListener('input', () => { st()[q.k] = +r.value; n.value = fmtv(r.value); mark(); changed(); });
     n.addEventListener('change', () => {
-      let v = parseFloat(n.value); if (!Number.isFinite(v)) v = q.d;
+      let v = parseFloat(n.value); if (Number.isFinite(v) && q.parse) v = q.parse(v); if (!Number.isFinite(v)) v = q.d;
       st()[q.k] = Math.min(q.max, Math.max(q.min, v)); sync(); changed();
     });
     lab.addEventListener('dblclick', () => { st()[q.k] = q.d; sync(); changed(); });
     row.append(lab, r, n, u);
-    sync = () => { r.value = st()[q.k]; n.value = show(st()[q.k], q.step); mark(); };
+    sync = () => { r.value = st()[q.k]; n.value = fmtv(st()[q.k]); mark(); };
   }
   host.append(row);
   return sync;
@@ -113,10 +138,10 @@ function syncAll() { for (const id in views) views[id].sync(); }
 
 function refreshSummary() {
   for (const [gid] of GROUPS) {
-    const n = EFFECTS.filter(e => e.group === gid && state.fx[e.id].on).length;
+    const n = EFFECTS.filter(e => e.group === gid && state.fx[e.id].on && e.id !== 'light').length;
     $(`.grp[data-g="${gid}"] .grp-c`).textContent = n ? n + ' on' : '';
   }
-  const on = EFFECTS.filter(e => state.fx[e.id].on);
+  const on = EFFECTS.filter(e => state.fx[e.id].on && e.id !== 'light');
   const chain = $('#chain');
   chain.textContent = 'chain: ';
   if (!on.length) { const b = document.createElement('b'); b.textContent = 'empty — switch an effect on'; chain.append(b); }
@@ -126,7 +151,26 @@ function refreshSummary() {
   });
 }
 
-function changed() { persist(); refreshSummary(); request(true); }
+function changed() { persist(); refreshSummary(); request(true); scheduleMeter(); }
+
+/* the chain as the GPU runs it: light settings go to the scene conversion, amounts scaled by intensity */
+function buildChain() {
+  const k = state.intensity / 100;
+  return EFFECTS.filter(e => state.fx[e.id].on && e.id !== 'light').map(e => {
+    const p = Object.assign({}, state.fx[e.id]);
+    for (const q of e.params) if (q.amt) p[q.k] = Math.min(q.max, Math.max(q.min, p[q.k] * k));
+    return { fx: e, p };
+  });
+}
+function chainOpts() {
+  const L = state.fx.light;
+  return { hr: L.on ? Math.pow(2, L.stops) : 1, knee: L.knee, k: state.intensity / 100 };
+}
+
+/* overall intensity */
+function syncIntensity() { $('#inten').value = state.intensity; $('#intenv').textContent = state.intensity + '%'; }
+$('#inten').addEventListener('input', (e) => { state.intensity = +e.target.value; syncIntensity(); changed(); });
+$('#inten').addEventListener('dblclick', () => { state.intensity = 100; syncIntensity(); changed(); });
 
 /* filter */
 $('#find').addEventListener('input', (ev) => {
@@ -142,12 +186,16 @@ $('#preset').addEventListener('change', (ev) => {
   ev.target.value = '';
   if (!pr) return;
   const seed = state.seed; state = freshState(); state.seed = seed;
-  for (const id in pr[1]) { Object.assign(state.fx[id], pr[1][id]); state.fx[id].on = true; }
+  for (const id in pr[1]) {
+    const e = EFFECTS.find(x => x.id === id), v = pr[1][id];
+    if (e && e.sets && v[e.sets.k] && e.sets.from[v[e.sets.k]]) Object.assign(state.fx[id], e.sets.from[v[e.sets.k]]);
+    Object.assign(state.fx[id], v); state.fx[id].on = true;
+  }
   syncAll(); changed(); say('preset: ' + pr[0]);
 });
 $('#reseed').addEventListener('click', () => { state.seed = 1 + Math.floor(Math.random() * 9999); changed(); say('seed ' + state.seed); });
-$('#alloff').addEventListener('click', () => { for (const id in state.fx) state.fx[id].on = false; syncAll(); changed(); });
-$('#resetall').addEventListener('click', () => { const seed = state.seed; state = freshState(); state.seed = seed; syncAll(); changed(); });
+$('#alloff').addEventListener('click', () => { for (const id in state.fx) state.fx[id].on = id === 'light' ? state.fx[id].on : false; syncAll(); changed(); });
+$('#resetall').addEventListener('click', () => { const seed = state.seed; state = freshState(); state.seed = seed; syncAll(); syncIntensity(); changed(); });
 
 /* ---------------- rendering ---------------- */
 let stack = null, mergeDirty = false;   // merge of several versions (see "merge" below)
@@ -163,11 +211,17 @@ function frame() {
   }
   if (needProcess && !cropping) {
     needProcess = false;
-    const chain = EFFECTS.filter(e => state.fx[e.id].on).map(e => ({ fx: e, p: state.fx[e.id] }));
-    try { gpu.process(chain, state.seed); say(chain.length ? `${chain.length} effect${chain.length > 1 ? 's' : ''}` : 'original'); }
+    const chain = buildChain();
+    try { gpu.process(chain, state.seed, chainOpts()); say(chain.length ? `${chain.length} effect${chain.length > 1 ? 's' : ''}` : 'original'); }
     catch (e) { say(e.message, true); console.error(e); }
   }
-  gpu.show(holdOrig ? 1 : mode, split);
+  let tex = null;
+  if (cropping) tex = gpu.base;
+  else if (xs.asSaved) { try { tex = gpu.savedView(exportS()); } catch (e) { say(e.message, true); console.error(e); } }
+  const w0 = cv.width, h0 = cv.height;
+  gpu.show(cropping ? 0 : holdOrig ? 1 : mode, split, tex);
+  if (cv.width !== w0 || cv.height !== h0) fit();
+  $('#viewnote').textContent = !cropping && xs.asSaved ? viewNote() : '';
 }
 function say(t, err) { const s = $('#status'); s.textContent = t; s.classList.toggle('err', !!err); }
 
@@ -280,7 +334,7 @@ function useSource(src, w0, h0, name) {
   updateMeta();
   $('#drop').classList.add('gone');
   $('#save').disabled = false; $('#cropbtn').disabled = false;
-  fit(); request(true);
+  fit(); request(true); scheduleMeter();
 }
 async function openFile(file) {
   if (!file || !gpu) return;
@@ -324,7 +378,7 @@ const mergeP = (() => {
   return d;
 })();
 const saveMerge = () => { try { localStorage.setItem(MKEY, JSON.stringify({ mode: mergeP.mode, pow: mergeP.pow, scale: mergeP.scale, soft: mergeP.soft })); } catch (e) { /* ignore */ } };
-const markMerge = () => { saveMerge(); mergeDirty = true; request(false); };
+const markMerge = () => { saveMerge(); mergeDirty = true; request(false); scheduleMeter(); };
 
 function runMerge() {
   const n = stack.names.length, solo = mergeP.solo, w = new Array(8).fill(0);
@@ -501,36 +555,119 @@ function testScene() {
 }
 
 /* ---------------- export ---------------- */
-$('#fmt').addEventListener('change', () => { $('#qwrap').hidden = $('#fmt').value === 'png'; });
-$('#q').addEventListener('input', () => { $('#qv').textContent = $('#q').value; });
-$('#save').addEventListener('click', () => {
+/* export settings: what the file will be, and (optionally) which app to check it against */
+const XKEY = 'ie2.v5.export';
+const xs = (() => {
+  const d = { format: 'jpeg', q: 92, sub: '444', long: '0', check: 'none', asSaved: true };
+  try { const v = JSON.parse(localStorage.getItem(XKEY) || 'null'); if (v) for (const k in d) if (typeof v[k] === typeof d[k]) d[k] = v[k]; } catch (e) { /* ignore */ }
+  return d;
+})();
+const saveX = () => { try { localStorage.setItem(XKEY, JSON.stringify(xs)); } catch (e) { /* ignore */ } };
+function exportS() {
+  const P = xs.check !== 'none' && PLATFORMS[xs.check];
+  return { format: xs.format, q: +xs.q, sub: xs.sub, long: +xs.long || 0, check: P ? { long: P.long, q: P.q, sub: P.sub, sharpen: P.psharp } : null };
+}
+const CHECK_NAMES = { instagram: 'Instagram', whatsapp: 'WhatsApp', facebook: 'Facebook', x: 'X', messages: 'Messages' };
+function viewNote() {
+  const f = xs.format === 'jpeg' ? `JPEG ${xs.q} ${xs.sub.split('').join(':')}` : xs.format === 'png' ? 'PNG' : 'PNG 16-bit';
+  return `as saved: ${f}` + (+xs.long ? ` · ${xs.long} px` : '') + (xs.check !== 'none' ? ` · then ${CHECK_NAMES[xs.check]} ≈` : '');
+}
+function syncExportUI() {
+  $('#xfmt').value = xs.format; $('#xq').value = xs.q; $('#xqv').textContent = xs.q; $('#xsub').value = xs.sub; $('#xlong').value = xs.long; $('#xcheck').value = xs.check;
+  document.querySelectorAll('.xjpeg').forEach(el => { el.hidden = xs.format !== 'jpeg'; });
+  $('#assaved').classList.toggle('on', xs.asSaved);
+  $('#assaved').setAttribute('aria-pressed', xs.asSaved);
+}
+function exportChanged() { saveX(); syncExportUI(); request(false); scheduleMeter(); scheduleSize(); }
+$('#xfmt').addEventListener('change', (e) => { xs.format = e.target.value; exportChanged(); });
+$('#xq').addEventListener('input', (e) => { xs.q = +e.target.value; exportChanged(); });
+$('#xsub').addEventListener('change', (e) => { xs.sub = e.target.value; exportChanged(); });
+$('#xlong').addEventListener('change', (e) => { xs.long = e.target.value; exportChanged(); });
+$('#xcheck').addEventListener('change', (e) => { xs.check = e.target.value; exportChanged(); });
+$('#assaved').addEventListener('click', () => { xs.asSaved = !xs.asSaved; exportChanged(); });
+$('#save').addEventListener('click', () => { const p = $('#xpop'); p.hidden = !p.hidden; if (!p.hidden) scheduleSize(); });
+document.addEventListener('pointerdown', (e) => { if (!$('#xpop').hidden && !e.target.closest('#xpop, #save')) $('#xpop').hidden = true; });
+
+// estimated JPEG file size (real encode), only while the panel is open
+let sizeTimer = 0;
+function scheduleSize() {
+  clearTimeout(sizeTimer);
+  if ($('#xpop').hidden || !loaded) return;
+  if (xs.format !== 'jpeg') { $('#xsize').textContent = 'Lossless: nothing is lost in the file.'; return; }
+  $('#xsize').textContent = 'estimating size…';
+  sizeTimer = setTimeout(() => {
+    if ($('#xpop').hidden || cropping) return;
+    try { frame(); const src = gpu.prepareJpeg(exportS()); try { const b = ENC.jpeg(src); $('#xsize').textContent = `≈ ${fmtBytes(b.length)} · ${src.info.W}×${src.info.H}`; } finally { src.done(); } }
+    catch (e) { $('#xsize').textContent = ''; console.error(e); }
+  }, 500);
+}
+const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : Math.round(n / 1024) + ' KB';
+
+async function saveFile() {
   if (!loaded) return;
   if (cropping) endCrop(true);
-  request(true); frame();
-  // Some browser / GPU combinations (e.g. Direct3D-backed WebGL on Windows) copy a WebGL canvas
-  // upside down or mirrored. Draw a probe with a known top-left, read it back exactly the way the
-  // export does, and undo whatever flip this machine applies.
-  gpu.probe();
-  const pc = document.createElement('canvas'); pc.width = pc.height = 4;
-  const px2 = pc.getContext('2d', { willReadFrequently: true }); px2.drawImage(cv, 0, 0, 4, 4);
-  const pd = px2.getImageData(0, 0, 1, 1).data, flipV = pd[0] < 128, flipH = pd[1] < 128;
-  // the picture itself, full resolution, Result view
-  gpu.show(0, split, !state.fx.posterize.on);
-  const out = document.createElement('canvas'); out.width = cv.width; out.height = cv.height;
-  const ox = out.getContext('2d');
-  ox.setTransform(flipH ? -1 : 1, 0, 0, flipV ? -1 : 1, flipH ? out.width : 0, flipV ? out.height : 0);
-  ox.drawImage(cv, 0, 0);
+  frame();
+  const S = exportS();
+  say('encoding…');
+  await new Promise(r => setTimeout(r, 20));
+  let bytes, ext, w, h;
+  try {
+    if (S.format === 'jpeg') {
+      const src = gpu.prepareJpeg(S); w = src.info.W; h = src.info.H;
+      try { bytes = ENC.jpeg(src); } finally { src.done(); }
+      ext = 'jpg';
+    } else {
+      const src = gpu.preparePng(S); w = src.w; h = src.h;
+      try { bytes = await ENC.png(src); } finally { src.done(); }
+      ext = 'png';
+    }
+  } catch (e) { say('export failed: ' + e.message, true); console.error(e); return; }
   request(false);
-  const fmt = $('#fmt').value, mime = 'image/' + fmt, ext = fmt === 'jpeg' ? 'jpg' : fmt;
-  say('encoding ' + ext + '…');
-  const fixed = flipV || flipH ? ' (browser flip corrected)' : '';
-  out.toBlob((blob) => {
-    if (!blob) { say('export failed', true); return; }
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${baseName}_v5.${ext}`;
-    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    say(`saved ${a.download} · ${(blob.size / 1024).toFixed(0)} KB${fixed}`);
-  }, mime, +$('#q').value / 100);
-});
+  const blob = new Blob([bytes], { type: ext === 'jpg' ? 'image/jpeg' : 'image/png' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${baseName}_v5.${ext}`;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  say(`saved ${a.download} · ${w}×${h} · ${fmtBytes(blob.size)}`);
+  $('#xpop').hidden = true;
+}
+$('#xsave').addEventListener('click', saveFile);
+
+/* ---------------- survival meter ---------------- */
+// After edits settle, every effect's change is measured before and after the export (and the chosen
+// app check): Lost = it won't show in the file, Natural = survives within real-camera range,
+// Too strong = a setting is beyond what real cameras / devices produce.
+let meterTimer = 0;
+function scheduleMeter() {
+  clearTimeout(meterTimer);
+  for (const id in views) if (views[id].badge) views[id].badge.classList.add('stale');
+  if (!loaded || cropping) return;
+  meterTimer = setTimeout(runMeter, 900);
+}
+function rate(e, p, m) {
+  const beyond = e.params.some(q => q.real && !q.o && !q.b && (p[q.k] < q.real[0] - 1e-9 || p[q.k] > q.real[1] + 1e-9));
+  const { pre, post } = m, keep = pre.mean > 1e-4 ? post.mean / pre.mean : 0;
+  const info = `Keeps ${Math.round(Math.min(1, keep) * 100)}% of its change after export · visibly changes ${(post.vis * 100).toFixed(1)}% of the image`;
+  if (pre.mean < 0.05 && pre.vis < 0.001) return ['lost', 'No change', 'This photo has nothing for it to act on (or it is set to zero).'];
+  if (post.mean < 0.06 || (keep < 0.3 && post.vis < 0.005)) return ['lost', 'Lost', info + '. It will not really show in the saved file.'];
+  if (beyond) return ['strong', 'Too strong', info + '. A setting is beyond what real cameras / devices produce.'];
+  return ['ok', 'Natural', info + '.'];
+}
+function runMeter() {
+  if (!loaded || cropping || !gpu) return;
+  const chain = buildChain();
+  for (const id in views) { const b = views[id].badge; if (b) { b.hidden = true; b.classList.remove('stale'); } }
+  if (!chain.length) { $('#msum').textContent = ''; return; }
+  let res;
+  try { res = gpu.measure(chain, state.seed, chainOpts(), exportS()); } catch (e) { console.error(e); return; }
+  const count = { ok: 0, lost: 0, strong: 0 };
+  chain.forEach(({ fx, p }, i) => {
+    if (fx.meter === false || !res[i]) return;
+    const [cls, label, tip] = rate(fx, p, res[i]), b = views[fx.id].badge;
+    b.hidden = false; b.className = 'badge ' + cls; b.textContent = label; b.title = tip;
+    count[cls]++;
+  });
+  $('#msum').textContent = [count.ok && `${count.ok} natural`, count.lost && `${count.lost} lost`, count.strong && `${count.strong} too strong`].filter(Boolean).join(' · ');
+  request(false);
+}
 
 /* ---------------- crop & rotate ---------------- */
 /* geo = what is applied; edit = the working copy while the crop bar is open. The crop rectangle is
@@ -561,11 +698,11 @@ function endCrop(apply) {
   edit = null; drag = null;
   document.body.classList.remove('cropping');
   gpu.setGeometry(geo);
-  updateMeta(); fit(); request(true);
+  updateMeta(); request(true); scheduleMeter();
   if (apply) say(`cropped to ${gpu.size[0]}×${gpu.size[1]}`);
 }
 // While editing, show the whole frame (no crop) so the crop box can be moved anywhere in it.
-function preview() { gpu.setGeometry(edit, [0, 0, 1, 1]); placeCrop(); request(false); }
+function preview() { gpu.setGeometry(edit, [0, 0, 1, 1]); const [w, h] = gpu.size; if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; } placeCrop(); request(false); }
 function ratio() {
   if (edit.aspect === 'free') return 0;
   return edit.aspect === 'orig' ? cv.width / cv.height : +edit.aspect;
@@ -639,3 +776,5 @@ $('#anglev').addEventListener('change', (e) => { const v = parseFloat(e.target.v
 /* ---------------- go ---------------- */
 buildRack();
 refreshSummary();
+syncIntensity();
+syncExportUI();

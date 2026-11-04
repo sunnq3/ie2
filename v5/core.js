@@ -1,10 +1,16 @@
 'use strict';
 /*
  * ie2 v5 — GPU core.
- * The image lives on the GPU as half-float RGBA textures. Every effect is a short chain of
- * full-screen fragment passes; intermediate textures come from a pool and go straight back to it.
- * Coordinates inside shaders: gl_FragCoord.y = 0 is the TOP row of the image (we never flip until
- * the final on-screen pass), so "top / bottom" in effects mean what they say.
+ * The image lives on the GPU as float RGBA textures. Every effect is a short chain of full-screen
+ * fragment passes; intermediate textures come from a pool and go straight back to it.
+ * Coordinates inside shaders: gl_FragCoord.y = 0 is the TOP row of the image (nothing is ever flipped),
+ * so "top / bottom" in effects mean what they say and read-backs come out top row first.
+ *
+ * Two light domains:
+ *   display — what the photo file holds: sRGB-encoded 0..1.
+ *   scene   — linear light, with blown highlights rebuilt as bright light (values above 1), so lens
+ *             and sensor effects respond to real light the way they do in a camera.
+ * The pipeline converts between them automatically, exactly invertibly.
  */
 const GPU = (() => {
   const VERT = `#version 300 es
@@ -26,10 +32,29 @@ float lumaL(vec3 c) { return dot(c, vec3(.2126, .7152, .0722)); }
 vec3 lin(vec3 c) { c = max(c, 0.); return mix(c / 12.92, pow((c + .055) / 1.055, vec3(2.4)), step(.04045, c)); }
 vec3 srgb(vec3 c) { c = max(c, 0.); return mix(c * 12.92, 1.055 * pow(c, vec3(1. / 2.4)) - .055, step(.0031308, c)); }
 vec3 srgbS(vec3 c) { return sign(c) * srgb(abs(c)); }
+float lin1(float v) { v = max(v, 0.); return v <= .04045 ? v / 12.92 : pow((v + .055) / 1.055, 2.4); }
+float srgb1(float v) { v = max(v, 0.); return v <= .0031308 ? v * 12.92 : 1.055 * pow(v, 1. / 2.4) - .055; }
 vec3 toYcc(vec3 c) { return vec3(dot(c, vec3(.299, .587, .114)), dot(c, vec3(-.168736, -.331264, .5)), dot(c, vec3(.5, -.418688, -.081312))); }
 vec3 fromYcc(vec3 y) { return vec3(y.x + 1.402 * y.z, y.x - .344136 * y.y - .714136 * y.z, y.x + 1.772 * y.y); }
 vec3 yiq(vec3 c) { return vec3(dot(c, vec3(.299, .587, .114)), dot(c, vec3(.596, -.274, -.322)), dot(c, vec3(.211, -.523, .312))); }
 vec3 unyiq(vec3 y) { return vec3(y.x + .956 * y.y + .621 * y.z, y.x - .272 * y.y - .647 * y.z, y.x - 1.106 * y.y + 1.703 * y.z); }
+// display <-> scene light. Above the knee, values are expanded toward hr (the brightest rebuilt light),
+// driven by the brightest channel so hue is kept. toDisp is the exact inverse; light beyond hr clips.
+float hrF(float m, float hr, float knee) { float t = clamp((m - knee) / max(1. - knee, 1e-4), 0., 1.); return 1. + (hr - 1.) * t * t * t * (3. - 2. * t); }
+vec3 toScene(vec3 c, float hr, float knee) { c = clamp(c, 0., 1.); float m = max(c.r, max(c.g, c.b)); return lin(c) * hrF(m, hr, knee); }
+vec3 toDisp(vec3 x, float hr, float knee) {
+  x = max(x, 0.); float M = max(x.r, max(x.g, x.b));
+  if (M <= 0.) return vec3(0.);
+  float m;
+  if (hr <= 1.0001 || M <= lin1(knee)) m = srgb1(min(M, 1.));
+  else if (M >= hr) m = 1.;
+  else {
+    float lo = knee, hi = 1.;
+    for (int i = 0; i < 20; i++) { float mid = .5 * (lo + hi); if (lin1(mid) * hrF(mid, hr, knee) < M) lo = mid; else hi = mid; }
+    m = .5 * (lo + hi);
+  }
+  return srgb(min(x / hrF(m, hr, knee), vec3(1.)));
+}
 uint pcg(uvec3 v) {
   v = v * 1664525u + 1013904223u;
   v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
@@ -51,6 +76,17 @@ float rad() { return length(gl_FragCoord.xy - u_res * .5) / (.5 * length(u_res))
 
   const SH = {
     ingest: `void main() { vec4 c = texelFetch(u_src, ivec2(P()), 0); o = vec4(mix(vec3(1.), c.rgb, c.a), 1.); }`,
+    copy: `void main() { o = vec4(texelFetch(u_src, ivec2(P()), 0).rgb, 1.); }`,
+    clamp01: `void main() { o = vec4(clamp(texelFetch(u_src, ivec2(P()), 0).rgb, 0., 1.), 1.); }`,
+    toScene: `uniform float u_hr, u_knee; void main() { o = vec4(toScene(texelFetch(u_src, ivec2(P()), 0).rgb, u_hr, u_knee), 1.); }`,
+    toDisp: `uniform float u_hr, u_knee; void main() { o = vec4(toDisp(texelFetch(u_src, ivec2(P()), 0).rgb, u_hr, u_knee), 1.); }`,
+    // round to 8 bits (optionally dithered) exactly as a file stores it
+    q8: `uniform float u_dither;
+void main() {
+  vec2 p = P(); vec3 c = clamp(texelFetch(u_src, ivec2(p), 0).rgb, 0., 1.);
+  vec3 n = u_dither * vec3(rnd(p, 1.) + rnd(p, 2.) - 1., rnd(p, 3.) + rnd(p, 4.) - 1., rnd(p, 5.) + rnd(p, 6.) - 1.);
+  o = vec4(clamp(floor(c * 255. + n + .5), 0., 255.) / 255., 1.);
+}`,
     down: `uniform ivec2 u_f;
 void main() {
   ivec2 b = ivec2(P()) * u_f, mx = ivec2(u_srcRes) - 1; vec4 s = vec4(0);
@@ -64,12 +100,89 @@ void main() {
   for (int k = -R; k <= R; k++) { float w = exp(-float(k * k) * k2); s += w * texelFetch(u_src, clamp(i + u_dir * k, ivec2(0), mx), 0); ws += w; }
   o = s / ws;
 }`,
-    show: `uniform sampler2D u_b; uniform float u_split, u_mode, u_dither;
+    // One axis of a resize. Kernels: 0 nearest, 1 triangle, 2 Catmull-Rom, 3 Lanczos-3, 4 exact area,
+    // 5 triangle without anti-aliasing (what cheap GPU / browser scalers do), 6 Mitchell.
+    // u_off shifts the sampling grid (half-pixel offset bugs in real software).
+    rs: `uniform int u_axis, u_kern; uniform float u_scale, u_off;
+float K(float x) {
+  x = abs(x);
+  if (u_kern == 1 || u_kern == 5) return max(0., 1. - x);
+  if (u_kern == 2) return x < 1. ? (1.5 * x - 2.5) * x * x + 1. : x < 2. ? ((-.5 * x + 2.5) * x - 4.) * x + 2. : 0.;
+  if (u_kern == 6) return x < 1. ? (7. * x * x * x - 12. * x * x + 16. / 3.) / 6. : x < 2. ? (-7. / 3. * x * x * x + 12. * x * x - 20. * x + 32. / 3.) / 6. : 0.;
+  if (x < 1e-5) return 1.; if (x >= 3.) return 0.;
+  float a = PI * x; return 3. * sin(a) * sin(a / 3.) / (a * a);
+}
+vec3 S(int j, ivec2 q) { return px(u_axis == 0 ? ivec2(j, q.y) : ivec2(q.x, j)); }
+void main() {
+  ivec2 q = ivec2(P()); float i = u_axis == 0 ? P().x : P().y, n = u_axis == 0 ? u_srcRes.x : u_srcRes.y;
+  float c = i / u_scale + u_off;
+  if (u_kern == 0) { o = vec4(S(int(floor(c)), q), 1.); return; }
+  vec3 s = vec3(0.); float ws = 0.;
+  if (u_kern == 4) {
+    float a = (i - .5) / u_scale + u_off, b = (i + .5) / u_scale + u_off;
+    if (u_scale >= 1.) { a = c - .5; b = c + .5; }
+    for (int j = int(floor(a)); j <= int(ceil(b)); j++) { float w = max(0., min(float(j + 1), b) - max(float(j), a)); s += w * S(j, q); ws += w; }
+    o = vec4(s / max(ws, 1e-6), 1.); return;
+  }
+  float fs = (u_scale < 1. && u_kern != 5) ? 1. / u_scale : 1., sup = (u_kern == 1 || u_kern == 5 ? 1. : u_kern == 3 ? 3. : 2.) * fs;
+  int lo = int(floor(c - sup)), hi = int(ceil(c + sup));
+  for (int j = lo; j <= hi; j++) { float w = K((float(j) + .5 - c) / fs); s += w * S(j, q); ws += w; }
+  o = vec4(s / ws, 1.);
+}`,
+    unsharp: `uniform sampler2D u_b; uniform float u_k; void main() { vec3 c = px(ivec2(P())); o = vec4(c + u_k * (luma(c) - luma(texture(u_b, UV()).rgb)), 1.); }`,
+
+    /* ---- JPEG, done the way an encoder and decoder do it, so the preview is the file ---- */
+    // RGB (rounded to 8 bits, optional dither) -> Y-128, Cb, Cr, padded to whole MCUs by edge copy
+    jpYcc: `uniform float u_dither;
+void main() {
+  ivec2 p = min(ivec2(P()), ivec2(u_srcRes) - 1); vec2 f = vec2(p);
+  vec3 n = u_dither * vec3(rnd(f, 1.) + rnd(f, 2.) - 1., rnd(f, 3.) + rnd(f, 4.) - 1., rnd(f, 5.) + rnd(f, 6.) - 1.);
+  vec3 c = clamp(floor(clamp(texelFetch(u_src, p, 0).rgb, 0., 1.) * 255. + n + .5), 0., 255.);
+  vec3 y = floor(toYcc(c) + vec3(0., 128., 128.) + .5);
+  o = vec4(y.x - 128., y.y - 128., y.z - 128., 1.);
+}`,
+    jpDown: `uniform ivec2 u_s;
+void main() {
+  ivec2 b = ivec2(P()) * u_s, mx = ivec2(u_srcRes) - 1; vec2 s = vec2(0.);
+  for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) if (x < u_s.x && y < u_s.y) s += texelFetch(u_src, min(b + ivec2(x, y), mx), 0).gb;
+  o = vec4(0., floor(s / float(u_s.x * u_s.y) + .5), 1.);
+}`,
+    jpRow: `uniform float u_B[64];
+void main() { ivec2 p = ivec2(P()); int u = p.x & 7, bx = p.x - u; vec3 s = vec3(0.);
+  for (int i = 0; i < 8; i++) s += u_B[u * 8 + i] * texelFetch(u_src, ivec2(bx + i, p.y), 0).rgb;
+  o = vec4(s, 1.); }`,
+    jpColQ: `uniform float u_B[64], u_QY[64], u_QC[64];
+void main() { ivec2 p = ivec2(P()); int v = p.y & 7, by = p.y - v, k = v * 8 + (p.x & 7); vec3 s = vec3(0.);
+  for (int j = 0; j < 8; j++) s += u_B[v * 8 + j] * texelFetch(u_src, ivec2(p.x, by + j), 0).rgb;
+  o = vec4(clamp(round(s / vec3(u_QY[k], u_QC[k], u_QC[k])), -1023., 1023.), 1.); }`,
+    jpColI: `uniform float u_B[64], u_QY[64], u_QC[64];
+void main() { ivec2 p = ivec2(P()); int j = p.y & 7, by = p.y - j, u = p.x & 7; vec3 s = vec3(0.);
+  for (int v = 0; v < 8; v++) { int k = v * 8 + u; s += u_B[v * 8 + j] * texelFetch(u_src, ivec2(p.x, by + v), 0).rgb * vec3(u_QY[k], u_QC[k], u_QC[k]); }
+  o = vec4(s, 1.); }`,
+    jpRowI: `uniform float u_B[64];
+void main() { ivec2 p = ivec2(P()); int i = p.x & 7, bx = p.x - i; vec3 s = vec3(0.);
+  for (int u = 0; u < 8; u++) s += u_B[u * 8 + i] * texelFetch(u_src, ivec2(bx + u, p.y), 0).rgb;
+  o = vec4(clamp(round(s + 128.), 0., 255.) - vec3(0., 128., 128.), 1.); }`,
+    // decoder output: chroma upsampled the way libjpeg's "fancy" upsampling does (centred linear)
+    jpOut: `uniform sampler2D u_c; uniform vec2 u_cs, u_cres;
+void main() { ivec2 p = ivec2(P()); float Y = texelFetch(u_src, p, 0).r;
+  vec2 C = texture(u_c, ((vec2(p) + .5) / u_cs) / u_cres).gb;
+  o = vec4(clamp(floor(fromYcc(vec3(Y, C)) + .5), 0., 255.) / 255., 1.); }`,
+
+    // per-pixel colour difference (CIE76 dE) for the survival meter: visible?, dE, dE where visible
+    dE: `uniform sampler2D u_b;
+vec3 lab(vec3 c) {
+  vec3 x = mat3(.4124, .2126, .0193, .3576, .7152, .1192, .1805, .0722, .9505) * lin(clamp(c, 0., 1.)) / vec3(.95047, 1., 1.08883);
+  vec3 f = mix(pow(max(x, 1e-6), vec3(1. / 3.)), 7.787 * x + 16. / 116., step(x, vec3(.008856)));
+  return vec3(116. * f.y - 16., 500. * (f.x - f.y), 200. * (f.y - f.z));
+}
+void main() { float d = min(length(lab(px(ivec2(P()))) - lab(texture(u_b, UV()).rgb)), 60.); float v = d > 1. ? 1. : 0.; o = vec4(v, d, v * d, 1.); }`,
+
+    show: `uniform sampler2D u_b; uniform float u_split, u_mode;
 void main() {
   vec2 uv = vec2(gl_FragCoord.x / u_res.x, 1. - gl_FragCoord.y / u_res.y);
   vec3 r = texture(u_src, uv).rgb, a = texture(u_b, uv).rgb;
   vec3 c = u_mode < .5 ? r : u_mode < 1.5 ? a : (uv.x < u_split ? a : r);
-  c += u_dither * vec3(rnd(P(), 1.) + rnd(P(), 2.) - 1., rnd(P(), 3.) + rnd(P(), 4.) - 1., rnd(P(), 5.) + rnd(P(), 6.) - 1.) / 255.;
   o = vec4(clamp(c, 0., 1.), 1.);
 }`,
     // crop / rotate / flip in one resample. Output pixel -> frame -> undo fine rotation -> undo flip
@@ -150,15 +263,22 @@ void main() {
   }
   o = vec4(ws > 0. ? s / ws : L(0, p), 1.);
 }`,
-    // orientation probe for the on-screen canvas: top half red, left half green (as displayed)
-    probe: `void main() { vec2 p = gl_FragCoord.xy / u_res; o = vec4(p.y > .5 ? 1. : 0., p.x < .5 ? 1. : 0., 0., 1.); }`,
-    out8: `uniform float u_dither;
-void main() {
-  vec2 p = P(); vec3 c = clamp(texelFetch(u_src, ivec2(p), 0).rgb, 0., 1.);
-  vec3 n = vec3(rnd(p, 1.) + rnd(p, 2.) - 1., rnd(p, 3.) + rnd(p, 4.) - 1., rnd(p, 5.) + rnd(p, 6.) - 1.);
-  o = vec4(clamp(c + u_dither * n / 255., 0., 1.), 1.);
-}`,
   };
+
+  // JPEG basics: Annex K tables, IJG quality scaling, the DCT basis, chroma sampling factors
+  const QBASE_Y = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99];
+  const QBASE_C = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99];
+  function qtable(base, q) {
+    q = Math.min(100, Math.max(1, Math.round(q)));
+    const s = q < 50 ? 5000 / q : 200 - 2 * q;
+    return base.map(v => Math.min(255, Math.max(1, Math.floor((v * s + 50) / 100))));
+  }
+  const DCTB = new Float32Array(64);
+  for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) DCTB[u * 8 + x] = (u ? 1 : Math.SQRT1_2) * 0.5 * Math.cos((2 * x + 1) * u * Math.PI / 16);
+  const SAMP = { 444: [1, 1], 422: [2, 1], 420: [2, 2] };
+  const KERN = { nearest: 0, bilinear: 1, bicubic: 2, lanczos3: 3, area: 4, cheap: 5, mitchell: 6 };
 
   function create(canvas) {
     const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
@@ -205,6 +325,8 @@ void main() {
       } else if (v.length === 2 && !(v instanceof Float32Array)) gl.uniform2f(l, v[0], v[1]);
       else if (v.length === 3 && !(v instanceof Float32Array)) gl.uniform3f(l, v[0], v[1], v[2]);
       else if (v.length === 4 && !(v instanceof Float32Array)) gl.uniform4f(l, v[0], v[1], v[2], v[3]);
+      else if (v.v2) gl.uniform2fv(l, v.v2);
+      else if (v.v3) gl.uniform3fv(l, v.v3);
       else gl.uniform1fv(l, v);
     }
 
@@ -238,6 +360,7 @@ void main() {
       let l = pool.get(t.key); if (!l) pool.set(t.key, l = []);
       if (!l.includes(t)) l.push(t);
     }
+    function release(t) { if (t) { t.pinned = false; put(t); } }
     function destroy(t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
     function drain() { for (const l of pool.values()) l.forEach(destroy); pool.clear(); }
 
@@ -264,6 +387,20 @@ void main() {
       if (target && made) made.push(target);
       return target;
     }
+    // Run fn with its own texture bookkeeping; every texture it makes is returned to the pool except
+    // the ones `fn` returns (a texture or an array / object of textures).
+    function scoped(fn) {
+      const outer = made; made = [];
+      let r;
+      try { r = fn(); }
+      finally {
+        const mine = made; made = outer;
+        const keep = new Set(r && r.tex ? [r] : r && typeof r === 'object' ? Object.values(r).filter(x => x && x.tex) : []);
+        for (const t of mine) if (!keep.has(t)) put(t);
+        if (made) for (const t of keep) made.push(t);
+      }
+      return r;
+    }
     // Gaussian blur. Wide radii run on a box-downsampled copy (sampled back with bilinear filtering),
     // so the cost stays flat whatever the radius. axis: 'xy' | 'x' | 'y'.
     function blur(t, sigma, axis = 'xy') {
@@ -275,14 +412,105 @@ void main() {
       const sg = (k) => Math.sqrt(Math.max(0.04, (sigma / k) ** 2 - (k > 1 ? 1 / 12 : 0)));
       if (axis !== 'y') s = pass(SH.gauss, s, { u_dir: { i: [1, 0] }, u_sig: sg(fx) });
       if (axis !== 'x') s = pass(SH.gauss, s, { u_dir: { i: [0, 1] }, u_sig: sg(fy) });
+      if (s.w !== t.w || s.h !== t.h) s = pass(SH.rs, pass(SH.rs, s, { u_axis: { i: 0 }, u_kern: { i: 1 }, u_scale: t.w / s.w, u_off: 0 }, { w: t.w, h: s.h }),
+        { u_axis: { i: 1 }, u_kern: { i: 1 }, u_scale: t.h / s.h, u_off: 0 }, { w: t.w, h: t.h });
       return s;
+    }
+    // Resize with a named kernel (see KERN). 'halve' = repeated 2x box then a cheap final step.
+    // opts.off: grid offset in source pixels.
+    function resize(t, w, h, method = 'lanczos3', opts = {}) {
+      w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h));
+      if (w === t.w && h === t.h && !opts.off) return t;
+      if (method === 'halve') {
+        let s = t;
+        while (s.w >= 2 * w && s.h >= 2 * h) s = pass(SH.down, s, { u_f: { i: [2, 2] } }, { w: Math.ceil(s.w / 2), h: Math.ceil(s.h / 2) });
+        return resize(s, w, h, 'cheap', opts);
+      }
+      const k = KERN[method] !== undefined ? KERN[method] : 3, off = +opts.off || 0;
+      const a = pass(SH.rs, t, { u_axis: { i: 0 }, u_kern: { i: k }, u_scale: w / t.w, u_off: off }, { w, h: t.h });
+      return pass(SH.rs, a, { u_axis: { i: 1 }, u_kern: { i: k }, u_scale: h / t.h, u_off: off }, { w, h });
+    }
+    function unsharp(t, amount, radius) { return amount > 0 ? pass(SH.unsharp, t, { u_k: amount }, { tex: { u_b: blur(t, radius) } }) : t; }
+
+    /* ---------- JPEG ---------- */
+    // Forward half of a real JPEG encode: 8-bit RGB -> YCbCr -> chroma subsampling -> DCT -> quantise.
+    // Returns integer coefficient textures laid out like the image (each 8x8 block holds its 64 coefs).
+    function jpegCoefs(t, q, sub, dither) {
+      const [hs, vs] = SAMP[sub] || SAMP[444], qY = qtable(QBASE_Y, q), qC = qtable(QBASE_C, q);
+      const Wp = Math.ceil(t.w / (8 * hs)) * 8 * hs, Hp = Math.ceil(t.h / (8 * vs)) * 8 * vs;
+      const U = { u_B: DCTB, u_QY: new Float32Array(qY), u_QC: new Float32Array(qC) };
+      const ycc = pass(SH.jpYcc, t, { u_dither: dither ? 1 : 0 }, { w: Wp, h: Hp, fmt: 'f32' });
+      const Y = pass(SH.jpColQ, pass(SH.jpRow, ycc, U, { fmt: 'f32' }), U, { fmt: 'f32' });
+      let C = Y;
+      if (hs * vs > 1) {
+        const cs = pass(SH.jpDown, ycc, { u_s: { i: [hs, vs] } }, { w: Wp / hs, h: Hp / vs, fmt: 'f32' });
+        C = pass(SH.jpColQ, pass(SH.jpRow, cs, U, { fmt: 'f32' }), U, { fmt: 'f32' });
+      }
+      return { Y, C, W: t.w, H: t.h, Wp, Hp, hs, vs, qY, qC };
+    }
+    // Decoder: dequantise -> inverse DCT -> 8-bit samples -> fancy chroma upsampling -> 8-bit RGB
+    function jpegDecode(co) {
+      const U = { u_B: DCTB, u_QY: new Float32Array(co.qY), u_QC: new Float32Array(co.qC) };
+      const Yd = pass(SH.jpRowI, pass(SH.jpColI, co.Y, U, { fmt: 'f32' }), U, { fmt: 'f16' });
+      const Cd = co.C === co.Y ? Yd : pass(SH.jpRowI, pass(SH.jpColI, co.C, U, { fmt: 'f32' }), U, { fmt: 'f16' });
+      return pass(SH.jpOut, Yd, { u_cs: [co.hs, co.vs], u_cres: [Cd.w, Cd.h] }, { w: co.W, h: co.H, tex: { u_c: Cd } });
+    }
+    function jpegSim(t, q, sub, dither) { return scoped(() => jpegDecode(jpegCoefs(t, q, sub, dither))); }
+
+    /* ---------- export simulation ---------- */
+    // S = { format: 'jpeg' | 'png' | 'png16', q, sub, long (0 = full size), check: platform or null }
+    // platform = { long, q, sub, sharpen }. Returns what the file holds (and what the platform makes of it).
+    function asSaved(t, S) {
+      return scoped(() => {
+        let x = t;
+        const fit = (img, L, how) => { const m = Math.max(img.w, img.h); return L && m > L ? resize(img, img.w * L / m, img.h * L / m, how) : img; };
+        x = fit(x, S.long, 'lanczos3');
+        if (S.format === 'jpeg') x = jpegSim(x, S.q, S.sub, true);
+        else if (S.format === 'png') x = pass(SH.q8, x, { u_dither: 1 });
+        else x = pass(SH.clamp01, x);
+        const P = S.check;
+        if (P) {
+          x = fit(x, P.long, 'bicubic');
+          if (P.sharpen) x = unsharp(x, P.sharpen, 0.8);
+          x = jpegSim(x, P.q, P.sub, false);
+        }
+        return x;
+      });
+    }
+
+    /* ---------- measurement (survival meter) ---------- */
+    function readFloat(t, x, y, w, h) {
+      const buf = new Float32Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+      gl.readPixels(x, y, w, h, gl.RGBA, gl.FLOAT, buf);
+      return buf;
+    }
+    function readU8(t, x, y, w, h) {
+      const buf = new Uint8Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+      gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      return buf;
+    }
+    // { vis: share of pixels visibly changed (dE > 1), mean: mean dE, visMean: mean dE of the changed ones }
+    function diffStats(a, b) {
+      return scoped(() => {
+        if (b.w !== a.w || b.h !== a.h) b = resize(b, a.w, a.h, 'bicubic');
+        let d = pass(SH.dE, a, {}, { fmt: 'f32', tex: { u_b: b } });
+        while (d.w > 32 || d.h > 32) d = pass(SH.down, d, { u_f: { i: [d.w > 32 ? 8 : 1, d.h > 32 ? 8 : 1] } }, { w: d.w > 32 ? Math.ceil(d.w / 8) : d.w, h: d.h > 32 ? Math.ceil(d.h / 8) : d.h, fmt: 'f32' });
+        const r = readFloat(d, 0, 0, d.w, d.h); let v = 0, m = 0, vm = 0;
+        for (let i = 0; i < r.length; i += 4) { v += r[i]; m += r[i + 1]; vm += r[i + 2]; }
+        const n = r.length / 4;
+        return { vis: v / n, mean: m / n, visMean: v > 0 ? vm / v : 0 };
+      });
     }
 
     /* ---------- image state ---------- */
     // src: the opened image. base: src after crop / rotate (what effects and comparisons start from).
-    let src = null, base = null, result = null, W = 0, H = 0;
+    let src = null, base = null, result = null, saved = null, savedKey = '', W = 0, H = 0;
     let layers = [];   // the versions of a merge, as 8-bit textures
+    function dropSaved() { if (saved) { release(saved); saved = null; savedKey = ''; } }
     function clearImage() {
+      dropSaved();
       if (result && result !== base) put(result);
       if (base && base !== src) destroy(base);
       if (src) destroy(src);
@@ -350,6 +578,7 @@ void main() {
       if (!src) return;
       const fr = frameOf(g), b = cropBox(g, fr, crop), t = (g.turns | 0) & 3, ang = +g.angle || 0;
       const identity = !t && !ang && !g.flipH && !g.flipV && !b.x && !b.y && b.w === src.w && b.h === src.h;
+      dropSaved();
       if (result !== base) put(result);
       if (base !== src) destroy(base);
       if (b.w !== W || b.h !== H) drain();
@@ -362,55 +591,143 @@ void main() {
         base.pinned = true;
       }
       result = base; W = b.w; H = b.h;
-      canvas.width = W; canvas.height = H;
     }
 
-    // chain: [{ fx, p }] in pipeline order
-    function process(chain, seedValue) {
-      if (!base) return 0;
-      const t0 = performance.now();
-      seed = seedValue | 0;
-      if (result !== base) put(result);
-      let cur = base;
-      const ctx = { W, H, diag: Math.hypot(W, H), short: Math.min(W, H), pass, blur, get, put };
-      for (const { fx, p } of chain) {
+    /* ---------- the effect chain ---------- */
+    // opts = { hr: brightest rebuilt light (linear), knee, k: overall intensity }
+    function makeCtx(opts) {
+      const hr = Math.max(1, +opts.hr || 1), knee = Math.min(0.99, Math.max(0.5, +opts.knee || 0.9));
+      return {
+        W, H, diag: Math.hypot(W, H), short: Math.min(W, H), hr, knee, k: opts.k == null ? 1 : +opts.k, seed,
+        pass, blur, get, put, resize, unsharp, jpegSim, scoped,
+        q8: (t, dither) => pass(SH.q8, t, { u_dither: dither ? 1 : 0 }),
+        toScene: (t) => pass(SH.toScene, t, { u_hr: hr, u_knee: knee }),
+        toDisp: (t) => pass(SH.toDisp, t, { u_hr: hr, u_knee: knee }),
+      };
+    }
+    // Effects declare the light domain they work in (fx.domain, default display) and may hand over
+    // in another one (fx.out). Conversions are inserted where the domain changes.
+    function runChain(chain, opts, onStep) {
+      const ctx = makeCtx(opts);
+      let cur = base, dom = 'display';
+      const swap = (next) => { if (cur !== base && cur !== next) put(cur); cur = next; };
+      const conv = (to) => { made = null; swap(to === 'scene' ? ctx.toScene(cur) : ctx.toDisp(cur)); dom = to; };
+      for (let i = 0; i < chain.length; i++) {
+        const { fx, p } = chain[i], need = fx.domain || 'display';
+        if (need !== dom) conv(need);
         made = [];
         let out;
         try { out = fx.run(ctx, cur, p) || cur; }
-        catch (e) { made.forEach(put); made = null; throw new Error(fx.name + ': ' + e.message); }
-        for (const t of made) if (t !== out) put(t);
-        made = null;
-        if (cur !== base && cur !== out) put(cur);
-        cur = out;
+        catch (e) { const m = made; made = null; m.forEach(t => { if (t !== cur) put(t); }); throw new Error(fx.name + ': ' + e.message); }
+        const mine = made; made = null;
+        for (const t of mine) if (t !== out) put(t);
+        const domOut = fx.out || need;
+        if (onStep) onStep(i, cur, dom, out, domOut, ctx);
+        swap(out); dom = domOut;
       }
-      result = cur;
+      if (dom !== 'display') conv('display');
+      made = null;
+      return cur;
+    }
+    function process(chain, seedValue, opts = {}) {
+      if (!base) return 0;
+      const t0 = performance.now();
+      seed = seedValue | 0;
+      dropSaved();
+      if (result !== base) put(result);
+      result = base;
+      result = runChain(chain, opts);
       gl.finish();
       return performance.now() - t0;
     }
+    // For every effect in the chain: how visible its change is before and after export (S).
+    function measure(chain, seedValue, opts, S) {
+      if (!base) return [];
+      seed = seedValue | 0;
+      const out = [];
+      const fin = runChain(chain, opts, (i, a, da, b, db, ctx) => {
+        out[i] = scoped(() => {
+          const A = da === 'scene' ? ctx.toDisp(a) : a, B = db === 'scene' ? ctx.toDisp(b) : b;
+          const pre = diffStats(A, B), post = diffStats(asSaved(A, S), asSaved(B, S));
+          return { pre, post };
+        });
+      });
+      if (fin !== base && fin !== result) put(fin);
+      return out;
+    }
+    // Cached "as saved" view of the current result.
+    function savedView(S) {
+      if (!result) return null;
+      const key = JSON.stringify(S);
+      if (saved && savedKey === key) return saved;
+      dropSaved();
+      made = null;
+      saved = asSaved(result, S); saved.pinned = true; savedKey = key;
+      return saved;
+    }
 
-    function show(mode, split, dither) {
+    // Draw a texture (result, saved view or base) on the visible canvas; base fills the split / original side.
+    function show(mode, split, tex) {
       if (!base) return;
+      const t = tex || result;
+      if (canvas.width !== t.w || canvas.height !== t.h) { canvas.width = t.w; canvas.height = t.h; }
       made = null;
-      pass(SH.show, result, { u_mode: mode, u_split: split, u_dither: dither ? 1 : 0 }, { target: null, w: W, h: H, tex: { u_b: base } });
+      pass(SH.show, t, { u_mode: mode, u_split: split }, { target: null, w: t.w, h: t.h, tex: { u_b: base } });
     }
 
-    // Draw the probe on the visible canvas; the caller reads it back to learn how this browser copies it.
-    function probe() { if (!base) return; made = null; pass(SH.probe, base, {}, { target: null, w: W, h: H }); }
-
-    function exportPixels(dither) {
+    /* ---------- reading pixels for files ---------- */
+    // Everything below reads with readPixels from our own framebuffers: rows come out top row first in
+    // every browser, so files can't end up flipped.
+    function fileSource(S) {
+      // the image the file holds, before encoding: result resized to the export size
       made = null;
-      const t = pass(SH.out8, result, { u_dither: dither ? 1 : 0 }, { fmt: 'u8' });
-      const buf = new Uint8ClampedArray(W * H * 4);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
-      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      return scoped(() => {
+        const m = Math.max(result.w, result.h);
+        return S.long && m > S.long ? resize(result, result.w * S.long / m, result.h * S.long / m, 'lanczos3') : pass(SH.copy, result);
+      });
+    }
+    function prepareJpeg(S) {
+      const t = fileSource(S); t.pinned = true;
+      made = null;
+      const co = scoped(() => jpegCoefs(t, S.q, S.sub, true));
+      release(t);
+      co.Y.pinned = co.C.pinned = true;
+      return {
+        info: co,
+        readY: (y, rows) => readFloat(co.Y, 0, y, co.Wp, rows),
+        readC: (y, rows) => readFloat(co.C, 0, y, co.C.w, rows),
+        done: () => { release(co.Y); release(co.C); },
+      };
+    }
+    function preparePng(S) {
+      const t = fileSource(S); t.pinned = true;
+      made = null;
+      const deep = S.format === 'png16';
+      const r = scoped(() => deep ? pass(SH.clamp01, t, {}, { fmt: 'f32' }) : pass(SH.q8, t, { u_dither: 1 }, { fmt: 'u8' }));
+      release(t); r.pinned = true;
+      return {
+        w: r.w, h: r.h, deep,
+        read: (y, rows) => deep ? readFloat(r, 0, y, r.w, rows) : readU8(r, 0, y, r.w, rows),
+        done: () => release(r),
+      };
+    }
+
+    function exportPixels() {
+      made = null;
+      const t = scoped(() => pass(SH.q8, result, { u_dither: 0 }, { fmt: 'u8' }));
+      const buf = readU8(t, 0, 0, t.w, t.h);
       put(t);
-      return new ImageData(buf, W, H);
+      return new ImageData(new Uint8ClampedArray(buf.buffer), t.w, t.h);
     }
 
-    return { gl, maxTex, load, loadStack, merge, probe, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
+    return {
+      gl, maxTex, load, loadStack, merge, setGeometry, frameOf, process, measure, savedView, show, exportPixels, prepareJpeg, preparePng,
+      get size() { return [W, H]; }, get outSize() { return result ? [result.w, result.h] : [W, H]; },
+      get source() { return src ? [src.w, src.h] : [0, 0]; }, get base() { return base; },
+    };
   }
 
-  return { create, LIB, SH };
+  return { create, LIB, SH, qtable, QBASE_Y, QBASE_C, DCTB };
 })();
 
 if (typeof module !== 'undefined') module.exports = GPU;
