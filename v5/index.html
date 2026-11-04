@@ -61,6 +61,27 @@ main { display: grid; grid-template-columns: 384px minmax(0, 1fr); min-height: 0
 .fx { background: var(--card); border: 1px solid var(--rule); border-radius: 4px; }
 .fx.on { border-color: var(--ink); box-shadow: 2px 2px 0 var(--ink); }
 .fx[hidden], .grp[hidden] { display: none; }
+
+/* merge */
+.merge { margin: 10px 10px 4px; background: var(--card); border: 1.5px solid var(--ink); box-shadow: 3px 3px 0 var(--acc); border-radius: 4px; padding: 10px; display: grid; gap: 8px; }
+.merge[hidden] { display: none; }
+.mg-h { display: flex; align-items: center; gap: 8px; }
+.mg-t { font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; flex: 1; }
+.mg-h select { height: 26px; font-size: 12px; border-width: 1px; }
+.mg-hint { margin: 0; color: var(--mute); font-size: 11.5px; line-height: 1.35; }
+.mg-rows { display: grid; gap: 5px; }
+.mg-row { display: grid; grid-template-columns: 46px minmax(0, 1fr) 96px 44px; gap: 8px; align-items: center; }
+.mg-th { all: unset; box-sizing: border-box; cursor: pointer; width: 46px; height: 32px; border-radius: 2px; background: var(--sunk) center / cover no-repeat; box-shadow: 0 0 0 1px var(--rule); }
+.mg-th:hover { box-shadow: 0 0 0 1.5px var(--ink); }
+.mg-th.solo { box-shadow: 0 0 0 2.5px var(--acc); }
+.mg-th:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.mg-n { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mg-n b { font: 600 11px var(--mono); color: var(--faint); margin-right: 4px; }
+.mg-row.off .mg-th, .mg-row.off .mg-n { opacity: .4; }
+.merge.noweights .mg-row input { visibility: hidden; }
+.mg-p { display: grid; gap: 4px; border-top: 1px dashed var(--rule); padding-top: 8px; }
+.mg-p:empty { display: none; }
+.mg-p .b { height: 26px; font-size: 12px; justify-self: start; border-width: 1px; }
 .fx-h { display: flex; align-items: center; gap: 9px; padding: 8px 9px 2px; }
 .fx-n { all: unset; cursor: pointer; flex: 1; font-weight: 600; font-size: 13px; }
 .fx-r { all: unset; cursor: pointer; color: var(--faint); font: 13px var(--mono); padding: 0 3px; visibility: hidden; }
@@ -187,7 +208,8 @@ body.cropping .cbox { display: block; }
 <header class="bar">
   <div class="logo"><b>ie2</b><span>V5</span><em>artifact lab</em></div>
   <button class="b" id="open" type="button">Open…</button>
-  <input id="file" type="file" accept="image/*" hidden>
+  <button class="b" id="mergebtn" type="button" title="Open 2–8 versions of the same image and blend them into one">Merge…</button>
+  <input id="file" type="file" accept="image/*" multiple hidden>
   <div class="meta" id="meta">no image</div>
   <div class="grow"></div>
   <select id="preset" title="Start from a preset"><option value="">Presets…</option></select>
@@ -203,7 +225,7 @@ body.cropping .cbox { display: block; }
 <main>
   <aside class="rack">
     <div class="rack-top"><input id="find" type="search" placeholder="Filter 30 effects…" autocomplete="off"><button class="b q" id="resetall" type="button" title="All effects off and back to default settings">Reset</button></div>
-    <div class="fxlist" id="fxlist"></div>
+    <div class="fxlist" id="fxlist"><section class="merge" id="merge" hidden></section></div>
   </aside>
 
   <section class="view">
@@ -247,7 +269,7 @@ body.cropping .cbox { display: block; }
           <h1>Thirty ways an image gets marked by the machines that make and show it.</h1>
           <p>Lens and film quirks, sensor faults, phone processing, compression, VHS, CRTs and LCDs, all rendered on your GPU. Nothing is uploaded.</p>
           <div class="row"><button class="b go" id="open2" type="button">Open an image</button><button class="b" id="chart" type="button">Use the test scene</button></div>
-          <small>or drop / paste an image anywhere</small>
+          <small>or drop / paste an image anywhere · pick 2–8 versions at once to merge them</small>
         </div>
       </div>
     </div>
@@ -257,11 +279,11 @@ body.cropping .cbox { display: block; }
 <footer class="foot">
   <div class="chain" id="chain">chain: <b>empty</b></div>
   <span id="status">ready</span>
-  <span class="build" title="If this number is older than expected, hard-refresh the page">build 8</span>
+  <span class="build" title="If this number is older than expected, hard-refresh the page">build 9</span>
 </footer>
 
-<script src="core.js?b=8"></script>
-<script src="rack.js?b=8"></script>
-<script src="main.js?b=8"></script>
+<script src="core.js?b=9"></script>
+<script src="rack.js?b=9"></script>
+<script src="main.js?b=9"></script>
 </body>
 </html>

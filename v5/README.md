@@ -26,6 +26,20 @@ Open, drop or paste an image, or start from the built-in test scene. **Crop & ro
 
 Requires WebGL2 with float render targets (any current desktop or mobile browser). Images larger than 24 MP are worked on as a scaled copy.
 
+## Merge versions
+
+Pick or drop 2–8 images at once (or use **Merge…**) to blend versions of the same picture into one. Each version gets a weight slider, and clicking a thumbnail shows that version alone. Modes:
+
+- **Mix:** a weighted blend; every version's edits show in proportion to its weight
+- **Median:** keeps what most versions agree on, so an edit only one version has fades out
+- **Lighten / Darken:** the brightest or darkest version at each pixel
+- **Sharpest:** whichever version has the most fine detail at each spot
+- **Patchwork:** each area comes from a different version, with adjustable patch size and seam softness
+- **Channels:** red, green and blue each from a chosen version
+- **Detail + colour:** brightness from one version, colour from another
+
+Versions should share the same size and crop; any that differ are stretched to match the first. The blend then goes through crop & rotate and the effect rack like any other image.
+
 ## Files
 
 - `core.js`: WebGL2 pipeline, texture pool, blur, display and export

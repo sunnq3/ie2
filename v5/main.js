@@ -150,11 +150,17 @@ $('#alloff').addEventListener('click', () => { for (const id in state.fx) state.
 $('#resetall').addEventListener('click', () => { const seed = state.seed; state = freshState(); state.seed = seed; syncAll(); changed(); });
 
 /* ---------------- rendering ---------------- */
+let stack = null, mergeDirty = false;   // merge of several versions (see "merge" below)
 let loaded = false, needProcess = false, frameReq = 0, mode = 0, holdOrig = false, split = 0.5;
 function request(processToo) { if (processToo) needProcess = true; if (!frameReq) frameReq = requestAnimationFrame(frame); }
 function frame() {
   frameReq = 0;
   if (!loaded || !gpu) return;
+  if (mergeDirty && stack && !cropping) {
+    mergeDirty = false;
+    try { runMerge(); } catch (e) { say(e.message, true); console.error(e); }
+    needProcess = true;
+  }
   if (needProcess && !cropping) {
     needProcess = false;
     const chain = EFFECTS.filter(e => state.fx[e.id].on).map(e => ({ fx: e, p: state.fx[e.id] }));
@@ -268,6 +274,7 @@ function useSource(src, w0, h0, name) {
   const x = s.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, w, h);
   if (cropping) endCrop(false);
   gpu.load(s, w, h);
+  stack = null; $('#merge').hidden = true;
   geo = freshGeo();
   loaded = true; baseName = name; sourceNote = `${name} · ${w}×${h}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
   updateMeta();
@@ -285,15 +292,166 @@ async function openFile(file) {
 }
 $('#open').addEventListener('click', () => $('#file').click());
 $('#open2').addEventListener('click', () => $('#file').click());
-$('#file').addEventListener('change', (e) => { openFile(e.target.files[0]); e.target.value = ''; });
+$('#mergebtn').addEventListener('click', () => $('#file').click());
+$('#file').addEventListener('change', (e) => { openFiles(e.target.files); e.target.value = ''; });
 $('#chart').addEventListener('click', () => { const c = testScene(); useSource(c, c.width, c.height, 'test-scene'); });
 ['dragenter', 'dragover'].forEach(t => window.addEventListener(t, (e) => { e.preventDefault(); document.body.classList.add('dragging'); }));
 ['dragleave', 'drop'].forEach(t => window.addEventListener(t, (e) => { e.preventDefault(); if (t === 'drop' || !e.relatedTarget) document.body.classList.remove('dragging'); }));
-window.addEventListener('drop', (e) => { const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) openFile(f); });
+window.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) openFiles(e.dataTransfer.files); });
 window.addEventListener('paste', (e) => {
-  const it = e.clipboardData && [...e.clipboardData.items].find(i => i.kind === 'file' && i.type.startsWith('image/'));
-  if (it) { e.preventDefault(); openFile(it.getAsFile()); }
+  const its = e.clipboardData ? [...e.clipboardData.items].filter(i => i.kind === 'file' && i.type.startsWith('image/')) : [];
+  if (its.length) { e.preventDefault(); openFiles(its.map(i => i.getAsFile())); }
 });
+
+/* ---------------- merge ---------------- */
+/* Several versions of the same picture are uploaded as layers and blended on the GPU into the
+   source image; crop & rotate and the effect rack then work on the blend as on any other image. */
+const MAXV = 8, MKEY = 'ie2.v5.merge';
+const MERGE_MODES = [
+  ['mix', 'Mix', 'A weighted blend: every version’s edits show, in proportion to its weight.'],
+  ['median', 'Median', 'Keeps what most versions agree on; an edit only one or two have fades out. Weights count as votes.'],
+  ['lighten', 'Lighten', 'The brightest version at each pixel: glows, halation, bloom and light leaks come through. Weight is opacity.'],
+  ['darken', 'Darken', 'The darkest version at each pixel: scanlines, masks, shadows and dark fringes come through. Weight is opacity.'],
+  ['sharpest', 'Sharpest', 'Takes whichever version has the most fine detail at each spot (grain counts as detail). Selectivity 0 is a plain mix.'],
+  ['patch', 'Patchwork', 'Each area comes from a different version, joined with soft seams. Weight sets how much ground each one gets.'],
+  ['channels', 'Channels', 'Red, green and blue each come from a version you choose.'],
+  ['lumachroma', 'Detail + colour', 'Brightness and detail from one version, colour from another.'],
+];
+const mergeP = (() => {
+  const d = { mode: 'mix', pow: 2, scale: 14, soft: 0.5, pseed: 1, w: [], solo: -1, ch: [0, 1, 2] };
+  try { const s = JSON.parse(localStorage.getItem(MKEY) || 'null'); if (s) for (const k of ['mode', 'pow', 'scale', 'soft']) if (typeof s[k] === typeof d[k]) d[k] = s[k]; } catch (e) { /* ignore */ }
+  if (!MERGE_MODES.some(m => m[0] === d.mode)) d.mode = 'mix';
+  return d;
+})();
+const saveMerge = () => { try { localStorage.setItem(MKEY, JSON.stringify({ mode: mergeP.mode, pow: mergeP.pow, scale: mergeP.scale, soft: mergeP.soft })); } catch (e) { /* ignore */ } };
+const markMerge = () => { saveMerge(); mergeDirty = true; request(false); };
+
+function runMerge() {
+  const n = stack.names.length, solo = mergeP.solo, w = new Array(8).fill(0);
+  for (let i = 0; i < n; i++) w[i] = solo >= 0 ? (i === solo ? 1 : 0) : Math.max(0, +mergeP.w[i] || 0) / 100;
+  if (!w.some(v => v > 0)) w[0] = 1;   // everything off: show version 1 rather than nothing
+  const mi = solo >= 0 ? 0 : MERGE_MODES.findIndex(m => m[0] === mergeP.mode);
+  gpu.merge({ mode: mi, w, scale: mergeP.scale / 100 * Math.min(...gpu.source), soft: mergeP.soft, pow: mergeP.pow, seed: mergeP.pseed,
+    ch: mergeP.ch.map(c => Math.min(n - 1, c)) });
+  gpu.setGeometry(geo);
+}
+
+function openFiles(list) {
+  const files = [...list].filter(Boolean);
+  if (!files.length) return;
+  if (files.length === 1) { openFile(files[0]); return; }
+  openStack(files.slice(0, MAXV), files.length > MAXV);
+}
+async function openStack(files, clipped) {
+  if (!gpu) return;
+  say(`opening ${files.length} images…`);
+  let imgs;
+  try { imgs = await Promise.all(files.map(decode)); } catch (e) { say('one of those files can’t be decoded by this browser', true); return; }
+  const dims = imgs.map(im => [im.naturalWidth || im.width, im.naturalHeight || im.height]), [w0, h0] = dims[0];
+  // all versions are held on the GPU at once, so the per-image size budget shrinks with the count
+  const cap = Math.min(gpu.maxTex, 8192), k = Math.min(1, cap / Math.max(w0, h0), Math.sqrt(Math.min(24e6, 64e6 / imgs.length) / (w0 * h0)));
+  const w = Math.max(1, Math.round(w0 * k)), h = Math.max(1, Math.round(h0 * k));
+  const odd = dims.filter(([a, b]) => a !== w0 || b !== h0).length;
+  const canvases = imgs.map(im => {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(im, 0, 0, w, h); return c;
+  });
+  const thumbs = canvases.map(c => {
+    const t = document.createElement('canvas'); t.height = 64; t.width = Math.max(1, Math.round(64 * w / h));
+    t.getContext('2d').drawImage(c, 0, 0, t.width, t.height); return t.toDataURL('image/jpeg', 0.8);
+  });
+  if (cropping) endCrop(false);
+  gpu.loadStack(canvases, w, h);
+  stack = { names: files.map((f, i) => (f.name || 'version ' + (i + 1)).replace(/\.[^.]+$/, '')), thumbs };
+  mergeP.w = stack.names.map(() => 100); mergeP.solo = -1; mergeP.ch = [0, 1, 2].map(c => Math.min(c, files.length - 1));
+  geo = freshGeo();
+  loaded = true; baseName = stack.names[0] + '_merge';
+  sourceNote = `merge of ${files.length} · ${stack.names[0]} · ${w}×${h}` + (k < 1 ? ' (working copies)' : '');
+  buildMerge();
+  runMerge(); mergeDirty = false;
+  updateMeta();
+  $('#drop').classList.add('gone');
+  $('#save').disabled = false; $('#cropbtn').disabled = false;
+  $('#fxlist').scrollTop = 0;
+  fit(); request(true);
+  const notes = [];
+  if (odd) notes.push(`${odd} ${odd > 1 ? 'were' : 'was'} a different size and stretched to match the first`);
+  if (clipped) notes.push(`only the first ${MAXV} were used`);
+  setTimeout(() => say(`merged ${files.length} versions` + (notes.length ? ' · ' + notes.join(' · ') : ''), !!odd), 50);
+}
+
+function mrow(label, min, max, step, get, set, unit) {
+  const row = document.createElement('div'); row.className = 'pr rng';
+  const lab = document.createElement('span'); lab.className = 'pr-l'; lab.textContent = label;
+  const r = document.createElement('input'); r.type = 'range'; r.min = min; r.max = max; r.step = step; r.value = get(); r.setAttribute('aria-label', label);
+  const n = document.createElement('input'); n.type = 'text'; n.className = 'pr-v'; n.inputMode = 'decimal'; n.value = show(get(), step);
+  const u = document.createElement('span'); u.className = 'pr-u'; u.textContent = unit || '';
+  r.addEventListener('input', () => { set(+r.value); n.value = show(r.value, step); markMerge(); });
+  n.addEventListener('change', () => { const v = parseFloat(n.value); if (Number.isFinite(v)) set(clamp(v, min, max)); r.value = get(); n.value = show(get(), step); markMerge(); });
+  row.append(lab, r, n, u); return row;
+}
+function mpick(label, idx) {
+  const row = document.createElement('div'); row.className = 'pr sel';
+  const lab = document.createElement('span'); lab.className = 'pr-l'; lab.textContent = label;
+  const s = document.createElement('select');
+  stack.names.forEach((nm, i) => s.add(new Option(`${i + 1} · ${nm}`, i)));
+  s.value = mergeP.ch[idx];
+  s.addEventListener('change', () => { mergeP.ch[idx] = +s.value; markMerge(); });
+  row.append(lab, s); return row;
+}
+function buildMerge() {
+  const box = $('#merge'); box.textContent = ''; box.hidden = false;
+  const h = document.createElement('div'); h.className = 'mg-h';
+  const t = document.createElement('span'); t.className = 'mg-t'; t.textContent = `Merge · ${stack.names.length} versions`;
+  const sel = document.createElement('select'); sel.setAttribute('aria-label', 'Merge mode');
+  for (const [v, l] of MERGE_MODES) sel.add(new Option(l, v));
+  sel.value = mergeP.mode;
+  h.append(t, sel);
+  const hint = document.createElement('p'); hint.className = 'mg-hint';
+  const rows = document.createElement('div'); rows.className = 'mg-rows';
+  const ths = [];
+  stack.names.forEach((nm, i) => {
+    const row = document.createElement('div'); row.className = 'mg-row';
+    const th = document.createElement('button'); th.type = 'button'; th.className = 'mg-th';
+    th.style.backgroundImage = `url("${stack.thumbs[i]}")`; th.title = 'View this version alone (click again to merge)';
+    th.setAttribute('aria-label', `View version ${i + 1} alone`);
+    const name = document.createElement('span'); name.className = 'mg-n';
+    const b = document.createElement('b'); b.textContent = i + 1; name.append(b, document.createTextNode(nm)); name.title = nm;
+    const r = document.createElement('input'); r.type = 'range'; r.min = 0; r.max = 100; r.step = 1; r.value = mergeP.w[i]; r.setAttribute('aria-label', `Weight of version ${i + 1}`);
+    const v = document.createElement('input'); v.type = 'text'; v.className = 'pr-v'; v.inputMode = 'numeric'; v.value = mergeP.w[i];
+    const setW = (x) => { mergeP.w[i] = x; r.value = x; v.value = x; row.classList.toggle('off', x <= 0); markMerge(); };
+    r.addEventListener('input', () => setW(+r.value));
+    v.addEventListener('change', () => { const x = parseFloat(v.value); setW(Number.isFinite(x) ? clamp(Math.round(x), 0, 100) : 100); });
+    th.addEventListener('click', () => {
+      mergeP.solo = mergeP.solo === i ? -1 : i;
+      ths.forEach((x, j) => x.classList.toggle('solo', j === mergeP.solo));
+      say(mergeP.solo >= 0 ? `showing version ${i + 1} alone · click it again to merge` : 'merged');
+      markMerge();
+    });
+    ths.push(th);
+    row.append(th, name, r, v); rows.append(row);
+  });
+  const params = document.createElement('div'); params.className = 'mg-p';
+  const fillParams = () => {
+    params.textContent = '';
+    const m = mergeP.mode;
+    hint.textContent = MERGE_MODES.find(x => x[0] === m)[2];
+    box.classList.toggle('noweights', m === 'channels' || m === 'lumachroma');
+    if (m === 'sharpest') params.append(mrow('Selectivity', 0, 8, 0.1, () => mergeP.pow, (x) => { mergeP.pow = x; }));
+    if (m === 'patch') {
+      params.append(mrow('Patch size', 2, 60, 1, () => mergeP.scale, (x) => { mergeP.scale = x; }, '%'),
+        mrow('Seam softness', 0, 1, 0.01, () => mergeP.soft, (x) => { mergeP.soft = x; }));
+      const rb = document.createElement('button'); rb.type = 'button'; rb.className = 'b'; rb.textContent = 'Reshuffle patches';
+      rb.addEventListener('click', () => { mergeP.pseed = 1 + Math.floor(Math.random() * 9999); markMerge(); });
+      params.append(rb);
+    }
+    if (m === 'channels') params.append(mpick('Red from', 0), mpick('Green from', 1), mpick('Blue from', 2));
+    if (m === 'lumachroma') params.append(mpick('Detail from', 0), mpick('Colour from', 1));
+  };
+  sel.addEventListener('change', () => { mergeP.mode = sel.value; fillParams(); markMerge(); });
+  fillParams();
+  box.append(h, hint, rows, params);
+}
 
 /* A synthetic scene with something for every effect: sky gradient, a clipped sun, street lights in
    the corners, dark silhouettes, colour patches, red-on-black text, fine lines and deep shadows. */

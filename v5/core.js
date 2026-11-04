@@ -85,6 +85,71 @@ void main() {
   for (int y = 0; y < 4; y++) { vec3 row = vec3(0.); for (int x = 0; x < 4; x++) row += wx[x] * px(i + ivec2(x - 1, y - 1)); c += wy[y] * row; }
   o = vec4(clamp(c, 0., 1.), 1.);
 }`,
+    // Merge 2-8 versions (u_src = version 1, u_l1..u_l7 = the rest). Weight 0 = version off.
+    // modes: 0 mix, 1 weighted median, 2 lighten, 3 darken, 4 sharpest, 5 patchwork, 6 channels, 7 detail + colour
+    merge: `uniform sampler2D u_l1, u_l2, u_l3, u_l4, u_l5, u_l6, u_l7;
+uniform int u_mode, u_n; uniform float u_w[8]; uniform float u_scale, u_soft, u_pow, u_pseed; uniform ivec3 u_ch;
+vec3 L(int i, ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(u_srcRes) - 1); vec4 t;
+  if (i == 0) t = texelFetch(u_src, p, 0); else if (i == 1) t = texelFetch(u_l1, p, 0); else if (i == 2) t = texelFetch(u_l2, p, 0);
+  else if (i == 3) t = texelFetch(u_l3, p, 0); else if (i == 4) t = texelFetch(u_l4, p, 0); else if (i == 5) t = texelFetch(u_l5, p, 0);
+  else if (i == 6) t = texelFetch(u_l6, p, 0); else t = texelFetch(u_l7, p, 0);
+  return mix(vec3(1.), t.rgb, t.a);
+}
+float detail(int i, ivec2 p) {
+  float e = 0.;
+  for (int y = -2; y <= 2; y += 2) for (int x = -2; x <= 2; x += 2) {
+    ivec2 q = p + ivec2(x, y); float c = luma(L(i, q));
+    e += abs(c - luma(L(i, q + ivec2(1, 0)))) + abs(c - luma(L(i, q + ivec2(0, 1))));
+  }
+  return e / 9.;
+}
+void main() {
+  ivec2 p = ivec2(P()); int n = clamp(u_n, 1, 8);
+  if (u_mode == 6) { o = vec4(L(clamp(u_ch.x, 0, n - 1), p).r, L(clamp(u_ch.y, 0, n - 1), p).g, L(clamp(u_ch.z, 0, n - 1), p).b, 1.); return; }
+  if (u_mode == 7) { vec3 a = toYcc(L(clamp(u_ch.x, 0, n - 1), p)), b = toYcc(L(clamp(u_ch.y, 0, n - 1), p)); o = vec4(fromYcc(vec3(a.x, b.yz)), 1.); return; }
+  if (u_mode == 1) {
+    vec3 r = vec3(0.);
+    for (int c = 0; c < 3; c++) {
+      float va[8] = float[8](0., 0., 0., 0., 0., 0., 0., 0.), wa[8] = float[8](0., 0., 0., 0., 0., 0., 0., 0.);
+      int k = 0; float tot = 0.;
+      for (int i = 0; i < 8; i++) {
+        if (i >= n) break; float w = u_w[i]; if (w <= 0.) continue;
+        float v = L(i, p)[c]; int j = k;
+        while (j > 0 && va[j - 1] > v) { va[j] = va[j - 1]; wa[j] = wa[j - 1]; j--; }
+        va[j] = v; wa[j] = w; k++; tot += w;
+      }
+      float cum = 0., m = va[0], hw = tot * .5;
+      for (int j = 0; j < 8; j++) {
+        if (j >= k) break; cum += wa[j];
+        if (cum >= hw - 1e-5) { m = (abs(cum - hw) < 1e-5 && j + 1 < k) ? .5 * (va[j] + va[j + 1]) : va[j]; break; }
+      }
+      r[c] = m;
+    }
+    o = vec4(r, 1.); return;
+  }
+  if (u_mode == 2 || u_mode == 3) {
+    float wm = 0.; for (int i = 0; i < 8; i++) { if (i >= n) break; wm = max(wm, u_w[i]); }
+    vec3 r = vec3(0.); bool first = true;
+    for (int i = 0; i < 8; i++) {
+      if (i >= n) break; float w = u_w[i]; if (w <= 0.) continue;
+      vec3 c = L(i, p);
+      if (first) { r = c; first = false; } else r = mix(r, u_mode == 2 ? max(r, c) : min(r, c), w / wm);
+    }
+    o = vec4(r, 1.); return;
+  }
+  vec3 s = vec3(0.); float ws = 0., K = 4. + 60. * (1. - u_soft);
+  for (int i = 0; i < 8; i++) {
+    if (i >= n) break; float w = u_w[i]; if (w <= 0.) continue;
+    if (u_mode == 4) w *= pow(detail(i, p) * 40. + .15, u_pow);
+    else if (u_mode == 5) {
+      vec2 q = P() / max(u_scale, 1.); float k = 300. + float(i) * 17. + u_pseed * 31.;
+      w *= exp(K * (.62 * vnoise(q, k) + .38 * vnoise(q * 2.3 + 11.7, k + 7.) - .5));
+    }
+    s += w * L(i, p); ws += w;
+  }
+  o = vec4(ws > 0. ? s / ws : L(0, p), 1.);
+}`,
     // orientation probe for the on-screen canvas: top half red, left half green (as displayed)
     probe: `void main() { vec2 p = gl_FragCoord.xy / u_res; o = vec4(p.y > .5 ? 1. : 0., p.x < .5 ? 1. : 0., 0., 1.); }`,
     out8: `uniform float u_dither;
@@ -216,18 +281,45 @@ void main() {
     /* ---------- image state ---------- */
     // src: the opened image. base: src after crop / rotate (what effects and comparisons start from).
     let src = null, base = null, result = null, W = 0, H = 0;
-    function load(source, w, h) {
+    let layers = [];   // the versions of a merge, as 8-bit textures
+    function clearImage() {
       if (result && result !== base) put(result);
       if (base && base !== src) destroy(base);
       if (src) destroy(src);
+      layers.forEach(destroy); layers = [];
+      src = base = result = null;
       drain();
-      W = w; H = h;
-      canvas.width = w; canvas.height = h;
-      const up = makeTex(w, h, 'u8');
-      gl.bindTexture(gl.TEXTURE_2D, up.tex);
+    }
+    function upload(source, w, h) {
+      const t = makeTex(w, h, 'u8');
+      gl.bindTexture(gl.TEXTURE_2D, t.tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      return t;
+    }
+    // Several versions of one picture, all w x h. merge() then writes their blend into src.
+    function loadStack(sources, w, h) {
+      clearImage();
+      W = w; H = h; canvas.width = w; canvas.height = h;
+      layers = sources.slice(0, 8).map(s => { const t = upload(s, w, h); t.pinned = true; return t; });
+      src = makeTex(w, h, 'f16'); src.pinned = true;
+      base = result = src;
+    }
+    // m = { mode, n, w: [8 weights], scale, soft, pow, seed, ch: [r, g, b] }
+    function merge(m) {
+      if (!layers.length) return;
+      made = null;
+      const tex = {};
+      for (let i = 1; i < 8; i++) tex['u_l' + i] = layers[Math.min(i, layers.length - 1)];
+      pass(SH.merge, layers[0], { u_mode: { i: m.mode }, u_n: { i: layers.length }, u_w: new Float32Array(m.w), u_scale: m.scale,
+        u_soft: m.soft, u_pow: m.pow, u_pseed: m.seed, u_ch: { i: m.ch } }, { target: src, w: src.w, h: src.h, tex });
+    }
+    function load(source, w, h) {
+      clearImage();
+      W = w; H = h;
+      canvas.width = w; canvas.height = h;
+      const up = upload(source, w, h);
       made = null;
       src = pass(SH.ingest, up, {}, {});
       src.pinned = true;
@@ -315,7 +407,7 @@ void main() {
       return new ImageData(buf, W, H);
     }
 
-    return { gl, maxTex, load, probe, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
+    return { gl, maxTex, load, loadStack, merge, probe, setGeometry, frameOf, process, show, exportPixels, get size() { return [W, H]; }, get source() { return src ? [src.w, src.h] : [0, 0]; } };
   }
 
   return { create, LIB, SH };
