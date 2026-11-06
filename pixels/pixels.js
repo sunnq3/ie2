@@ -25,9 +25,12 @@ const hist = [], future = []; let histBytes = 0;
 /* ---------------- view state ---------------- */
 const stage = $('#stage'), view = $('#view'), vctx = view.getContext('2d');
 let z = 1, tx = 0, ty = 0, dpr = 1, tool = 'select', spaceDown = false, drag = null, hover = null, frameReq = 0;
-let mods = { shift: false, alt: false, ctrl: false };       // held modifier keys, shown on screen
+let mods = { shift: false, alt: false, ctrl: false, a: false, x: false };   // held keys (A = add, X = remove)
+let modeBtn = 'replace';                                    // selection mode chosen with the New / Add / Remove buttons
+let fillSrc = 'near', fillCol = '#ffffff', brush = 1;       // fill tool settings
 let selList = null;                                         // coordinates of small selections, drawn as markers
-const selMode = (e) => (e.shiftKey || mods.shift) ? 'add' : (e.altKey || mods.alt) ? 'sub' : (e.ctrlKey || e.metaKey || mods.ctrl) ? 'toggle' : 'replace';
+const heldMode = (e) => (mods.a || (e && e.shiftKey) || mods.shift) ? 'add' : (mods.x || (e && e.altKey) || mods.alt) ? 'sub' : ((e && (e.ctrlKey || e.metaKey)) || mods.ctrl) ? 'toggle' : '';
+const selMode = (e) => heldMode(e) || modeBtn;
 const MODE_LABEL = { add: '+ add', sub: '− remove', toggle: '± toggle' };
 
 const say = (t, err) => { const s = $('#status'); s.textContent = t; s.classList.toggle('err', !!err); };
@@ -58,7 +61,7 @@ function setImage(src, w0, h0, nm) {
   name = nm; loaded = true;
   $('#meta').textContent = `${nm} · ${W}×${H}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
   $('#drop').classList.add('gone');
-  ['#save', '#all'].forEach(s => { $(s).disabled = false; });
+  ['#save', '#all', '#fillholes'].forEach(s => { $(s).disabled = false; });
   sync(); fit(); say('ready');
 }
 function sample() {
@@ -213,6 +216,102 @@ function drop(dx, dy) {
 }
 function nudge(dx, dy) { if (!sel.n || float) return; lift(); drop(dx, dy); }
 
+/* ---------------- filling empty pixels ---------------- */
+const isEmpty = (i) => data[i * 4 + 3] === 0;
+const pickCol = () => { const h = fillCol.replace('#', ''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16)); };
+const pack = (r, g, b) => (255 << 24 | b << 16 | g << 8 | r) >>> 0;      // little-endian RGBA word
+// average of the nearest non-empty pixels (growing rings), or null if none within reach
+function nearColour(x, y) {
+  for (let r = 1; r <= 32; r++) {
+    let sr = 0, sg = 0, sb = 0, n = 0;
+    for (let yy = y - r; yy <= y + r; yy++) {
+      if (yy < 0 || yy >= H) continue;
+      const edge = yy === y - r || yy === y + r;
+      for (let xx = x - r; xx <= x + r; xx += edge ? 1 : 2 * r) {
+        if (xx < 0 || xx >= W) continue;
+        const i = (yy * W + xx) * 4; if (!data[i + 3]) continue;
+        sr += data[i]; sg += data[i + 1]; sb += data[i + 2]; n++;
+      }
+    }
+    if (n) return [Math.round(sr / n), Math.round(sg / n), Math.round(sb / n)];
+  }
+  return null;
+}
+// fill the empty pixels under the brush; existing pixels are never painted over
+function paint(cx, cy, list) {
+  const h = (brush - 1) >> 1, col = fillSrc === 'colour' ? pickCol() : null;
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (let y = cy - h; y <= cy + h; y++) for (let x = cx - h; x <= cx + h; x++) {
+    if (!inside(x, y)) continue;
+    const i = y * W + x; if (!isEmpty(i)) continue;
+    const c = col || nearColour(x, y); if (!c) continue;
+    px32[i] = pack(c[0], c[1], c[2]); list.push(i);
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  if (x1 >= 0) redraw({ x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 });
+}
+function line(a, b, list) {   // paint along the drag so fast strokes leave no gaps
+  let [x, y] = a; const [x1, y1] = b, dx = Math.abs(x1 - x), dy = -Math.abs(y1 - y), sx = x < x1 ? 1 : -1, sy = y < y1 ? 1 : -1;
+  let err = dx + dy;
+  for (let k = 0; k < 100000; k++) {
+    paint(x, y, list);
+    if (x === x1 && y === y1) break;
+    const e2 = 2 * err; if (e2 >= dy) { err += dy; x += sx; } if (e2 <= dx) { err += dx; y += sy; }
+  }
+}
+function finishFill(list) {
+  if (!list.length) { say(fillSrc === 'colour' ? 'nothing filled: only empty pixels get filled' : 'nothing filled: click on empty (deleted) pixels'); return; }
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (const i of list) { const x = i % W, y = (i / W) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  const r = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }, after = snap(r), before = snap(r);
+  for (const i of list) { const x = i % W - x0, y = ((i / W) | 0) - y0; before.pix.fill(0, (y * r.w + x) * 4, (y * r.w + x) * 4 + 4); }
+  record(r, before, after, 'fill');
+  say(`filled ${list.length.toLocaleString()} pixel${list.length > 1 ? 's' : ''}`);
+}
+// fill every empty pixel in the selection (or the whole image) from the outside in
+function fillHoles() {
+  if (!loaded || float) return;
+  const r = sel.n ? bbox() : { x: 0, y: 0, w: W, h: H }, useSel = sel.n > 0;
+  const hole = new Uint8Array(W * H); let n = 0;
+  for (let y = r.y; y < r.y + r.h; y++) for (let i = y * W + r.x, e = i + r.w; i < e; i++) if (isEmpty(i) && (!useSel || mask[i])) { hole[i] = 1; n++; }
+  if (!n) { say(useSel ? 'no empty pixels in the selection' : 'no empty pixels to fill'); return; }
+  const before = snap(r);
+  if (fillSrc === 'colour') { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }
+  else {
+    // onion peel: each round fills the holes touching filled pixels with the average of those neighbours
+    let front = [];
+    const touches = (i) => { const x = i % W, y = (i / W) | 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if ((dx || dy) && X >= 0 && Y >= 0 && X < W && Y < H) { const j = Y * W + X; if (!hole[j] && !isEmpty(j)) return true; } } return false; };
+    const queued = new Uint8Array(W * H);
+    for (let i = 0; i < hole.length; i++) if (hole[i] && touches(i)) { front.push(i); queued[i] = 1; }
+    let left = n;
+    while (front.length) {
+      const cols = new Uint32Array(front.length);
+      front.forEach((i, k) => {
+        const x = i % W, y = (i / W) | 0; let sr = 0, sg = 0, sb = 0, c = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const X = x + dx, Y = y + dy; if (!(dx || dy) || X < 0 || Y < 0 || X >= W || Y >= H) continue;
+          const j = Y * W + X; if (hole[j] || isEmpty(j)) continue;
+          const o = j * 4; sr += data[o]; sg += data[o + 1]; sb += data[o + 2]; c++;
+        }
+        cols[k] = c ? pack(Math.round(sr / c), Math.round(sg / c), Math.round(sb / c)) : 0;
+      });
+      const next = [];
+      front.forEach((i, k) => { if (cols[k]) { px32[i] = cols[k]; hole[i] = 0; left--; } });
+      for (const i of front) {
+        const x = i % W, y = (i / W) | 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
+          const j = Y * W + X; if (hole[j] && !queued[j]) { queued[j] = 1; next.push(j); }
+        }
+      }
+      front = next;
+    }
+    if (left > 0) { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }   // nothing around to borrow from
+  }
+  record(r, before, snap(r), 'fill holes'); redraw(r); need();
+  say(`filled ${n.toLocaleString()} empty pixel${n > 1 ? 's' : ''}` + (useSel ? ' in the selection' : ''));
+}
+
 /* ---------------- view ---------------- */
 function resize() {
   dpr = window.devicePixelRatio || 1;
@@ -283,8 +382,13 @@ function draw() {
   if (hover && !drag && inside(hover[0], hover[1]) && z >= 4) {   // pixel under the cursor
     vctx.strokeStyle = '#fff'; vctx.lineWidth = 1.5; vctx.strokeRect(tx + hover[0] * z + 0.5, ty + hover[1] * z + 0.5, z - 1, z - 1);
   }
-  const ml = MODE_LABEL[mods.shift ? 'add' : mods.alt ? 'sub' : mods.ctrl ? 'toggle' : ''];
-  if (ml && hover && tool === 'select' && !spaceDown) {
+  if (tool === 'fill' && hover && !spaceDown) {     // brush outline
+    const h = (brush - 1) / 2, bx = tx + (hover[0] - h) * z, by = ty + (hover[1] - h) * z, bs = Math.max(brush * z, 4);
+    vctx.strokeStyle = '#fff'; vctx.lineWidth = 1.5; vctx.strokeRect(bx - .5, by - .5, bs + 1, bs + 1);
+    vctx.strokeStyle = 'rgb(' + ACC.join(',') + ')'; vctx.lineWidth = 1; vctx.strokeRect(bx + .5, by + .5, bs - 1, bs - 1);
+  }
+  const ml = tool === 'select' ? MODE_LABEL[selMode(null) === 'replace' ? '' : selMode(null)] : '';
+  if (ml && hover && !spaceDown) {
     const hx = tx + (hover[0] + 1) * z + 10, hy = ty + (hover[1] + 1) * z + 10;
     vctx.font = '600 11px "IBM Plex Mono", monospace'; const tw = vctx.measureText(ml).width;
     vctx.fillStyle = 'rgba(27,26,23,.9)'; vctx.fillRect(hx, hy, tw + 10, 18);
@@ -323,8 +427,9 @@ view.addEventListener('pointerdown', (e) => {
   if (tool === 'hand' || spaceDown || e.button === 1 || e.button === 2) { drag = { mode: 'pan', cx, cy, tx, ty }; stage.classList.add('panning'); return; }
   if (e.button !== 0) return;
   const [x, y] = toImg(cx, cy);
+  if (tool === 'fill') { drag = { mode: 'fill', filled: [], last: [x, y] }; paint(x, y, drag.filled); need(); return; }
   const mode = selMode(e);
-  if (inside(x, y) && mask[y * W + x] && mode === 'replace') { lift(); drag = { mode: 'move', cx, cy }; sync(); need(); return; }
+  if (inside(x, y) && mask[y * W + x] && !heldMode(e) && modeBtn !== 'sub') { lift(); drag = { mode: 'move', cx, cy }; sync(); need(); return; }
   drag = { mode: 'pick', cx, cy, a: [x, y], b: [x, y], sel: mode };
 });
 view.addEventListener('pointermove', (e) => {
@@ -332,6 +437,7 @@ view.addEventListener('pointermove', (e) => {
   if (!drag) { hover = loaded ? toImg(cx, cy) : null; showHover(); stage.classList.toggle('over-sel', !!(hover && inside(...hover) && mask[hover[1] * W + hover[0]] && tool === 'select' && !spaceDown)); need(); return; }
   if (drag.mode === 'pan') { tx = drag.tx + cx - drag.cx; ty = drag.ty + cy - drag.cy; need(); return; }
   if (drag.mode === 'move') { moveTo(cx, cy, e.shiftKey); $('#status').textContent = `moving ${float.dx}, ${float.dy}` + (e.shiftKey ? ' · straight' : ''); need(); return; }
+  if (drag.mode === 'fill') { const p = toImg(cx, cy); line(drag.last, p, drag.filled); drag.last = p; hover = p; need(); return; }
   if (drag.mode === 'pick' && Math.hypot(cx - drag.cx, cy - drag.cy) > 3) drag.mode = 'box';
   if (drag.mode === 'box') { drag.b = toImg(cx, cy); need(); }
 });
@@ -347,9 +453,10 @@ function endDrag(e) {
     const [cx, cy] = pos(e);
     if (drag.mode === 'move' && float) moveTo(cx, cy, e.shiftKey);
     if (drag.mode === 'box' || (drag.mode === 'pick' && Math.hypot(cx - drag.cx, cy - drag.cy) > 3)) { drag.mode = 'box'; drag.b = toImg(cx, cy); }
-    const m = selMode(e); if (m !== 'replace' && drag.sel) drag.sel = m;
+    const m = heldMode(e); if (m && drag.sel) drag.sel = m;
   }
   const d = drag; drag = null; stage.classList.remove('panning');
+  if (d.mode === 'fill') { finishFill(d.filled); sync(); need(); return; }
   if (d.mode === 'move') drop(float ? float.dx : 0, float ? float.dy : 0);
   else if (d.mode === 'pick') {
     const [x, y] = d.a;
@@ -377,19 +484,22 @@ view.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 /* ---------------- keyboard ---------------- */
+const NOMODS = () => ({ shift: false, alt: false, ctrl: false, a: false, x: false });
 function trackMods(e) {
-  const m = { shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey };
-  if (m.shift !== mods.shift || m.alt !== mods.alt || m.ctrl !== mods.ctrl) {
-    mods = m;
-    const l = MODE_LABEL[m.shift ? 'add' : m.alt ? 'sub' : m.ctrl ? 'toggle' : ''];
-    if (loaded && !drag) say(l ? `${l}: click or drag to ${m.shift ? 'add to' : m.alt ? 'remove from' : 'toggle in'} the selection` + (m.shift ? ' · Shift while dragging a selection moves it straight' : '') : 'ready');
-    need();
-  }
+  if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  const down = e.type === 'keydown', k = (e.key || '').toLowerCase(), plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+  const m = { shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey, a: mods.a, x: mods.x };
+  if (k === 'a' && plain) m.a = down; if (k === 'x' && plain) m.x = down;
+  const before = heldMode(null);
+  mods = m;
+  const now = heldMode(null);
+  if (now !== before && loaded && !drag && tool === 'select') { say(now ? `${MODE_LABEL[now]}: click or drag` : 'ready'); }
+  need();
 }
 window.addEventListener('keydown', trackMods, true);
 window.addEventListener('keyup', trackMods, true);
-window.addEventListener('blur', () => { mods = { shift: false, alt: false, ctrl: false }; need(); });
-document.addEventListener('visibilitychange', () => { mods = { shift: false, alt: false, ctrl: false }; });
+window.addEventListener('blur', () => { mods = NOMODS(); need(); });
+document.addEventListener('visibilitychange', () => { mods = NOMODS(); });
 window.addEventListener('keydown', (e) => {
   if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
   const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
@@ -404,13 +514,24 @@ window.addEventListener('keydown', (e) => {
   const step = e.shiftKey ? 10 : 1;
   const arrows = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
   if (arrows[e.key] && sel.n) { e.preventDefault(); nudge(...arrows[e.key]); return; }
-  if (k === 'v') setTool('select'); else if (k === 'h') setTool('hand'); else if (k === 'f') fit();
+  if (k === 'v') setTool('select'); else if (k === 'h') setTool('hand'); else if (k === 'f') setTool('fill'); else if (k === '0') fit();
   else if (k === '+' || k === '=') zoomAt(z * 1.5, stage.clientWidth / 2, stage.clientHeight / 2);
   else if (k === '-') zoomAt(z / 1.5, stage.clientWidth / 2, stage.clientHeight / 2);
 });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') { spaceDown = false; stage.classList.toggle('hand', tool === 'hand'); } });
-function setTool(t) { tool = t; document.querySelectorAll('#tools button').forEach(b => b.classList.toggle('on', b.dataset.t === t)); stage.classList.toggle('hand', t === 'hand'); }
+function setTool(t) {
+  tool = t; document.querySelectorAll('#tools button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
+  stage.classList.toggle('hand', t === 'hand'); stage.classList.toggle('filling', t === 'fill');
+  $('#smode').hidden = t !== 'select'; $('#fopts').hidden = t !== 'fill';
+  need();
+}
 document.querySelectorAll('#tools button').forEach(b => b.addEventListener('click', () => setTool(b.dataset.t)));
+function setModeBtn(m) { modeBtn = m; document.querySelectorAll('#smode button').forEach(b => b.classList.toggle('on', b.dataset.m === m)); need(); }
+document.querySelectorAll('#smode button').forEach(b => b.addEventListener('click', () => setModeBtn(b.dataset.m)));
+$('#brush').addEventListener('change', (e) => { brush = +e.target.value; need(); });
+$('#fsrc').addEventListener('change', (e) => { fillSrc = e.target.value; $('#fcol').hidden = fillSrc !== 'colour'; });
+$('#fcol').addEventListener('input', (e) => { fillCol = e.target.value; });
+$('#fillholes').addEventListener('click', fillHoles);
 
 /* ---------------- buttons, files ---------------- */
 $('#open').addEventListener('click', () => $('#file').click());

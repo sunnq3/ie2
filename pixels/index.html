@@ -36,6 +36,12 @@ button { cursor: pointer; }
 .seg button { border: 0; background: var(--card); padding: 0 11px; }
 .seg button + button { border-left: 1.5px solid var(--ink); }
 .seg button.on { background: var(--ink); color: var(--paper); }
+kbd { font: 600 10px var(--mono); border: 1px solid currentColor; border-radius: 2px; padding: 0 3px; margin-left: 3px; opacity: .7; }
+.fopts { display: inline-flex; gap: 6px; align-items: center; }
+.fopts[hidden], .seg[hidden] { display: none; }
+.fopts select { height: 30px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); padding: 0 6px; }
+.fopts input[type=color] { width: 36px; height: 30px; border: 1.5px solid var(--ink); border-radius: 3px; padding: 1px; background: var(--card); }
+.stage.filling #view { cursor: cell; }
 .meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .grow { flex: 1; }
 .stage { position: relative; overflow: hidden; background: var(--stage); touch-action: none; }
@@ -76,7 +82,14 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <div class="logo"><b>ie2</b><span>PIXELS</span><a href="../v5/">→ v5</a></div>
   <button class="b" id="open" type="button">Open…</button>
   <input id="file" type="file" accept="image/*" hidden>
-  <div class="seg" id="tools"><button type="button" data-t="select" class="on" title="Select and move (V)">Select</button><button type="button" data-t="hand" title="Pan (H, or hold Space)">Hand</button></div>
+  <div class="seg" id="tools"><button type="button" data-t="select" class="on" title="Select and move (V)">Select</button><button type="button" data-t="fill" title="Fill empty pixels (F)">Fill</button><button type="button" data-t="hand" title="Pan (H, or hold Space)">Hand</button></div>
+  <div class="seg" id="smode" title="What a click or box does"><button type="button" data-m="replace" class="on" title="Click / box makes a new selection">New</button><button type="button" data-m="add" title="Click / box adds to the selection (or hold A)">Add <kbd>A</kbd></button><button type="button" data-m="sub" title="Click / box removes from the selection (or hold X)">Remove <kbd>X</kbd></button></div>
+  <div class="fopts" id="fopts" hidden>
+    <select id="brush" title="Brush size"><option value="1">1 px</option><option value="3">3 px</option><option value="7">7 px</option><option value="15">15 px</option><option value="31">31 px</option></select>
+    <select id="fsrc" title="What empty pixels are filled with"><option value="near">from surrounding colours</option><option value="colour">with a colour</option></select>
+    <input id="fcol" type="color" value="#ffffff" hidden aria-label="Fill colour">
+  </div>
+  <button class="b q" id="fillholes" type="button" title="Fill every empty pixel in the selection (or the whole image) from its surroundings" disabled>Fill holes</button>
   <button class="b q" id="undo" type="button" title="Undo (Ctrl/Cmd+Z)" disabled>Undo</button>
   <button class="b q" id="redo" type="button" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>Redo</button>
   <button class="b q" id="del" type="button" title="Delete selected pixels (Delete)" disabled>Delete</button>
@@ -87,7 +100,7 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <button class="b q" id="zout" type="button" title="Zoom out (−)">−</button>
   <span class="meta" id="zv" style="min-width:48px;text-align:center">–</span>
   <button class="b q" id="zin" type="button" title="Zoom in (+)">+</button>
-  <button class="b q" id="zfit" type="button" title="Fit (F)">Fit</button>
+  <button class="b q" id="zfit" type="button" title="Fit (0)">Fit</button>
   <div class="exp">
     <button class="b go" id="save" type="button" disabled>Export…</button>
     <div class="xpop" id="xpop" hidden>
@@ -110,10 +123,11 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <p>Select pixels, drag them anywhere, delete them, undo anything. Zoom in to see each one. Nothing is uploaded.</p>
       <div class="row"><button class="b go" id="open2" type="button">Open an image</button><button class="b" id="sample" type="button">Use a sample</button></div>
       <dl>
-        <dt>click</dt><dd>select one pixel (Shift adds, Alt removes, Ctrl/Cmd toggles)</dd>
+        <dt>click</dt><dd>select one pixel (hold A to add, X to remove, or use the Add / Remove buttons)</dd>
         <dt>drag</dt><dd>box-select; drag a selection to move it (Shift keeps it straight)</dd>
         <dt>arrows</dt><dd>nudge by 1 px (Shift: 10)</dd>
         <dt>Delete</dt><dd>remove selected pixels (leaves holes)</dd>
+        <dt>F</dt><dd>Fill tool: click or paint over holes to fill them; Fill holes fills them all</dd>
         <dt>wheel / Space</dt><dd>zoom / pan</dd>
       </dl>
     </div>
@@ -121,14 +135,14 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
 </section>
 
 <footer class="foot">
-  <span class="hint">Click: select · Shift: add · Alt: remove · Ctrl/Cmd: toggle · drag empty area: box · drag selection: move (Shift: straight) · arrows: nudge</span>
+  <span class="hint">Click: select · hold A: add · hold X: remove · drag empty area: box · drag selection: move · arrows: nudge · F: fill holes · V: select · 0: fit</span>
   <span id="hover"></span>
   <span id="selinfo"></span>
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=14"></script>
-<script src="../v5/export.js?b=14"></script>
-<script src="pixels.js?b=14"></script>
+<script src="../v5/core.js?b=15"></script>
+<script src="../v5/export.js?b=15"></script>
+<script src="pixels.js?b=15"></script>
 </body>
 </html>
