@@ -27,7 +27,7 @@ const stage = $('#stage'), view = $('#view'), vctx = view.getContext('2d');
 let z = 1, tx = 0, ty = 0, dpr = 1, tool = 'select', spaceDown = false, drag = null, hover = null, frameReq = 0;
 let mods = { shift: false, alt: false, ctrl: false };       // held modifier keys, shown on screen
 let selList = null;                                         // coordinates of small selections, drawn as markers
-const selMode = (e) => e.shiftKey ? 'add' : e.altKey ? 'sub' : (e.ctrlKey || e.metaKey) ? 'toggle' : 'replace';
+const selMode = (e) => (e.shiftKey || mods.shift) ? 'add' : (e.altKey || mods.alt) ? 'sub' : (e.ctrlKey || e.metaKey || mods.ctrl) ? 'toggle' : 'replace';
 const MODE_LABEL = { add: '+ add', sub: '− remove', toggle: '± toggle' };
 
 const say = (t, err) => { const s = $('#status'); s.textContent = t; s.classList.toggle('err', !!err); };
@@ -316,8 +316,10 @@ function showHover() {
 const pos = (e) => { const r = view.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
 view.addEventListener('pointerdown', (e) => {
   if (!loaded) return;
+  e.preventDefault();                                   // no text selection / native drag (Firefox Shift+click)
+  if (drag) endDrag(null);                              // a previous click whose release never arrived
   const [cx, cy] = pos(e);
-  view.setPointerCapture(e.pointerId);
+  try { view.setPointerCapture(e.pointerId); } catch (err) { /* capture is a nicety */ }
   if (tool === 'hand' || spaceDown || e.button === 1 || e.button === 2) { drag = { mode: 'pan', cx, cy, tx, ty }; stage.classList.add('panning'); return; }
   if (e.button !== 0) return;
   const [x, y] = toImg(cx, cy);
@@ -341,7 +343,7 @@ function moveTo(cx, cy, straight) {
 }
 function endDrag(e) {
   if (!drag) return;
-  if (e && e.type === 'pointerup') {   // take the release point and the keys held at release too
+  if (e && (e.type === 'pointerup' || e.type === 'mouseup')) {   // take the release point and the keys held at release too
     const [cx, cy] = pos(e);
     if (drag.mode === 'move' && float) moveTo(cx, cy, e.shiftKey);
     if (drag.mode === 'box' || (drag.mode === 'pick' && Math.hypot(cx - drag.cx, cy - drag.cy) > 3)) { drag.mode = 'box'; drag.b = toImg(cx, cy); }
@@ -361,6 +363,11 @@ function endDrag(e) {
 }
 view.addEventListener('pointerup', endDrag);
 view.addEventListener('pointercancel', endDrag);
+view.addEventListener('lostpointercapture', (e) => { if (drag) endDrag(e); });
+// fallbacks: a release outside the canvas, or a mouse release without a pointer release
+window.addEventListener('pointerup', (e) => { if (drag) endDrag(e); });
+window.addEventListener('mouseup', (e) => { if (drag) setTimeout(() => { if (drag) endDrag(e); }, 0); });
+['mousedown', 'selectstart', 'dragstart'].forEach(t => view.addEventListener(t, (e) => e.preventDefault()));
 view.addEventListener('pointerleave', () => { if (!drag) { hover = null; showHover(); need(); } });
 view.addEventListener('contextmenu', (e) => e.preventDefault());
 view.addEventListener('wheel', (e) => {
@@ -382,7 +389,7 @@ function trackMods(e) {
 window.addEventListener('keydown', trackMods, true);
 window.addEventListener('keyup', trackMods, true);
 window.addEventListener('blur', () => { mods = { shift: false, alt: false, ctrl: false }; need(); });
-view.addEventListener('pointermove', trackMods);
+document.addEventListener('visibilitychange', () => { mods = { shift: false, alt: false, ctrl: false }; });
 window.addEventListener('keydown', (e) => {
   if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
   const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();

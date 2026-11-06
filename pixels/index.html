@@ -18,7 +18,7 @@
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
-body { background: var(--paper); color: var(--ink); font: 13px/1.4 var(--sans); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
+body { -webkit-user-select: none; user-select: none; background: var(--paper); color: var(--ink); font: 13px/1.4 var(--sans); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
 button, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 .bar { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1.5px solid var(--ink); flex-wrap: wrap; }
@@ -103,7 +103,7 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
 </header>
 
 <section class="stage" id="stage">
-  <canvas id="view"></canvas>
+  <canvas id="view" draggable="false"></canvas>
   <div class="drop" id="drop">
     <div class="card">
       <h1>Every pixel is a block you can grab.</h1>
@@ -127,8 +127,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=13"></script>
-<script src="../v5/export.js?b=13"></script>
-<script src="pixels.js?b=13"></script>
+<script src="../v5/core.js?b=14"></script>
+<script src="../v5/export.js?b=14"></script>
+<script src="pixels.js?b=14"></script>
 </body>
 </html>
