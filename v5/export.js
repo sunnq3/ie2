@@ -177,10 +177,11 @@ const ENC = (() => {
     o.u32(data.length); o.raw(tb); o.raw(data);
     o.u32((crc(data, crc(tb)) ^ 0xffffffff) >>> 0);
   }
-  // src = { w, h, deep, read(y, rows) -> RGBA (Uint8Array, or Float32Array 0..1 when deep) }
+  // src = { w, h, deep, alpha, read(y, rows) -> RGBA (Uint8Array, or Float32Array 0..1 when deep) }
+  // alpha: keep transparency (8-bit RGBA); otherwise RGB.
   async function png(src, onProgress) {
     if (typeof CompressionStream === 'undefined') throw new Error('this browser cannot write PNG files (no CompressionStream)');
-    const { w, h, deep } = src, bpp = deep ? 6 : 3, stride = w * bpp + 1;
+    const { w, h, deep } = src, alpha = !!src.alpha && !deep, nc = alpha ? 4 : 3, bpp = deep ? 6 : nc, stride = w * bpp + 1;
     const cs = new CompressionStream('deflate'), writer = cs.writable.getWriter();
     const parts = []; let total = 0;
     const reading = (async () => { const rd = cs.readable.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; parts.push(value); total += value.length; } })();
@@ -190,7 +191,7 @@ const ENC = (() => {
       const line = new Uint8Array(w * bpp);
       for (let r = 0; r < rows; r++) {
         for (let x = 0, i = r * w * 4, j = 0; x < w; x++, i += 4) {
-          for (let c = 0; c < 3; c++) {
+          for (let c = 0; c < nc; c++) {
             if (deep) { const v = Math.round(Math.min(1, Math.max(0, px[i + c])) * 65535); line[j++] = v >> 8; line[j++] = v & 255; }
             else line[j++] = px[i + c];
           }
@@ -204,7 +205,7 @@ const ENC = (() => {
     await writer.close(); await reading;
     const o = new Bytes(total + 1024);
     o.raw([137, 80, 78, 71, 13, 10, 26, 10]);
-    const ih = new Bytes(13); ih.u32(w); ih.u32(h); ih.u8(deep ? 16 : 8); ih.u8(2); ih.u8(0); ih.u8(0); ih.u8(0);
+    const ih = new Bytes(13); ih.u32(w); ih.u32(h); ih.u8(deep ? 16 : 8); ih.u8(alpha ? 6 : 2); ih.u8(0); ih.u8(0); ih.u8(0);
     chunk(o, 'IHDR', ih.out());
     chunk(o, 'sRGB', new Uint8Array([0]));
     chunk(o, 'tEXt', new TextEncoder().encode('Software\0ie2 v5'));

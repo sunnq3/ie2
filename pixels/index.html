@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ie2 pixels</title>
+<meta name="description" content="Select, drag and delete individual pixels of an image. Runs in your browser; nothing is uploaded.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231b1a17'/%3E%3Crect x='7' y='7' width='8' height='8' fill='%23e4471b'/%3E%3Crect x='17' y='7' width='8' height='8' fill='%23efebe3'/%3E%3Crect x='7' y='17' width='8' height='8' fill='%23efebe3'/%3E%3Crect x='19' y='19' width='8' height='8' fill='%23e4471b'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #efebe3; --card: #f8f6f1; --sunk: #e6e1d7; --ink: #1b1a17; --mute: #6f6a60; --faint: #9a9488;
+  --rule: #d6d0c4; --acc: #e4471b; --stage: #2a2927;
+  --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--paper); color: var(--ink); font: 13px/1.4 var(--sans); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+.bar { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-bottom: 1.5px solid var(--ink); flex-wrap: wrap; }
+.logo { display: flex; align-items: baseline; gap: 6px; margin-right: 10px; user-select: none; }
+.logo b { font: 700 21px/1 var(--mono); letter-spacing: -1.5px; }
+.logo span { font: 600 10px/1 var(--mono); background: var(--acc); color: #fff; padding: 3px 5px; border-radius: 2px; letter-spacing: .04em; }
+.logo a { font: 400 11px/1 var(--mono); color: var(--mute); margin-left: 4px; }
+.b { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; padding: 0 11px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); white-space: nowrap; user-select: none; }
+.b:hover { background: #fff; }
+.b.go { background: var(--ink); color: var(--paper); }
+.b:disabled { opacity: .35; cursor: not-allowed; }
+.b.q { border-color: transparent; background: transparent; color: var(--mute); }
+.b.q:hover:not(:disabled) { color: var(--ink); background: var(--sunk); }
+.seg { display: inline-flex; border: 1.5px solid var(--ink); border-radius: 3px; overflow: hidden; height: 30px; }
+.seg button { border: 0; background: var(--card); padding: 0 11px; }
+.seg button + button { border-left: 1.5px solid var(--ink); }
+.seg button.on { background: var(--ink); color: var(--paper); }
+.meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.grow { flex: 1; }
+.stage { position: relative; overflow: hidden; background: var(--stage); touch-action: none; }
+#view { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+.stage.hand #view { cursor: grab; }
+.stage.panning #view { cursor: grabbing; }
+.stage.over-sel #view { cursor: move; }
+.drop { position: absolute; inset: 0; display: grid; place-items: center; background: var(--stage); z-index: 5; }
+.drop.gone { display: none; }
+body.dragging .drop { display: grid; outline: 3px dashed var(--acc); outline-offset: -14px; }
+.card { background: var(--paper); border: 1.5px solid var(--ink); box-shadow: 6px 6px 0 var(--acc); border-radius: 4px; padding: 26px 28px; max-width: 460px; }
+.card h1 { margin: 0 0 6px; font: 700 22px/1.15 var(--sans); letter-spacing: -.3px; }
+.card p { margin: 0 0 14px; color: var(--mute); }
+.card .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.card dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 16px 0 0; font-size: 12px; color: var(--mute); }
+.card dt { font: 500 11px var(--mono); color: var(--ink); }
+.card dd { margin: 0; }
+.exp { position: relative; display: inline-flex; }
+.xpop { position: absolute; right: 0; top: calc(100% + 8px); z-index: 30; width: 310px; background: var(--card); border: 1.5px solid var(--ink); box-shadow: 4px 4px 0 var(--acc); border-radius: 4px; padding: 12px; display: grid; gap: 8px; }
+.xpop[hidden] { display: none; }
+.xpop h4 { margin: 0; font: 600 10.5px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+.xrow { display: grid; grid-template-columns: 82px minmax(0, 1fr); align-items: center; gap: 8px; font-size: 12px; color: var(--mute); }
+.xrow[hidden] { display: none; }
+.xrow select { height: 28px; font-size: 12px; border: 1px solid var(--ink); border-radius: 3px; background: var(--card); min-width: 0; }
+.xrow .qv { display: grid; grid-template-columns: minmax(0, 1fr) 30px; gap: 6px; align-items: center; color: var(--ink); font: 12px var(--mono); }
+.xrow input[type=color] { width: 44px; height: 26px; border: 1px solid var(--ink); border-radius: 3px; padding: 1px; background: var(--card); }
+.xnote { margin: 0; color: var(--mute); font-size: 11.5px; line-height: 1.35; }
+input[type=range] { accent-color: var(--acc); width: 100%; }
+.foot { display: flex; align-items: center; gap: 14px; padding: 6px 14px; border-top: 1.5px solid var(--ink); font: 11.5px var(--mono); color: var(--mute); min-height: 30px; white-space: nowrap; overflow: hidden; }
+.foot .hint { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+#status.err { color: var(--acc); }
+.swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid var(--ink); vertical-align: -1px; margin-right: 4px; }
+@media (max-width: 760px) { .meta { order: 9; flex-basis: 100%; } .foot .hint { display: none; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="logo"><b>ie2</b><span>PIXELS</span><a href="../v5/">→ v5</a></div>
+  <button class="b" id="open" type="button">Open…</button>
+  <input id="file" type="file" accept="image/*" hidden>
+  <div class="seg" id="tools"><button type="button" data-t="select" class="on" title="Select and move (V)">Select</button><button type="button" data-t="hand" title="Pan (H, or hold Space)">Hand</button></div>
+  <button class="b q" id="undo" type="button" title="Undo (Ctrl/Cmd+Z)" disabled>Undo</button>
+  <button class="b q" id="redo" type="button" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>Redo</button>
+  <button class="b q" id="del" type="button" title="Delete selected pixels (Delete)" disabled>Delete</button>
+  <button class="b q" id="all" type="button" title="Select all (Ctrl/Cmd+A)" disabled>Select all</button>
+  <button class="b q" id="none" type="button" title="Deselect (Esc)" disabled>Deselect</button>
+  <div class="meta" id="meta"></div>
+  <div class="grow"></div>
+  <button class="b q" id="zout" type="button" title="Zoom out (−)">−</button>
+  <span class="meta" id="zv" style="min-width:48px;text-align:center">–</span>
+  <button class="b q" id="zin" type="button" title="Zoom in (+)">+</button>
+  <button class="b q" id="zfit" type="button" title="Fit (F)">Fit</button>
+  <div class="exp">
+    <button class="b go" id="save" type="button" disabled>Export…</button>
+    <div class="xpop" id="xpop" hidden>
+      <h4>Save as</h4>
+      <div class="xrow"><span>Format</span><select id="xfmt"><option value="png">PNG (keeps holes transparent)</option><option value="jpg">JPG</option></select></div>
+      <div class="xrow xj"><span>Quality</span><span class="qv"><input id="xq" type="range" min="50" max="100" step="1" value="92" aria-label="JPG quality"><b id="xqv">92</b></span></div>
+      <div class="xrow xj"><span>Colour</span><select id="xsub"><option value="444">4:4:4 · full colour (best)</option><option value="422">4:2:2 · half colour</option><option value="420">4:2:0 · quarter colour</option></select></div>
+      <div class="xrow xj"><span>Hole fill</span><input id="xbg" type="color" value="#ffffff" aria-label="Colour for deleted pixels"></div>
+      <p class="xnote xj" id="xnote">JPG can't store transparency, so deleted pixels are filled with this colour.</p>
+      <button class="b go" id="xsave" type="button">Save file</button>
+    </div>
+  </div>
+</header>
+
+<section class="stage" id="stage">
+  <canvas id="view"></canvas>
+  <div class="drop" id="drop">
+    <div class="card">
+      <h1>Every pixel is a block you can grab.</h1>
+      <p>Select pixels, drag them anywhere, delete them, undo anything. Zoom in to see each one. Nothing is uploaded.</p>
+      <div class="row"><button class="b go" id="open2" type="button">Open an image</button><button class="b" id="sample" type="button">Use a sample</button></div>
+      <dl>
+        <dt>click</dt><dd>select one pixel (Shift adds, Alt removes)</dd>
+        <dt>drag</dt><dd>box-select; drag a selection to move it</dd>
+        <dt>arrows</dt><dd>nudge by 1 px (Shift: 10)</dd>
+        <dt>Delete</dt><dd>remove selected pixels (leaves holes)</dd>
+        <dt>wheel / Space</dt><dd>zoom / pan</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<footer class="foot">
+  <span class="hint">Click: select · Shift: add · Alt: remove · drag empty area: box · drag selection: move · arrows: nudge</span>
+  <span id="hover"></span>
+  <span id="selinfo"></span>
+  <span id="status">ready</span>
+</footer>
+
+<script src="../v5/core.js?b=12"></script>
+<script src="../v5/export.js?b=12"></script>
+<script src="pixels.js?b=12"></script>
+</body>
+</html>

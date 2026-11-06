@@ -27,6 +27,7 @@ button { cursor: pointer; }
 .logo { display: flex; align-items: baseline; gap: 6px; margin-right: 10px; user-select: none; }
 .logo b { font: 700 21px/1 var(--mono); letter-spacing: -1.5px; }
 .logo span { font: 600 10px/1 var(--mono); background: var(--acc); color: var(--acc-ink); padding: 3px 5px; border-radius: 2px; letter-spacing: .04em; }
+.logo .sib { font: 400 11px/1 var(--mono); color: var(--mute); margin-left: 8px; }
 .logo em { font: 400 11px/1 var(--mono); color: var(--mute); font-style: normal; margin-left: 2px; }
 .b { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border: 1.5px solid var(--ink); border-radius: 3px; background: var(--card); white-space: nowrap; user-select: none; }
 .b:hover { background: #fff; }
@@ -235,7 +236,7 @@ body.cropping .cbox { display: block; }
 </head>
 <body>
 <header class="bar">
-  <div class="logo"><b>ie2</b><span>V5</span><em>artifact lab</em></div>
+  <div class="logo"><b>ie2</b><span>V5</span><em>artifact lab</em><a class="sib" href="../pixels/" title="Select, drag and delete individual pixels">pixels →</a></div>
   <button class="b" id="open" type="button">Open…</button>
   <button class="b" id="mergebtn" type="button" title="Open 2–8 versions of the same image and blend them into one">Merge…</button>
   <input id="file" type="file" accept="image/*" multiple hidden>
@@ -321,12 +322,12 @@ body.cropping .cbox { display: block; }
   <div class="chain" id="chain">chain: <b>empty</b></div>
   <span id="msum" class="msum" title="Survival after export, for the effects that are on"></span>
   <span id="status">ready</span>
-  <span class="build" title="If this number is older than expected, hard-refresh the page">build 11</span>
+  <span class="build" title="If this number is older than expected, hard-refresh the page">build 12</span>
 </footer>
 
-<script src="core.js?b=11"></script>
-<script src="rack.js?b=11"></script>
-<script src="export.js?b=11"></script>
-<script src="main.js?b=11"></script>
+<script src="core.js?b=12"></script>
+<script src="rack.js?b=12"></script>
+<script src="export.js?b=12"></script>
+<script src="main.js?b=12"></script>
 </body>
 </html>
