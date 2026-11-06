@@ -61,14 +61,14 @@ function setImage(src, w0, h0, nm) {
   name = nm; loaded = true;
   $('#meta').textContent = `${nm} · ${W}×${H}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
   $('#drop').classList.add('gone');
-  ['#save', '#all', '#fillholes'].forEach(s => { $(s).disabled = false; });
+  ['#save', '#all', '#fillholes', '#swarea', '#rnd'].forEach(s => { $(s).disabled = false; });
   sync(); fit(); say('ready');
 }
 function sample() {
   // a small scene that's fun to take apart at high zoom
   const c = document.createElement('canvas'); c.width = 192; c.height = 128; const x = c.getContext('2d');
   const g = x.createLinearGradient(0, 0, 0, 90); g.addColorStop(0, '#1d3f8c'); g.addColorStop(0.6, '#e98a5a'); g.addColorStop(1, '#f6d58e');
-  x.fillStyle = g; x.fillRect(0, 0, 192, 90);
+  x.fillStyle = g; x.fillRect(0, 0, 192, 110);
   x.fillStyle = '#fff3c4'; x.beginPath(); x.arc(140, 58, 14, 0, Math.PI * 2); x.fill();
   x.fillStyle = '#3b2a4d'; x.beginPath(); x.moveTo(0, 92); x.lineTo(40, 64); x.lineTo(78, 90); x.lineTo(120, 70); x.lineTo(192, 96); x.lineTo(192, 128); x.lineTo(0, 128); x.fill();
   x.fillStyle = '#25331f'; x.fillRect(0, 100, 192, 28);
@@ -218,7 +218,10 @@ function nudge(dx, dy) { if (!sel.n || float) return; lift(); drop(dx, dy); }
 
 /* ---------------- filling empty pixels ---------------- */
 const isEmpty = (i) => data[i * 4 + 3] === 0;
-const pickCol = () => { const h = fillCol.replace('#', ''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16)); };
+const hexRgb = (hx) => { const h = hx.replace('#', ''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16)); };
+const rgbHex = (c) => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+const pickCol = () => hexRgb(fillCol);
+const randSwatch = (rnd = Math.random) => swatches.length ? hexRgb(swatches[Math.floor(rnd() * swatches.length)]) : pickCol();
 const pack = (r, g, b) => (255 << 24 | b << 16 | g << 8 | r) >>> 0;      // little-endian RGBA word
 // average of the nearest non-empty pixels (growing rings), or null if none within reach
 function nearColour(x, y) {
@@ -239,12 +242,12 @@ function nearColour(x, y) {
 }
 // fill the empty pixels under the brush; existing pixels are never painted over
 function paint(cx, cy, list) {
-  const h = (brush - 1) >> 1, col = fillSrc === 'colour' ? pickCol() : null;
+  const h = (brush - 1) >> 1, col = fillSrc === 'colour' ? pickCol() : null, sw = fillSrc === 'swatches';
   let x0 = W, y0 = H, x1 = -1, y1 = -1;
   for (let y = cy - h; y <= cy + h; y++) for (let x = cx - h; x <= cx + h; x++) {
     if (!inside(x, y)) continue;
     const i = y * W + x; if (!isEmpty(i)) continue;
-    const c = col || nearColour(x, y); if (!c) continue;
+    const c = col || (sw ? randSwatch() : nearColour(x, y)); if (!c) continue;
     px32[i] = pack(c[0], c[1], c[2]); list.push(i);
     if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
   }
@@ -268,6 +271,103 @@ function finishFill(list) {
   record(r, before, after, 'fill');
   say(`filled ${list.length.toLocaleString()} pixel${list.length > 1 ? 's' : ''}`);
 }
+/* ---------------- swatches & colour picker ---------------- */
+let swatches = [];
+try { swatches = JSON.parse(localStorage.getItem('ie2.pixels.swatches') || '[]').filter(h => /^#[0-9a-f]{6}$/.test(h)).slice(0, 24); } catch (e) { swatches = []; }
+function renderSwatches() {
+  const box = $('#sws'); box.textContent = '';
+  swatches.forEach((h, k) => {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'swc' + (h === fillCol ? ' on' : ''); b.style.background = h; b.title = h + ' · click to use, right-click to remove';
+    b.addEventListener('click', () => setColour(h));
+    b.addEventListener('contextmenu', (e) => { e.preventDefault(); swatches.splice(k, 1); saveSwatches(); });
+    box.append(b);
+  });
+  $('#fcol').value = fillCol;
+}
+function saveSwatches() { try { localStorage.setItem('ie2.pixels.swatches', JSON.stringify(swatches)); } catch (e) { /* ignore */ } renderSwatches(); }
+function setColour(h) { fillCol = h; renderSwatches(); }
+function addSwatch(h) { swatches = [h, ...swatches.filter(x => x !== h)].slice(0, 24); fillCol = h; saveSwatches(); }
+function pickAt(x, y) {
+  if (!inside(x, y)) return;
+  const i = (y * W + x) * 4;
+  if (!data[i + 3]) { say('that pixel is empty: nothing to pick'); return; }
+  const h = rgbHex([data[i], data[i + 1], data[i + 2]]); addSwatch(h); say(`picked ${h} into the swatches`);
+}
+// the main colours of the selection (or the whole image): a coarse colour histogram, most common distinct bins
+function swatchesFromArea() {
+  if (!loaded) return;
+  const r = sel.n ? bbox() : { x: 0, y: 0, w: W, h: H }, useSel = sel.n > 0;
+  const cnt = new Float64Array(4096), sr = new Float64Array(4096), sg = new Float64Array(4096), sb = new Float64Array(4096);
+  const step = Math.max(1, Math.floor(Math.sqrt(r.w * r.h / 250000)));
+  for (let y = r.y; y < r.y + r.h; y += step) for (let x = r.x; x < r.x + r.w; x += step) {
+    const i = y * W + x; if (useSel && !mask[i]) continue;
+    const o = i * 4; if (!data[o + 3]) continue;
+    const b = (data[o] >> 4) << 8 | (data[o + 1] >> 4) << 4 | (data[o + 2] >> 4);
+    cnt[b]++; sr[b] += data[o]; sg[b] += data[o + 1]; sb[b] += data[o + 2];
+  }
+  const bins = [...cnt.keys()].filter(b => cnt[b]).sort((a, b) => cnt[b] - cnt[a]);
+  const out = [];
+  for (const b of bins) {
+    const c = [sr[b] / cnt[b], sg[b] / cnt[b], sb[b] / cnt[b]].map(Math.round);
+    if (out.every(o => Math.hypot(o[0] - c[0], o[1] - c[1], o[2] - c[2]) > 28)) out.push(c);
+    if (out.length >= 10) break;
+  }
+  if (!out.length) { say('no colours there (all empty)'); return; }
+  swatches = out.map(rgbHex); fillCol = swatches[0]; saveSwatches();
+  say(`${out.length} swatches from the ${useSel ? 'selection' : 'image'}`);
+}
+
+/* ---------------- randomize ---------------- */
+// A share of the pixels in the selection (or the image) is deleted or recoloured; replacement colours come
+// from a random pixel within reach (sampled from the image as it was before), from the swatches, or both.
+const rx = { amt: 30, del: 30, src: 'near', reach: 4 };
+try { Object.assign(rx, JSON.parse(localStorage.getItem('ie2.pixels.random') || '{}')); } catch (e) { /* ignore */ }
+let lastRandom = null;     // the history entry of the last randomize, for Re-roll
+function mulberry(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function randomize() {
+  if (!loaded || float) return;
+  const useSel = sel.n > 0, r = useSel ? bbox() : { x: 0, y: 0, w: W, h: H };
+  const rnd = mulberry((Math.random() * 4294967296) >>> 0), R = Math.max(1, rx.reach | 0);
+  // frozen copy of the area plus its reach, so replacements come from the original pixels
+  const fx0 = Math.max(0, r.x - R), fy0 = Math.max(0, r.y - R), fx1 = Math.min(W, r.x + r.w + R), fy1 = Math.min(H, r.y + r.h + R), fw = fx1 - fx0;
+  const frozen = new Uint32Array(fw * (fy1 - fy0));
+  for (let y = fy0; y < fy1; y++) frozen.set(px32.subarray(y * W + fx0, y * W + fx1), (y - fy0) * fw);
+  const before = snap(r);
+  const pAmt = rx.amt / 100, pDel = rx.del / 100;
+  let changed = 0, deleted = 0;
+  for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) {
+    const i = y * W + x;
+    if (useSel && !mask[i]) continue;
+    if (rnd() >= pAmt) continue;
+    changed++;
+    if (rnd() < pDel) { px32[i] = 0; deleted++; continue; }
+    const fromSw = rx.src === 'swatches' || (rx.src === 'mix' && rnd() < 0.5);
+    if (fromSw && swatches.length) { const c = randSwatch(rnd); px32[i] = pack(c[0], c[1], c[2]); continue; }
+    for (let t = 0; t < 8; t++) {                // a random non-empty pixel within reach
+      const X = x + Math.round((rnd() * 2 - 1) * R), Y = y + Math.round((rnd() * 2 - 1) * R);
+      if (X < fx0 || Y < fy0 || X >= fx1 || Y >= fy1) continue;
+      const v = frozen[(Y - fy0) * fw + (X - fx0)];
+      if (v >>> 24) { px32[i] = v; break; }
+    }
+  }
+  if (!changed) { say('nothing changed: raise Amount'); return; }
+  record(r, before, snap(r), 'randomize'); lastRandom = hist[hist.length - 1];
+  redraw(r); need(); syncRandom();
+  say(`randomized ${changed.toLocaleString()} pixels${useSel ? ' in the selection' : ''} · ${deleted.toLocaleString()} deleted, ${(changed - deleted).toLocaleString()} recoloured`);
+}
+function reroll() {
+  if (!(lastRandom && hist[hist.length - 1] === lastRandom)) return;
+  undo(); const e = future.pop(); histBytes -= 2 * (e.before.pix.length + e.before.m.length);   // replaced, not redoable
+  randomize();
+}
+function syncRandom() {
+  $('#ramt').value = rx.amt; $('#ramtv').textContent = rx.amt + '%'; $('#rdel').value = rx.del; $('#rdelv').textContent = rx.del + '%';
+  $('#rsrc').value = rx.src; $('#rreach').value = rx.reach; $('#rreachv').textContent = rx.reach + ' px';
+  $('#rarea').textContent = sel.n ? `Works on the ${sel.n.toLocaleString()} selected pixels.` : 'Nothing selected: works on the whole image.';
+  $('#rroll').disabled = !(lastRandom && hist[hist.length - 1] === lastRandom);
+  try { localStorage.setItem('ie2.pixels.random', JSON.stringify(rx)); } catch (e) { /* ignore */ }
+}
+
 // fill every empty pixel in the selection (or the whole image) from the outside in
 function fillHoles() {
   if (!loaded || float) return;
@@ -277,6 +377,7 @@ function fillHoles() {
   if (!n) { say(useSel ? 'no empty pixels in the selection' : 'no empty pixels to fill'); return; }
   const before = snap(r);
   if (fillSrc === 'colour') { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }
+  else if (fillSrc === 'swatches') { for (let i = 0; i < hole.length; i++) if (hole[i]) { const c = randSwatch(); px32[i] = pack(c[0], c[1], c[2]); } }
   else {
     // onion peel: each round fills the holes touching filled pixels with the average of those neighbours
     let front = [];
@@ -353,7 +454,7 @@ function draw() {
   const ox = float ? float.dx : 0, oy = float ? float.dy : 0;
   if (float) vctx.drawImage(float.canvas, tx + (float.r.x + ox) * z, ty + (float.r.y + oy) * z, float.r.w * z, float.r.h * z);
   if (tint) {
-    vctx.globalAlpha = z >= 6 ? 0.28 : 0.4;
+    vctx.globalAlpha = z >= 6 ? 0.2 : 0.3;
     vctx.drawImage(tint, tx + (sel.x0 + ox) * z, ty + (sel.y0 + oy) * z, tint.width * z, tint.height * z);
     vctx.globalAlpha = 1;
   }
@@ -365,7 +466,7 @@ function draw() {
     for (let y = gy0; y <= gy1; y++) { const Y = Math.round(ty + y * z) + 0.5; vctx.moveTo(Math.max(tx, 0), Y); vctx.lineTo(Math.min(tx + iw, cw), Y); }
     vctx.stroke();
   }
-  if (selList && z < 6) {   // small selections stay visible when pixels are smaller than a few screen dots
+  if (selList && z < 3 && sel.n <= 1500) {   // small selections stay visible when pixels are smaller than a few screen dots
     const s2 = Math.max(z, 6);
     vctx.lineWidth = 1.5;
     for (let k = 0; k < selList.length; k += 2) {
@@ -406,6 +507,7 @@ function sync() {
   $('#zv').textContent = loaded ? (z >= 1 ? Math.round(z * 100) + '%' : (z * 100).toFixed(z < 0.1 ? 1 : 0) + '%') : '–';
   $('#undo').disabled = !hist.length || !!float; $('#redo').disabled = !future.length || !!float;
   $('#del').disabled = !sel.n; $('#none').disabled = !sel.n;
+  if (!$('#rpop').hidden) syncRandom();
   $('#selinfo').textContent = sel.n ? `${sel.n.toLocaleString()} selected · ${sel.x1 - sel.x0 + 1}×${sel.y1 - sel.y0 + 1}` : '';
 }
 function showHover() {
@@ -428,6 +530,7 @@ view.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   const [x, y] = toImg(cx, cy);
   if (tool === 'fill') { drag = { mode: 'fill', filled: [], last: [x, y] }; paint(x, y, drag.filled); need(); return; }
+  if (tool === 'pick') { pickAt(x, y); return; }
   const mode = selMode(e);
   if (inside(x, y) && mask[y * W + x] && !heldMode(e) && modeBtn !== 'sub') { lift(); drag = { mode: 'move', cx, cy }; sync(); need(); return; }
   drag = { mode: 'pick', cx, cy, a: [x, y], b: [x, y], sel: mode };
@@ -514,14 +617,14 @@ window.addEventListener('keydown', (e) => {
   const step = e.shiftKey ? 10 : 1;
   const arrows = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
   if (arrows[e.key] && sel.n) { e.preventDefault(); nudge(...arrows[e.key]); return; }
-  if (k === 'v') setTool('select'); else if (k === 'h') setTool('hand'); else if (k === 'f') setTool('fill'); else if (k === '0') fit();
+  if (k === 'v') setTool('select'); else if (k === 'h') setTool('hand'); else if (k === 'f') setTool('fill'); else if (k === 'i') setTool('pick'); else if (k === '0') fit();
   else if (k === '+' || k === '=') zoomAt(z * 1.5, stage.clientWidth / 2, stage.clientHeight / 2);
   else if (k === '-') zoomAt(z / 1.5, stage.clientWidth / 2, stage.clientHeight / 2);
 });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') { spaceDown = false; stage.classList.toggle('hand', tool === 'hand'); } });
 function setTool(t) {
   tool = t; document.querySelectorAll('#tools button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
-  stage.classList.toggle('hand', t === 'hand'); stage.classList.toggle('filling', t === 'fill');
+  stage.classList.toggle('hand', t === 'hand'); stage.classList.toggle('filling', t === 'fill'); stage.classList.toggle('picking', t === 'pick');
   $('#smode').hidden = t !== 'select'; $('#fopts').hidden = t !== 'fill';
   need();
 }
@@ -529,8 +632,19 @@ document.querySelectorAll('#tools button').forEach(b => b.addEventListener('clic
 function setModeBtn(m) { modeBtn = m; document.querySelectorAll('#smode button').forEach(b => b.classList.toggle('on', b.dataset.m === m)); need(); }
 document.querySelectorAll('#smode button').forEach(b => b.addEventListener('click', () => setModeBtn(b.dataset.m)));
 $('#brush').addEventListener('change', (e) => { brush = +e.target.value; need(); });
-$('#fsrc').addEventListener('change', (e) => { fillSrc = e.target.value; $('#fcol').hidden = fillSrc !== 'colour'; });
-$('#fcol').addEventListener('input', (e) => { fillCol = e.target.value; });
+$('#fsrc').addEventListener('change', (e) => { fillSrc = e.target.value; });
+$('#fcol').addEventListener('input', (e) => { fillCol = e.target.value; renderSwatches(); });
+$('#fcol').addEventListener('change', (e) => addSwatch(e.target.value));
+$('#swarea').addEventListener('click', swatchesFromArea);
+$('#swclear').addEventListener('click', () => { swatches = []; saveSwatches(); });
+$('#rnd').addEventListener('click', () => { const p = $('#rpop'); p.hidden = !p.hidden; syncRandom(); });
+$('#ramt').addEventListener('input', (e) => { rx.amt = +e.target.value; syncRandom(); });
+$('#rdel').addEventListener('input', (e) => { rx.del = +e.target.value; syncRandom(); });
+$('#rsrc').addEventListener('change', (e) => { rx.src = e.target.value; syncRandom(); });
+$('#rreach').addEventListener('input', (e) => { rx.reach = +e.target.value; syncRandom(); });
+$('#rapply').addEventListener('click', randomize);
+$('#rroll').addEventListener('click', reroll);
+document.addEventListener('pointerdown', (e) => { if (!$('#rpop').hidden && !e.target.closest('#rpop, #rnd')) $('#rpop').hidden = true; });
 $('#fillholes').addEventListener('click', fillHoles);
 
 /* ---------------- buttons, files ---------------- */
@@ -642,4 +756,4 @@ async function save() {
 }
 
 /* ---------------- go ---------------- */
-syncX(); resize(); sync();
+syncX(); renderSwatches(); syncRandom(); resize(); sync();

@@ -9,9 +9,11 @@ Live: **https://sunnq3.github.io/ie2/pixels/**
 - **Click** a pixel to select it. Hold **A** (or turn on **Add**) to add, hold **X** (or **Remove**) to remove. Shift / Alt work too where the browser allows.
 - **Drag on empty space** to box-select (Shift / Alt work here too).
 - **Drag a selection** to move it. It leaves transparent holes behind and covers whatever it lands on.
+- **Pick** (I): click the image to take a colour into the swatches. **From area** fills the swatches with the main colours of the selection (or the whole image); click a swatch to use it, right-click to remove it.
+- **Randomize…**: in the selection (or the whole image), a random share of pixels (*Amount*) is changed; of those, *Deleted* become empty and the rest take a colour from a random pixel within *Reach*, from the swatches, or both. **Re-roll** replaces the last result with new dice; Undo restores the original.
 - **Arrow keys** nudge the selection by 1 px (Shift: 10 px).
 - **Delete** removes the selected pixels, leaving holes.
-- **Fill** (F): click or paint over empty pixels to fill them from the surrounding colours or with a chosen colour; existing pixels are never painted over. **Fill holes** fills every empty pixel in the selection, or the whole image, from the outside in.
+- **Fill** (F): click or paint over empty pixels to fill them from the surrounding colours, the current colour, or random swatches; existing pixels are never painted over. **Fill holes** fills every empty pixel in the selection, or the whole image, from the outside in.
 - **Undo / redo** with Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z.
 - **Zoom and pan:** the wheel zooms, Space or the Hand tool pans, 0 fits. The pixel grid appears from 800%.
 - **Export:**
