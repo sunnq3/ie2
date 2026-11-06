@@ -241,6 +241,72 @@ void main() {
 void main() { vec3 a = toYcc(px(ivec2(P()))), b = toYcc(texture(u_b, UV()).rgb); o = vec4(fromYcc(vec3(a.x, mix(a.yz, b.yz, u_k))), 1.); }`,
 
   /* ---------------- processing (display) ---------------- */
+  // Re-grain. 1) a smooth base: edge-preserving average of brightness, colour from a blurred copy
+  // (a pixel with fewer than two similar neighbours — a hot pixel — is judged by its neighbours, so it is removed;
+  //  colour is averaged with the same edge-aware weights from a pre-blurred copy)
+  gtBase: `uniform sampler2D u_c; uniform int u_r; uniform float u_sr;
+void main() {
+  ivec2 i = ivec2(P()), mx = ivec2(u_srcRes) - 1; float c0 = luma(px(i)), m8 = 0.; int close = 0;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    if (x == 0 && y == 0) continue;
+    float v = luma(px(i + ivec2(x, y))); m8 += v; if (abs(v - c0) < 2. * u_sr) close++;
+  }
+  float g = close >= 2 ? c0 : m8 / 8.;
+  float s = 0., ws = 0., a = 1. / (2. * u_sr * u_sr), sd = max(.6 * float(u_r), .7), ss = 1. / (2. * sd * sd); vec2 cs = vec2(0.);
+  for (int y = -5; y <= 5; y++) for (int x = -5; x <= 5; x++) {
+    if (abs(x) > u_r || abs(y) > u_r) continue;
+    ivec2 j = i + ivec2(x, y);
+    float v = luma(px(j)), d = v - g, w = exp(-float(x * x + y * y) * ss - d * d * a);
+    s += w * v; cs += w * toYcc(texelFetch(u_c, clamp(j, ivec2(0), mx), 0).rgb).yz; ws += w;
+  }
+  o = vec4(fromYcc(vec3(s / ws, cs / ws)), 1.);
+}`,
+  // 2) what the smoothing took away (YCbCr), optionally without the 8x8 block steps of a JPEG
+  gtRes: `uniform sampler2D u_b; uniform float u_db;
+vec3 R(ivec2 i) { ivec2 j = clamp(i, ivec2(0), ivec2(u_srcRes) - 1); return toYcc(texelFetch(u_src, j, 0).rgb) - toYcc(texelFetch(u_b, j, 0).rgb); }
+void main() {
+  ivec2 i = ivec2(P()); vec3 r = R(i);
+  if (u_db > .5) { ivec2 b = i - (i & 7); vec3 m = vec3(0.); for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) m += R(b + ivec2(x, y)); r -= m / 64.; }
+  o = vec4(r, 1.);
+}`,
+  gtSq: `void main() { vec3 r = texelFetch(u_src, ivec2(P()), 0).rgb; o = vec4(r.x * r.x, .5 * (r.y * r.y + r.z * r.z), 0., 1.); }`,
+  gtNoise: `void main() { vec2 p = P(); o = vec4(gss(p, 131.), gss(p, 137.), gss(p, 139.), 1.); }`,
+  // per-cell residual level and brightness, read back to build the image's noise-vs-brightness curve
+  cellStats: `uniform sampler2D u_b; uniform int u_f;
+void main() { ivec2 b = ivec2(P()) * u_f, mx = ivec2(u_srcRes) - 1; vec2 v = vec2(0.); float l = 0., n = 0.;
+  for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) if (x < u_f && y < u_f) { ivec2 j = min(b + ivec2(x, y), mx); v += texelFetch(u_src, j, 0).rg; l += luma(texelFetch(u_b, j, 0).rgb); n += 1.; }
+  o = vec4(v / n, l / n, 1.); }`,
+  // 3) put back: detail where there are edges / texture, grain (own, reshaped, or a matched fresh pattern) elsewhere
+  gtMix: `uniform sampler2D u_r, u_v, u_g, u_vg, u_n, u_vn;
+uniform float u_det, u_gr, u_luma, u_sh, u_fresh, u_floor, u_es, u_ny[16], u_nc[16];
+float curve(float y, float a[16]) { float f = clamp(y, 0., 1.) * 15.; int k = min(int(f), 14); return mix(a[k], a[k + 1], f - float(k)); }
+void main() {
+  ivec2 i = ivec2(P()), mx = ivec2(u_res) - 1; vec2 uv = UV();
+  vec3 b = toYcc(px(i)), R = texelFetch(u_r, i, 0).rgb;
+  vec2 V = max(texture(u_v, uv).rg, 1e-10), Vg = max(texture(u_vg, uv).rg, 1e-10);
+  vec2 NF = max(vec2(curve(b.x, u_ny), curve(b.x, u_nc)), 1e-10);       // noise expected at this brightness
+  float sn = sqrt(NF.x), snc = sqrt(NF.y);                                // the image's noise level here
+  // a lone spike with quiet neighbours is a hot pixel, not detail
+  int loud = 0;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) if ((x != 0 || y != 0) && abs(texelFetch(u_r, clamp(i + ivec2(x, y), ivec2(0), mx), 0).r) > 2. * sn) loud++;
+  if (abs(R.x) > 4. * sn && loud == 0) R = vec3(0.);
+  // detail = edges in the smooth base, or residual well above the noise level (texture, fine type)
+  float gx = luma(px(i + ivec2(1, 0))) - luma(px(i - ivec2(1, 0))), gy = luma(px(i + ivec2(0, 1))) - luma(px(i - ivec2(0, 1)));
+  float t0 = mix(.05, .008, u_es), eg = smoothstep(t0, t0 * 3., .5 * length(vec2(gx, gy)));
+  float lo = mix(4., 1.6, u_es), et = smoothstep(lo, 2. * lo, V.x / NF.x), ep = smoothstep(mix(5., 2.5, u_es), mix(7., 3.5, u_es), abs(R.x) / sn);
+  float e = max(eg, max(et, ep));
+  // grain: the residual reshaped (size) and held to the noise level; or a fresh pattern at that level
+  float sg = min(sqrt(V.x), 1.5 * sn), sgc = min(sqrt(V.y), 1.5 * snc);
+  vec3 G = texelFetch(u_g, i, 0).rgb * vec3(sqrt(V.x / Vg.x), sqrt(V.y / Vg.y), sqrt(V.y / Vg.y));
+  G = clamp(G, -2.5 * vec3(sg, sgc, sgc), 2.5 * vec3(sg, sgc, sgc));
+  vec3 N = texelFetch(u_n, i, 0).rgb / sqrt(max(texture(u_vn, uv).rgr, 1e-9));
+  float fl = u_floor * .03;
+  vec3 grain = u_fresh > .5 ? N * vec3(max(sn, fl), max(snc, .5 * fl), max(snc, .5 * fl))
+                            : G + N * vec3(sqrt(max(fl * fl - NF.x, 0.)), sqrt(max(.25 * fl * fl - NF.y, 0.)), sqrt(max(.25 * fl * fl - NF.y, 0.)));
+  float y = clamp(b.x, 0., 1.), shade = mix(1., .3 + 1.5 * (1. - smoothstep(.08, .95, y)) * smoothstep(0., .12, y + .02), u_sh);
+  vec3 add = u_det * e * R + u_gr * (1. - e) * shade * grain * vec3(1., 1. - u_luma, 1. - u_luma);
+  o = vec4(fromYcc(b + add), 1.);
+}`,
   ghost: `uniform float u_k, u_dx, u_dy, u_patch;
 void main() {
   vec2 p = P(); vec3 a = lin(at(p)), b = lin(at(p - vec2(u_dx, u_dy)));
@@ -595,6 +661,49 @@ const EFFECTS = [
     } },
 
   /* ---------------- processing */
+  { id: 'regrain', group: 'proc', name: 'Re-grain',
+    info: 'Strong noise reduction, then the photo’s own grain and detail added back in measured amounts: crisp and clean, with grain that looks like the camera’s. Clean photos get a matched grain.',
+    params: [range('smooth', 'Smoothing', 0, 1, 0.01, 0.6, '', { real: [0.2, 0.9] }),
+      range('detail', 'Detail back', 0, 1.5, 0.01, 1, '', { real: [0.6, 1.2] }),
+      range('grain', 'Grain back', 0, 1.5, 0.01, 0.45, '', { real: [0, 1], amt: true }),
+      pick('colour', 'Grain colour', [['luma', 'Brightness only (film-like)'], ['full', 'With colour']], 'luma'),
+      range('size', 'Grain size', 1, 3, 0.05, 1.3, '×', { real: [1, 2] }),
+      range('shadows', 'Shadow bias', 0, 1, 0.01, 0.5),
+      pick('pattern', 'Pattern', [['own', 'The photo’s own'], ['fresh', 'Fresh, matched to it']], 'own'),
+      range('floor', 'Grain if clean', 0, 1, 0.01, 0.2, '', { adv: true, real: [0, 0.6] }),
+      range('edge', 'Edge sensitivity', 0, 1, 0.01, 0.3, '', { adv: true }),
+      toggle('deblock', 'Leave JPEG blocks out of the grain', true, { adv: true })],
+    run(c, s, p) {
+      const r = Math.min(5, 2 + Math.round(4 * p.smooth)), sr = 0.012 + 0.13 * p.smooth;
+      let base = c.pass(S.gtBase, s, { u_r: { i: r }, u_sr: sr }, { tex: { u_c: c.blur(s, 1 + 3 * p.smooth) } });
+      for (const k of [0.8, 0.65]) base = c.pass(S.gtBase, base, { u_r: { i: r }, u_sr: sr * k }, { tex: { u_c: base } });
+      const R = c.pass(S.gtRes, s, { u_db: p.deblock }, { tex: { u_b: base }, fmt: 'f32' });
+      const Q = c.pass(S.gtSq, R, {}, { fmt: 'f32' });
+      const V = c.blur(Q, 3);
+      // noise-vs-brightness curve: in 16 brightness bins, the quieter quarter of cells is taken as pure noise
+      const cell = Math.min(16, Math.max(4, Math.round(Math.min(s.w, s.h) / 150)));
+      const cs = c.read(c.pass(S.cellStats, V, { u_f: { i: cell } }, { w: Math.ceil(s.w / cell), h: Math.ceil(s.h / cell), fmt: 'f32', tex: { u_b: base } }));
+      const bins = Array.from({ length: 16 }, () => [[], []]);
+      for (let k = 0; k < cs.length; k += 4) { const b = bins[Math.min(15, Math.max(0, Math.round(cs[k + 2] * 15)))]; b[0].push(cs[k]); b[1].push(cs[k + 1]); }
+      const pct = (a) => { a.sort((x, y) => x - y); return a[Math.floor(a.length * 0.25)]; };
+      const ny = new Float32Array(16).fill(-1), nc = new Float32Array(16).fill(-1);
+      bins.forEach((b, k) => { if (b[0].length >= 6) { ny[k] = pct(b[0]); nc[k] = pct(b[1]); } });
+      for (const a of [ny, nc]) {                 // fill brightness levels the photo doesn't have from their neighbours
+        const have = [...a.keys()].filter(k => a[k] >= 0);
+        for (let k = 0; k < 16; k++) if (a[k] < 0) {
+          if (!have.length) { a[k] = 0; continue; }
+          const lo = have.filter(h => h < k).pop(), hi = have.find(h => h > k);
+          a[k] = lo === undefined ? a[hi] : hi === undefined ? a[lo] : a[lo] + (a[hi] - a[lo]) * (k - lo) / (hi - lo);
+        }
+      }
+      let G = R, Vg = V;
+      if (p.size > 1.02) { G = c.blur(R, 0.6 * (p.size - 1)); Vg = c.blur(c.pass(S.gtSq, G, {}, { fmt: 'f32' }), 3); }
+      let N = c.pass(S.gtNoise, s, {}, { fmt: 'f32' });
+      N = c.blur(N, 0.45 + 0.35 * (p.size - 1));
+      const Vn = c.blur(c.pass(S.gtSq, N, {}, { fmt: 'f32' }), 3);
+      return c.pass(S.gtMix, base, { u_det: p.detail, u_gr: p.grain, u_luma: p.colour === 'luma', u_sh: p.shadows, u_fresh: p.pattern === 'fresh',
+        u_floor: p.floor, u_es: p.edge, u_ny: ny, u_nc: nc }, { tex: { u_r: R, u_v: V, u_g: G, u_vg: Vg, u_n: N, u_vn: Vn } });
+    } },
   { id: 'ghost', group: 'proc', name: 'HDR ghosting',
     info: 'A multi-frame merge leaves a semi-transparent duplicate, whole or in patchy de-ghosting seams.',
     params: [range('opacity', 'Opacity', 0, 1, 0.01, 0.3, '', { real: [0, 0.5], amt: true }), range('dx', 'Offset X', -40, 40, 0.1, 5, '‰'), range('dy', 'Offset Y', -40, 40, 0.1, 1, '‰'),

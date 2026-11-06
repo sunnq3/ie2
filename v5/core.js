@@ -403,17 +403,18 @@ void main() {
     }
     // Gaussian blur. Wide radii run on a box-downsampled copy (sampled back with bilinear filtering),
     // so the cost stays flat whatever the radius. axis: 'xy' | 'x' | 'y'.
-    function blur(t, sigma, axis = 'xy') {
+    function blur(t, sigma, axis = 'xy', fmt) {
       if (!(sigma > 0.25)) return t;
+      const F = fmt || (t.fmt === 'f32' ? 'f32' : 'f16');
       const f = sigma > 5 ? Math.min(32, Math.floor(sigma / 2.5)) : 1;
       const fx = axis === 'y' ? 1 : f, fy = axis === 'x' ? 1 : f;
       let s = t;
-      if (f > 1) s = pass(SH.down, t, { u_f: { i: [fx, fy] } }, { w: Math.ceil(t.w / fx), h: Math.ceil(t.h / fy) });
+      if (f > 1) s = pass(SH.down, t, { u_f: { i: [fx, fy] } }, { w: Math.ceil(t.w / fx), h: Math.ceil(t.h / fy), fmt: F });
       const sg = (k) => Math.sqrt(Math.max(0.04, (sigma / k) ** 2 - (k > 1 ? 1 / 12 : 0)));
-      if (axis !== 'y') s = pass(SH.gauss, s, { u_dir: { i: [1, 0] }, u_sig: sg(fx) });
-      if (axis !== 'x') s = pass(SH.gauss, s, { u_dir: { i: [0, 1] }, u_sig: sg(fy) });
-      if (s.w !== t.w || s.h !== t.h) s = pass(SH.rs, pass(SH.rs, s, { u_axis: { i: 0 }, u_kern: { i: 1 }, u_scale: t.w / s.w, u_off: 0 }, { w: t.w, h: s.h }),
-        { u_axis: { i: 1 }, u_kern: { i: 1 }, u_scale: t.h / s.h, u_off: 0 }, { w: t.w, h: t.h });
+      if (axis !== 'y') s = pass(SH.gauss, s, { u_dir: { i: [1, 0] }, u_sig: sg(fx) }, { fmt: F });
+      if (axis !== 'x') s = pass(SH.gauss, s, { u_dir: { i: [0, 1] }, u_sig: sg(fy) }, { fmt: F });
+      if (s.w !== t.w || s.h !== t.h) s = pass(SH.rs, pass(SH.rs, s, { u_axis: { i: 0 }, u_kern: { i: 1 }, u_scale: t.w / s.w, u_off: 0 }, { w: t.w, h: s.h, fmt: F }),
+        { u_axis: { i: 1 }, u_kern: { i: 1 }, u_scale: t.h / s.h, u_off: 0 }, { w: t.w, h: t.h, fmt: F });
       return s;
     }
     // Resize with a named kernel (see KERN). 'halve' = repeated 2x box then a cheap final step.
@@ -600,6 +601,7 @@ void main() {
       return {
         W, H, diag: Math.hypot(W, H), short: Math.min(W, H), hr, knee, k: opts.k == null ? 1 : +opts.k, seed,
         pass, blur, get, put, resize, unsharp, jpegSim, scoped,
+        read: (t) => readFloat(t, 0, 0, t.w, t.h),
         q8: (t, dither) => pass(SH.q8, t, { u_dither: dither ? 1 : 0 }),
         toScene: (t) => pass(SH.toScene, t, { u_hr: hr, u_knee: knee }),
         toDisp: (t) => pass(SH.toDisp, t, { u_hr: hr, u_knee: knee }),

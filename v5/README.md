@@ -20,7 +20,7 @@ Live: **https://sunnq3.github.io/ie2/v5/**
 
 - **Lens:** highlight recovery, chromatic aberration (lateral, with spectral spread), out-of-focus colour fringes (purple in front, green behind, detected from the image), purple fringing, coma, veiling glare & ghost reflections, film halation, vignetting, colour shading, corner softness, distortion (auto-filled frame), camera shake, missed focus.
 - **Sensor & camera:** sensor dust, rolling shutter, CCD smear & blooming, Camera.
-- **Processing:** HDR ghosting, lens-profile correction, noise-reduction smear, chroma blotches, tone-mapping halos, over-sharpening.
+- **Processing:** Re-grain (strong noise reduction, then the photo's own grain and detail added back separately: detail where there are edges or texture, grain held to the image's measured noise-vs-brightness curve, brightness-only or with colour, resizable, own pattern or a fresh matched one, faint matched grain for clean photos), HDR ghosting, lens-profile correction, noise-reduction smear, chroma blotches, tone-mapping halos, over-sharpening.
 - **Compression & sharing:**
   - **Re-share:** shrink to a real sharing size (with a choice of real-world scalers), platform sharpening, 8-bit rounding, JPEG at the small size, then enlarge as a viewer does. Optional generations, half-pixel offset errors and gamma-incorrect resizing. *Keep detail* stops it turning into blur.
   - Also: JPEG compression (real 8×8 DCT, chroma subsampling, generations), banding, datamosh.
