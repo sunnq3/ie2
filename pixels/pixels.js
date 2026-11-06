@@ -25,6 +25,10 @@ const hist = [], future = []; let histBytes = 0;
 /* ---------------- view state ---------------- */
 const stage = $('#stage'), view = $('#view'), vctx = view.getContext('2d');
 let z = 1, tx = 0, ty = 0, dpr = 1, tool = 'select', spaceDown = false, drag = null, hover = null, frameReq = 0;
+let mods = { shift: false, alt: false, ctrl: false };       // held modifier keys, shown on screen
+let selList = null;                                         // coordinates of small selections, drawn as markers
+const selMode = (e) => e.shiftKey ? 'add' : e.altKey ? 'sub' : (e.ctrlKey || e.metaKey) ? 'toggle' : 'replace';
+const MODE_LABEL = { add: '+ add', sub: '− remove', toggle: '± toggle' };
 
 const say = (t, err) => { const s = $('#status'); s.textContent = t; s.classList.toggle('err', !!err); };
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -86,19 +90,22 @@ function rescan(x0 = 0, y0 = 0, x1 = W - 1, y1 = H - 1, full = true) {
   buildTint(); sync();
 }
 function buildTint() {
+  selList = null;
   if (!sel.n) { tint = null; return; }
+  if (sel.n <= 4000) selList = [];
   const w = sel.x1 - sel.x0 + 1, h = sel.y1 - sel.y0 + 1;
   const c = tint && tint.width === w && tint.height === h ? tint : Object.assign(document.createElement('canvas'), { width: w, height: h });
   const t = c.getContext('2d'), id = t.createImageData(w, h), d = id.data;
   for (let y = 0; y < h; y++) {
     const row = (sel.y0 + y) * W + sel.x0;
-    for (let x = 0; x < w; x++) if (mask[row + x]) { const i = (y * w + x) * 4; d[i] = ACC[0]; d[i + 1] = ACC[1]; d[i + 2] = ACC[2]; d[i + 3] = 255; }
+    for (let x = 0; x < w; x++) if (mask[row + x]) { const i = (y * w + x) * 4; d[i] = ACC[0]; d[i + 1] = ACC[1]; d[i + 2] = ACC[2]; d[i + 3] = 255; if (selList) selList.push(sel.x0 + x, sel.y0 + y); }
   }
   t.putImageData(id, 0, 0); tint = c;
 }
 function setRect(x0, y0, x1, y1, mode) {
   // mode: 'replace' | 'add' | 'sub'
   x0 = clamp(x0, 0, W - 1); y0 = clamp(y0, 0, H - 1); x1 = clamp(x1, 0, W - 1); y1 = clamp(y1, 0, H - 1);
+  if (mode === 'toggle') { for (let y = y0; y <= y1; y++) for (let i = y * W + x0; i <= y * W + x1; i++) mask[i] ^= 1; rescan(); return; }
   if (mode === 'replace') clearSel(false);
   const v = mode === 'sub' ? 0 : 1;
   for (let y = y0; y <= y1; y++) mask.fill(v, y * W + x0, y * W + x1 + 1);
@@ -110,7 +117,7 @@ function setRect(x0, y0, x1, y1, mode) {
 }
 function clearSel(update = true) {
   if (sel.n) for (let y = sel.y0; y <= sel.y1; y++) mask.fill(0, y * W + sel.x0, y * W + sel.x1 + 1);
-  sel.n = 0; sel.x1 = sel.y1 = -1; tint = null;
+  sel.n = 0; sel.x1 = sel.y1 = -1; tint = null; selList = null;
   if (update) { sync(); need(); }
 }
 function selectAll() { if (!loaded) return; mask.fill(1); sel.n = W * H; sel.x0 = 0; sel.y0 = 0; sel.x1 = W - 1; sel.y1 = H - 1; buildTint(); sync(); need(); }
@@ -259,6 +266,15 @@ function draw() {
     for (let y = gy0; y <= gy1; y++) { const Y = Math.round(ty + y * z) + 0.5; vctx.moveTo(Math.max(tx, 0), Y); vctx.lineTo(Math.min(tx + iw, cw), Y); }
     vctx.stroke();
   }
+  if (selList && z < 6) {   // small selections stay visible when pixels are smaller than a few screen dots
+    const s2 = Math.max(z, 6);
+    vctx.lineWidth = 1.5;
+    for (let k = 0; k < selList.length; k += 2) {
+      const X = tx + (selList[k] + ox + 0.5) * z - s2 / 2, Y = ty + (selList[k + 1] + oy + 0.5) * z - s2 / 2;
+      vctx.strokeStyle = '#fff'; vctx.strokeRect(X - 1, Y - 1, s2 + 2, s2 + 2);
+      vctx.strokeStyle = 'rgb(' + ACC.join(',') + ')'; vctx.strokeRect(X, Y, s2, s2);
+    }
+  }
   if (sel.n) {   // selection bounds
     vctx.setLineDash([5, 4]); vctx.strokeStyle = 'rgb(' + ACC.join(',') + ')'; vctx.lineWidth = 1.5;
     vctx.strokeRect(tx + (sel.x0 + ox) * z - 1, ty + (sel.y0 + oy) * z - 1, (sel.x1 - sel.x0 + 1) * z + 2, (sel.y1 - sel.y0 + 1) * z + 2);
@@ -266,6 +282,13 @@ function draw() {
   }
   if (hover && !drag && inside(hover[0], hover[1]) && z >= 4) {   // pixel under the cursor
     vctx.strokeStyle = '#fff'; vctx.lineWidth = 1.5; vctx.strokeRect(tx + hover[0] * z + 0.5, ty + hover[1] * z + 0.5, z - 1, z - 1);
+  }
+  const ml = MODE_LABEL[mods.shift ? 'add' : mods.alt ? 'sub' : mods.ctrl ? 'toggle' : ''];
+  if (ml && hover && tool === 'select' && !spaceDown) {
+    const hx = tx + (hover[0] + 1) * z + 10, hy = ty + (hover[1] + 1) * z + 10;
+    vctx.font = '600 11px "IBM Plex Mono", monospace'; const tw = vctx.measureText(ml).width;
+    vctx.fillStyle = 'rgba(27,26,23,.9)'; vctx.fillRect(hx, hy, tw + 10, 18);
+    vctx.fillStyle = '#fff'; vctx.fillText(ml, hx + 5, hy + 13);
   }
   if (drag && drag.mode === 'box') {
     const [a, b] = [drag.a, drag.b];
@@ -298,7 +321,7 @@ view.addEventListener('pointerdown', (e) => {
   if (tool === 'hand' || spaceDown || e.button === 1 || e.button === 2) { drag = { mode: 'pan', cx, cy, tx, ty }; stage.classList.add('panning'); return; }
   if (e.button !== 0) return;
   const [x, y] = toImg(cx, cy);
-  const mode = e.shiftKey ? 'add' : e.altKey ? 'sub' : 'replace';
+  const mode = selMode(e);
   if (inside(x, y) && mask[y * W + x] && mode === 'replace') { lift(); drag = { mode: 'move', cx, cy }; sync(); need(); return; }
   drag = { mode: 'pick', cx, cy, a: [x, y], b: [x, y], sel: mode };
 });
@@ -306,16 +329,23 @@ view.addEventListener('pointermove', (e) => {
   const [cx, cy] = pos(e);
   if (!drag) { hover = loaded ? toImg(cx, cy) : null; showHover(); stage.classList.toggle('over-sel', !!(hover && inside(...hover) && mask[hover[1] * W + hover[0]] && tool === 'select' && !spaceDown)); need(); return; }
   if (drag.mode === 'pan') { tx = drag.tx + cx - drag.cx; ty = drag.ty + cy - drag.cy; need(); return; }
-  if (drag.mode === 'move') { float.dx = Math.round((cx - drag.cx) / z); float.dy = Math.round((cy - drag.cy) / z); $('#status').textContent = `moving ${float.dx}, ${float.dy}`; need(); return; }
+  if (drag.mode === 'move') { moveTo(cx, cy, e.shiftKey); $('#status').textContent = `moving ${float.dx}, ${float.dy}` + (e.shiftKey ? ' · straight' : ''); need(); return; }
   if (drag.mode === 'pick' && Math.hypot(cx - drag.cx, cy - drag.cy) > 3) drag.mode = 'box';
   if (drag.mode === 'box') { drag.b = toImg(cx, cy); need(); }
 });
+// Shift while moving keeps the move straight (horizontal or vertical)
+function moveTo(cx, cy, straight) {
+  let dx = Math.round((cx - drag.cx) / z), dy = Math.round((cy - drag.cy) / z);
+  if (straight) { if (Math.abs(dx) >= Math.abs(dy)) dy = 0; else dx = 0; }
+  float.dx = dx; float.dy = dy;
+}
 function endDrag(e) {
   if (!drag) return;
-  if (e && e.type === 'pointerup') {   // take the release point too, in case no move arrived after the last one
+  if (e && e.type === 'pointerup') {   // take the release point and the keys held at release too
     const [cx, cy] = pos(e);
-    if (drag.mode === 'move' && float) { float.dx = Math.round((cx - drag.cx) / z); float.dy = Math.round((cy - drag.cy) / z); }
+    if (drag.mode === 'move' && float) moveTo(cx, cy, e.shiftKey);
     if (drag.mode === 'box' || (drag.mode === 'pick' && Math.hypot(cx - drag.cx, cy - drag.cy) > 3)) { drag.mode = 'box'; drag.b = toImg(cx, cy); }
+    const m = selMode(e); if (m !== 'replace' && drag.sel) drag.sel = m;
   }
   const d = drag; drag = null; stage.classList.remove('panning');
   if (d.mode === 'move') drop(float ? float.dx : 0, float ? float.dy : 0);
@@ -340,6 +370,19 @@ view.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 /* ---------------- keyboard ---------------- */
+function trackMods(e) {
+  const m = { shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey };
+  if (m.shift !== mods.shift || m.alt !== mods.alt || m.ctrl !== mods.ctrl) {
+    mods = m;
+    const l = MODE_LABEL[m.shift ? 'add' : m.alt ? 'sub' : m.ctrl ? 'toggle' : ''];
+    if (loaded && !drag) say(l ? `${l}: click or drag to ${m.shift ? 'add to' : m.alt ? 'remove from' : 'toggle in'} the selection` + (m.shift ? ' · Shift while dragging a selection moves it straight' : '') : 'ready');
+    need();
+  }
+}
+window.addEventListener('keydown', trackMods, true);
+window.addEventListener('keyup', trackMods, true);
+window.addEventListener('blur', () => { mods = { shift: false, alt: false, ctrl: false }; need(); });
+view.addEventListener('pointermove', trackMods);
 window.addEventListener('keydown', (e) => {
   if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
   const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();

@@ -110,8 +110,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <p>Select pixels, drag them anywhere, delete them, undo anything. Zoom in to see each one. Nothing is uploaded.</p>
       <div class="row"><button class="b go" id="open2" type="button">Open an image</button><button class="b" id="sample" type="button">Use a sample</button></div>
       <dl>
-        <dt>click</dt><dd>select one pixel (Shift adds, Alt removes)</dd>
-        <dt>drag</dt><dd>box-select; drag a selection to move it</dd>
+        <dt>click</dt><dd>select one pixel (Shift adds, Alt removes, Ctrl/Cmd toggles)</dd>
+        <dt>drag</dt><dd>box-select; drag a selection to move it (Shift keeps it straight)</dd>
         <dt>arrows</dt><dd>nudge by 1 px (Shift: 10)</dd>
         <dt>Delete</dt><dd>remove selected pixels (leaves holes)</dd>
         <dt>wheel / Space</dt><dd>zoom / pan</dd>
@@ -121,14 +121,14 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
 </section>
 
 <footer class="foot">
-  <span class="hint">Click: select · Shift: add · Alt: remove · drag empty area: box · drag selection: move · arrows: nudge</span>
+  <span class="hint">Click: select · Shift: add · Alt: remove · Ctrl/Cmd: toggle · drag empty area: box · drag selection: move (Shift: straight) · arrows: nudge</span>
   <span id="hover"></span>
   <span id="selinfo"></span>
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=12"></script>
-<script src="../v5/export.js?b=12"></script>
-<script src="pixels.js?b=12"></script>
+<script src="../v5/core.js?b=13"></script>
+<script src="../v5/export.js?b=13"></script>
+<script src="pixels.js?b=13"></script>
 </body>
 </html>
