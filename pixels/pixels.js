@@ -61,7 +61,7 @@ function setImage(src, w0, h0, nm) {
   name = nm; loaded = true;
   $('#meta').textContent = `${nm} · ${W}×${H}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
   $('#drop').classList.add('gone');
-  ['#save', '#all', '#fillholes', '#swarea', '#rnd'].forEach(s => { $(s).disabled = false; });
+  ['#save', '#all', '#fillholes', '#swarea', '#rnd', '#fb'].forEach(s => { $(s).disabled = false; });
   sync(); fit(); say('ready');
 }
 function sample() {
@@ -368,6 +368,44 @@ function syncRandom() {
   try { localStorage.setItem('ie2.pixels.random', JSON.stringify(rx)); } catch (e) { /* ignore */ }
 }
 
+// onion peel: each round fills the holes touching real pixels with the average of those neighbours.
+// Returns how many holes had nothing around to borrow from.
+function peel(hole, n) {
+  const touches = (i) => { const x = i % W, y = (i / W) | 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if ((dx || dy) && X >= 0 && Y >= 0 && X < W && Y < H) { const j = Y * W + X; if (!hole[j] && !isEmpty(j)) return true; } } return false; };
+  const queued = new Uint8Array(W * H);
+  let front = [];
+  for (let i = 0; i < hole.length; i++) if (hole[i] && touches(i)) { front.push(i); queued[i] = 1; }
+  let left = n;
+  while (front.length) {
+    const cols = new Uint32Array(front.length);
+    for (let k = 0; k < front.length; k++) {
+      const i = front[k], x = i % W, y = (i / W) | 0; let sr = 0, sg = 0, sb = 0, c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy; if (!(dx || dy) || X < 0 || Y < 0 || X >= W || Y >= H) continue;
+        const j = Y * W + X; if (hole[j] || isEmpty(j)) continue;
+        const o = j * 4; sr += data[o]; sg += data[o + 1]; sb += data[o + 2]; c++;
+      }
+      cols[k] = c ? pack(Math.round(sr / c), Math.round(sg / c), Math.round(sb / c)) : 0;
+    }
+    const next = [];
+    for (let k = 0; k < front.length; k++) if (cols[k]) { px32[front[k]] = cols[k]; hole[front[k]] = 0; left--; }
+    for (const i of front) {
+      const x = i % W, y = (i / W) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
+        const j = Y * W + X; if (hole[j] && !queued[j]) { queued[j] = 1; next.push(j); }
+      }
+    }
+    front = next;
+  }
+  return left;
+}
+// give every marked pixel a colour from the current fill source
+function fillMarked(hole, n) {
+  if (fillSrc === 'colour') { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; return; }
+  if (fillSrc === 'swatches') { for (let i = 0; i < hole.length; i++) if (hole[i]) { const c = randSwatch(); px32[i] = pack(c[0], c[1], c[2]); } return; }
+  if (peel(hole, n) > 0) { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }   // nothing around to borrow from
+}
 // fill every empty pixel in the selection (or the whole image) from the outside in
 function fillHoles() {
   if (!loaded || float) return;
@@ -376,41 +414,173 @@ function fillHoles() {
   for (let y = r.y; y < r.y + r.h; y++) for (let i = y * W + r.x, e = i + r.w; i < e; i++) if (isEmpty(i) && (!useSel || mask[i])) { hole[i] = 1; n++; }
   if (!n) { say(useSel ? 'no empty pixels in the selection' : 'no empty pixels to fill'); return; }
   const before = snap(r);
-  if (fillSrc === 'colour') { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }
-  else if (fillSrc === 'swatches') { for (let i = 0; i < hole.length; i++) if (hole[i]) { const c = randSwatch(); px32[i] = pack(c[0], c[1], c[2]); } }
-  else {
-    // onion peel: each round fills the holes touching filled pixels with the average of those neighbours
-    let front = [];
-    const touches = (i) => { const x = i % W, y = (i / W) | 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if ((dx || dy) && X >= 0 && Y >= 0 && X < W && Y < H) { const j = Y * W + X; if (!hole[j] && !isEmpty(j)) return true; } } return false; };
-    const queued = new Uint8Array(W * H);
-    for (let i = 0; i < hole.length; i++) if (hole[i] && touches(i)) { front.push(i); queued[i] = 1; }
-    let left = n;
-    while (front.length) {
-      const cols = new Uint32Array(front.length);
-      front.forEach((i, k) => {
-        const x = i % W, y = (i / W) | 0; let sr = 0, sg = 0, sb = 0, c = 0;
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          const X = x + dx, Y = y + dy; if (!(dx || dy) || X < 0 || Y < 0 || X >= W || Y >= H) continue;
-          const j = Y * W + X; if (hole[j] || isEmpty(j)) continue;
-          const o = j * 4; sr += data[o]; sg += data[o + 1]; sb += data[o + 2]; c++;
-        }
-        cols[k] = c ? pack(Math.round(sr / c), Math.round(sg / c), Math.round(sb / c)) : 0;
-      });
-      const next = [];
-      front.forEach((i, k) => { if (cols[k]) { px32[i] = cols[k]; hole[i] = 0; left--; } });
-      for (const i of front) {
-        const x = i % W, y = (i / W) | 0;
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
-          const j = Y * W + X; if (hole[j] && !queued[j]) { queued[j] = 1; next.push(j); }
-        }
-      }
-      front = next;
-    }
-    if (left > 0) { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }   // nothing around to borrow from
-  }
+  fillMarked(hole, n);
   record(r, before, snap(r), 'fill holes'); redraw(r); need();
   say(`filled ${n.toLocaleString()} empty pixel${n > 1 ? 's' : ''}` + (useSel ? ' in the selection' : ''));
+}
+// replace every selected pixel (empty or not) with colour rebuilt from around the selection
+function fillSel() {
+  if (!sel.n || float) return;
+  const r = bbox(), hole = new Uint8Array(W * H); let n = 0;
+  for (let y = r.y; y < r.y + r.h; y++) for (let i = y * W + r.x, e = i + r.w; i < e; i++) if (mask[i]) { hole[i] = 1; n++; }
+  const before = snap(r);
+  fillMarked(hole, n);
+  record(r, before, snap(r), 'fill selection'); redraw(r); need();
+  say(`refilled ${n.toLocaleString()} selected pixel${n > 1 ? 's' : ''} ` + (fillSrc === 'near' ? 'from their surroundings' : fillSrc === 'colour' ? 'with the current colour' : 'with random swatches'));
+}
+
+/* ---------------- smoothing ---------------- */
+// gaussian-like blur (three box passes) of the selected pixels; empty pixels neither change nor contribute
+function hbox(a, w, h, r, tmp) {
+  const d = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const o = y * w; let s = 0;
+    for (let k = -r; k <= r; k++) s += a[o + clamp(k, 0, w - 1)];
+    for (let x = 0; x < w; x++) { tmp[o + x] = s / d; s += a[o + Math.min(w - 1, x + r + 1)] - a[o + Math.max(0, x - r)]; }
+  }
+  a.set(tmp);
+}
+function vbox(a, w, h, r, tmp) {
+  const d = 2 * r + 1, s = new Float64Array(w);
+  for (let k = -r; k <= r; k++) { const o = clamp(k, 0, h - 1) * w; for (let x = 0; x < w; x++) s[x] += a[o + x]; }
+  for (let y = 0; y < h; y++) {
+    const o = y * w, add = Math.min(h - 1, y + r + 1) * w, sub = Math.max(0, y - r) * w;
+    for (let x = 0; x < w; x++) { tmp[o + x] = s[x] / d; s[x] += a[add + x] - a[sub + x]; }
+  }
+  a.set(tmp);
+}
+function smoothSel() {
+  if (!sel.n || float) return;
+  const sigma = fb.sigma, br = Math.max(1, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2)), M = 3 * br + 1;
+  const r = bbox(), before = snap(r), bp = before.pix;
+  const ax0 = Math.max(0, r.x - M), ax1 = Math.min(W, r.x + r.w + M), aw = ax1 - ax0;
+  const S = Math.max(32, Math.floor(4e6 / aw));
+  let n = 0;
+  for (let y0 = r.y; y0 < r.y + r.h; y0 += S) {
+    const y1 = Math.min(r.y + r.h, y0 + S), sy0 = Math.max(0, y0 - M), sy1 = Math.min(H, y1 + M), sh = sy1 - sy0, N = aw * sh;
+    const ch = [new Float32Array(N), new Float32Array(N), new Float32Array(N), new Float32Array(N)], tmp = new Float32Array(N);
+    for (let y = sy0; y < sy1; y++) {
+      const inRow = y >= r.y && y < r.y + r.h;
+      for (let x = ax0; x < ax1; x++) {
+        const k = (y - sy0) * aw + (x - ax0);
+        let o, src;
+        if (inRow && x >= r.x && x < r.x + r.w) { src = bp; o = ((y - r.y) * r.w + (x - r.x)) * 4; } else { src = data; o = (y * W + x) * 4; }
+        if (!src[o + 3]) continue;
+        ch[0][k] = src[o]; ch[1][k] = src[o + 1]; ch[2][k] = src[o + 2]; ch[3][k] = 1;
+      }
+    }
+    for (const a of ch) for (let p = 0; p < 3; p++) { hbox(a, aw, sh, br, tmp); vbox(a, aw, sh, br, tmp); }
+    for (let y = y0; y < y1; y++) for (let x = r.x; x < r.x + r.w; x++) {
+      const i = y * W + x; if (!mask[i] || !data[i * 4 + 3]) continue;
+      const k = (y - sy0) * aw + (x - ax0), wt = ch[3][k]; if (wt <= 1e-6) continue;
+      const o = i * 4; data[o] = ch[0][k] / wt; data[o + 1] = ch[1][k] / wt; data[o + 2] = ch[2][k] / wt; n++;
+    }
+  }
+  record(r, before, snap(r), 'smooth'); redraw(r); need();
+  say(`smoothed ${n.toLocaleString()} pixels (radius ${sigma} px)`);
+}
+
+/* ---------------- find JPEG blocks ---------------- */
+// JPEG works on an 8×8 grid. Damaged blocks show up as either
+//  - "stripes": a block whose detail is carried by one or a few strong high-frequency DCT patterns (barcode / checker looks), or
+//  - "flat steps": blocks with no detail inside that jump in brightness exactly at the block border (staircase look).
+const fb = { sens: 50, kind: 'both', grow: 1, within: false, sigma: 2 };
+try { Object.assign(fb, JSON.parse(localStorage.getItem('ie2.pixels.blocks') || '{}')); } catch (e) { /* ignore */ }
+const DB = (() => { const b = new Float32Array(64); for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) b[u * 8 + x] = (u ? 1 : Math.SQRT1_2) * 0.5 * Math.cos((2 * x + 1) * u * Math.PI / 16); return b; })();
+const lumAt = (o) => 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+// where the 8×8 grid sits: the column / row phase at which neighbouring pixels differ the most
+function blockGrid() {
+  const sx = new Float64Array(8), nx = new Float64Array(8), sy = new Float64Array(8), ny = new Float64Array(8);
+  const rs = Math.max(1, Math.floor(H / 500)), cs = Math.max(1, Math.floor(W / 500));
+  for (let y = 0; y < H; y += rs) for (let x = 1; x < W; x++) { const o = (y * W + x) * 4; if (data[o + 3] && data[o - 1]) { sx[(x - 1) & 7] += Math.abs(lumAt(o) - lumAt(o - 4)); nx[(x - 1) & 7]++; } }
+  for (let y = 1; y < H; y++) for (let x = 0; x < W; x += cs) { const o = (y * W + x) * 4, p = o - W * 4; if (data[o + 3] && data[p + 3]) { sy[(y - 1) & 7] += Math.abs(lumAt(o) - lumAt(p)); ny[(y - 1) & 7]++; } }
+  const best = (s, n) => { const m = [...s].map((v, k) => n[k] ? v / n[k] : 0); let k = 0; for (let j = 1; j < 8; j++) if (m[j] > m[k]) k = j; const med = [...m].sort((a, b) => a - b)[4]; return [(k + 1) & 7, med > 0 ? m[k] / med : 1]; };
+  const [ox, kx] = best(sx, nx), [oy, ky] = best(sy, ny);
+  return { ox, oy, strength: Math.min(kx, ky) };
+}
+let lastFind = null;
+function findBlocks() {
+  if (!loaded || float) return;
+  const t0 = performance.now(), s = fb.sens / 100, g = blockGrid(), { ox, oy } = g;
+  const nbx = Math.floor((W - ox) / 8), nby = Math.floor((H - oy) / 8);
+  if (nbx < 1 || nby < 1) { say('image is smaller than one 8×8 block'); return; }
+  const mode = heldMode() || modeBtn, within = fb.within && sel.n > 0;
+  let bx0 = 0, by0 = 0, bx1 = nbx - 1, by1 = nby - 1;
+  if (within) { bx0 = clamp(Math.floor((sel.x0 - ox) / 8), 0, nbx - 1); by0 = clamp(Math.floor((sel.y0 - oy) / 8), 0, nby - 1); bx1 = clamp(Math.floor((sel.x1 - ox) / 8), 0, nbx - 1); by1 = clamp(Math.floor((sel.y1 - oy) / 8), 0, nby - 1); }
+  const NB = nbx * nby, flag = new Uint8Array(NB), valid = new Uint8Array(NB), flat = new Uint8Array(NB), edge = new Float32Array(NB * 4);
+  const aMin = 4 - 3 * s, kMax = 2 + Math.round(3 * s), rMax = 0.55 + 0.7 * s, flatMax = 0.35 + 0.4 * s, stepMin = 1.9 - 0.8 * s, lineMin = 0.45 - 0.2 * s, lineAmp = 5 - 2.5 * s;
+  const doStripes = fb.kind !== 'steps', doSteps = fb.kind !== 'stripes';
+  const blk = new Float32Array(64), tm = new Float32Array(64), C = new Float32Array(64);
+  for (let by = by0; by <= by1; by++) for (let bx = bx0; bx <= bx1; bx++) {
+    const b = by * nbx + bx, X0 = ox + bx * 8, Y0 = oy + by * 8;
+    let ok = true, m = 0;
+    for (let j = 0; j < 8 && ok; j++) for (let i = 0; i < 8; i++) { const o = ((Y0 + j) * W + X0 + i) * 4; if (!data[o + 3]) { ok = false; break; } const l = lumAt(o); blk[j * 8 + i] = l; m += l; }
+    if (!ok) continue;
+    valid[b] = 1; m /= 64;
+    let le = 0, ri = 0, to = 0, bo = 0;
+    for (let k = 0; k < 8; k++) { le += blk[k * 8]; ri += blk[k * 8 + 7]; to += blk[k]; bo += blk[56 + k]; }
+    edge[b * 4] = le / 8; edge[b * 4 + 1] = ri / 8; edge[b * 4 + 2] = to / 8; edge[b * 4 + 3] = bo / 8;
+    for (let k = 0; k < 64; k++) blk[k] -= m;
+    for (let j = 0; j < 8; j++) for (let u = 0; u < 8; u++) { let a = 0; for (let i = 0; i < 8; i++) a += DB[u * 8 + i] * blk[j * 8 + i]; tm[j * 8 + u] = a; }
+    let A1 = 0, E = 0;
+    for (let v = 0; v < 8; v++) for (let u = 0; u < 8; u++) { let a = 0; for (let j = 0; j < 8; j++) a += DB[v * 8 + j] * tm[j * 8 + u]; C[v * 8 + u] = a; if (v || u) { const q = Math.abs(a); E += a * a; if (q > A1) A1 = q; } }
+    if (Math.sqrt(E / 63) <= flatMax) flat[b] = 1;
+    if (doStripes && A1 >= aMin) {
+      const thr = Math.max(1.5, 0.25 * A1); let k = 0, rest = 0, hf = false;
+      for (let q = 1; q < 64; q++) { const a = Math.abs(C[q]); if (a >= thr) { k++; if (Math.max(q & 7, q >> 3) >= 2) hf = true; } else rest += a * a; }
+      if (hf && k <= kMax && Math.sqrt(rest / Math.max(1, 63 - k)) <= rMax) flag[b] |= 1;
+    }
+    if (doStripes && !(flag[b] & 1) && E > 0) {
+      // straight line stripes: most of the detail sits in fine vertical (or horizontal) lines, not in coarse shading or a real edge
+      // (a single thin line or edge spreads evenly over all frequencies; stripes peak at one)
+      let vh = 0, vl = 0, hh = 0, hl = 0, vm = 0, hm = 0;
+      for (let q = 1; q < 8; q++) { const a = C[q] * C[q], c = C[q * 8] * C[q * 8]; if (a > vm) vm = a; if (c > hm) hm = c; if (q < 3) { vl += a; hl += c; } else { vh += a; hh += c; } }
+      const useV = vh >= hh, hi = useV ? vh : hh, lo = useV ? vl : hl, peak = (useV ? vm : hm) / (hi + lo);
+      if (hi / E >= lineMin && Math.sqrt(hi) >= lineAmp && hi >= 1.5 * lo && peak >= 0.4) flag[b] |= 1;
+    }
+  }
+  if (doSteps) {
+    // flat neighbours that jump at the shared border, while neither block slopes towards it (that would be a smooth gradient)
+    const test = (a, b, horiz) => {
+      if (!valid[a] || !valid[b] || !flat[a] || !flat[b]) return;
+      const [nearA, farA, nearB, farB] = horiz ? [edge[a * 4 + 1], edge[a * 4], edge[b * 4], edge[b * 4 + 1]] : [edge[a * 4 + 3], edge[a * 4 + 2], edge[b * 4 + 2], edge[b * 4 + 3]];
+      const jump = Math.abs(nearB - nearA), slope = Math.max(Math.abs(nearA - farA), Math.abs(farB - nearB)) / 7;
+      if (jump >= stepMin && jump <= 16 && jump >= 2.5 * slope + 0.3) { flag[a] |= 2; flag[b] |= 2; }
+    };
+    for (let by = by0; by <= by1; by++) for (let bx = bx0; bx <= bx1; bx++) {
+      const b = by * nbx + bx;
+      if (bx < bx1) test(b, b + 1, true);
+      if (by < by1) test(b, b + nbx, false);
+    }
+  }
+  // turn flagged blocks into a pixel mask, grown by a few pixels so the block borders are covered too
+  const found = new Uint8Array(W * H), gr = fb.grow | 0;
+  let nf = 0, nStripe = 0, nStep = 0;
+  for (let by = by0; by <= by1; by++) for (let bx = bx0; bx <= bx1; bx++) {
+    const f = flag[by * nbx + bx]; if (!f) continue;
+    nf++; if (f & 1) nStripe++; else nStep++;
+    const x0 = Math.max(0, ox + bx * 8 - gr), x1 = Math.min(W - 1, ox + bx * 8 + 7 + gr), y0 = Math.max(0, oy + by * 8 - gr), y1 = Math.min(H - 1, oy + by * 8 + 7 + gr);
+    for (let y = y0; y <= y1; y++) found.fill(1, y * W + x0, y * W + x1 + 1);
+  }
+  if (within && mode !== 'sub') { for (let y = sel.y0; y <= sel.y1; y++) for (let i = y * W + sel.x0, e = y * W + sel.x1; i <= e; i++) mask[i] &= found[i]; }
+  else if (mode === 'sub') { for (let i = 0; i < found.length; i++) if (found[i]) mask[i] = 0; }
+  else if (mode === 'add') { for (let i = 0; i < found.length; i++) if (found[i]) mask[i] = 1; }
+  else if (mode === 'toggle') { for (let i = 0; i < found.length; i++) mask[i] ^= found[i]; }
+  else mask.set(found);
+  rescan(); need();
+  const scanned = (bx1 - bx0 + 1) * (by1 - by0 + 1);
+  lastFind = { blocks: nf, stripes: nStripe, steps: nStep, scanned, ox, oy, strength: g.strength, ms: Math.round(performance.now() - t0) };
+  syncBlocks();
+  say(nf ? `found ${nf.toLocaleString()} block${nf > 1 ? 's' : ''} with JPEG patterns · ${sel.n.toLocaleString()} pixels selected` : 'no block patterns found at this sensitivity');
+}
+function syncBlocks() {
+  $('#fbsens').value = fb.sens; $('#fbsensv').textContent = fb.sens; $('#fbkind').value = fb.kind; $('#fbgrow').value = fb.grow; $('#fbgrowv').textContent = fb.grow + ' px';
+  $('#fbwithin').checked = fb.within; $('#fbsig').value = fb.sigma; $('#fbsigv').textContent = fb.sigma + ' px'; $('#fbsrc').value = fillSrc;
+  const f = lastFind;
+  $('#fbres').textContent = !f ? 'Nothing searched yet.' : !f.blocks ? 'No block patterns found. Raise Sensitivity to catch fainter ones.'
+    : `${f.blocks.toLocaleString()} of ${f.scanned.toLocaleString()} blocks (${(100 * f.blocks / f.scanned).toFixed(1)}%) · ${f.stripes.toLocaleString()} striped, ${f.steps.toLocaleString()} flat steps` + (f.strength < 1.15 ? ' · no clear JPEG grid in this image, results are a best guess' : '');
+  ['#fbsmooth', '#fbfill', '#fbdel', '#fbrnd'].forEach(q => { $(q).disabled = !sel.n; });
+  try { localStorage.setItem('ie2.pixels.blocks', JSON.stringify(fb)); } catch (e) { /* ignore */ }
 }
 
 /* ---------------- view ---------------- */
@@ -508,6 +678,7 @@ function sync() {
   $('#undo').disabled = !hist.length || !!float; $('#redo').disabled = !future.length || !!float;
   $('#del').disabled = !sel.n; $('#none').disabled = !sel.n;
   if (!$('#rpop').hidden) syncRandom();
+  if (!$('#fbpop').hidden) syncBlocks();
   $('#selinfo').textContent = sel.n ? `${sel.n.toLocaleString()} selected · ${sel.x1 - sel.x0 + 1}×${sel.y1 - sel.y0 + 1}` : '';
 }
 function showHover() {
@@ -644,8 +815,21 @@ $('#rsrc').addEventListener('change', (e) => { rx.src = e.target.value; syncRand
 $('#rreach').addEventListener('input', (e) => { rx.reach = +e.target.value; syncRandom(); });
 $('#rapply').addEventListener('click', randomize);
 $('#rroll').addEventListener('click', reroll);
-document.addEventListener('pointerdown', (e) => { if (!$('#rpop').hidden && !e.target.closest('#rpop, #rnd')) $('#rpop').hidden = true; });
+document.addEventListener('pointerdown', (e) => { if (!$('#rpop').hidden && !e.target.closest('#rpop, #rnd, #fbrnd')) $('#rpop').hidden = true; });
 $('#fillholes').addEventListener('click', fillHoles);
+$('#fb').addEventListener('click', () => { const p = $('#fbpop'); p.hidden = !p.hidden; $('#rpop').hidden = true; syncBlocks(); });
+$('#fbsens').addEventListener('input', (e) => { fb.sens = +e.target.value; syncBlocks(); });
+$('#fbkind').addEventListener('change', (e) => { fb.kind = e.target.value; syncBlocks(); });
+$('#fbgrow').addEventListener('input', (e) => { fb.grow = +e.target.value; syncBlocks(); });
+$('#fbwithin').addEventListener('change', (e) => { fb.within = e.target.checked; syncBlocks(); });
+$('#fbsig').addEventListener('input', (e) => { fb.sigma = +e.target.value; syncBlocks(); });
+$('#fbsrc').addEventListener('change', (e) => { fillSrc = e.target.value; $('#fsrc').value = fillSrc; });
+$('#fbfind').addEventListener('click', findBlocks);
+$('#fbsmooth').addEventListener('click', smoothSel);
+$('#fbfill').addEventListener('click', fillSel);
+$('#fbdel').addEventListener('click', del);
+$('#fbrnd').addEventListener('click', () => { $('#fbpop').hidden = true; $('#rpop').hidden = false; syncRandom(); });
+document.addEventListener('pointerdown', (e) => { if (!$('#fbpop').hidden && !e.target.closest('#fbpop, #fb')) $('#fbpop').hidden = true; });
 
 /* ---------------- buttons, files ---------------- */
 $('#open').addEventListener('click', () => $('#file').click());

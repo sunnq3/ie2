@@ -55,6 +55,11 @@ kbd { font: 600 10px var(--mono); border: 1px solid currentColor; border-radius:
 .xpop.left { left: 0; right: auto; }
 .row2 { display: flex; gap: 8px; }
 .row2 .b { flex: 1; }
+.row4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.row4 .b { padding: 0 4px; font-size: 12px; }
+.xpop.wide { width: 360px; max-width: calc(100vw - 24px); }
+.xrow.chk { grid-template-columns: auto minmax(0, 1fr); cursor: pointer; color: var(--ink); }
+.xnote.res { color: var(--ink); font: 11.5px/1.4 var(--mono); }
 .meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .grow { flex: 1; }
 .stage { position: relative; overflow: hidden; background: var(--stage); touch-action: none; }
@@ -146,6 +151,23 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <div class="row2"><button class="b go" id="rapply" type="button">Apply</button><button class="b" id="rroll" type="button" title="Undo the last randomize and roll new dice" disabled>Re-roll</button></div>
     </div>
   </div>
+  <div class="exp">
+    <button class="b" id="fb" type="button" title="Search the image for JPEG block patterns and select them" disabled>Find blocks…</button>
+    <div class="xpop left wide" id="fbpop" hidden>
+      <h4>Find JPEG blocks</h4>
+      <p class="xnote">Scans every 8×8 JPEG block for the two kinds of damage: striped / checkered “barcode” blocks, and flat blocks that step in brightness at the block border. Matches become the selection (New / Add / Remove apply).</p>
+      <div class="xrow"><span>Sensitivity</span><span class="qv"><input id="fbsens" type="range" min="0" max="100" step="1" value="50" aria-label="Sensitivity"><b id="fbsensv">50</b></span></div>
+      <div class="xrow"><span>Look for</span><select id="fbkind"><option value="both">stripes + flat steps</option><option value="stripes">stripes / checkers only</option><option value="steps">flat steps only</option></select></div>
+      <div class="xrow"><span>Grow</span><span class="qv"><input id="fbgrow" type="range" min="0" max="6" step="1" value="1" aria-label="Grow the found areas"><b id="fbgrowv">1 px</b></span></div>
+      <label class="xrow chk"><input id="fbwithin" type="checkbox"><span>Only search inside the current selection</span></label>
+      <button class="b go" id="fbfind" type="button">Find &amp; select</button>
+      <p class="xnote res" id="fbres">Nothing searched yet.</p>
+      <h4>Then</h4>
+      <div class="row4"><button class="b" id="fbsmooth" type="button" title="Blur the selected pixels into each other and their surroundings" disabled>Smooth</button><button class="b" id="fbfill" type="button" title="Replace the selected pixels using the fill source below" disabled>Fill</button><button class="b" id="fbdel" type="button" title="Delete the selected pixels" disabled>Remove</button><button class="b" id="fbrnd" type="button" title="Open Randomize for the selected pixels" disabled>Randomize…</button></div>
+      <div class="xrow"><span>Smooth radius</span><span class="qv"><input id="fbsig" type="range" min="1" max="8" step="0.5" value="2" aria-label="Smooth radius"><b id="fbsigv">2 px</b></span></div>
+      <div class="xrow"><span>Fill from</span><select id="fbsrc"><option value="near">surrounding colours</option><option value="colour">the current colour</option><option value="swatches">random swatches</option></select></div>
+    </div>
+  </div>
   <button class="b q" id="all" type="button" title="Select all (Ctrl/Cmd+A)" disabled>Select all</button>
   <button class="b q" id="none" type="button" title="Deselect (Esc)" disabled>Deselect</button>
 </nav>
@@ -165,6 +187,7 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
         <dt>F</dt><dd>Fill tool: click or paint over holes to fill them; Fill holes fills them all</dd>
         <dt>I</dt><dd>Pick: click to take a colour into the swatches</dd>
         <dt>Randomize</dt><dd>randomly delete or recolour pixels in an area</dd>
+        <dt>Find blocks</dt><dd>auto-select JPEG block patterns, then smooth, fill, remove or randomize them</dd>
         <dt>wheel / Space</dt><dd>zoom / pan</dd>
       </dl>
     </div>
@@ -178,8 +201,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=17"></script>
-<script src="../v5/export.js?b=17"></script>
-<script src="pixels.js?b=17"></script>
+<script src="../v5/core.js?b=18"></script>
+<script src="../v5/export.js?b=18"></script>
+<script src="pixels.js?b=18"></script>
 </body>
 </html>
