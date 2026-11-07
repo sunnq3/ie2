@@ -163,6 +163,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <button class="b go" id="fbfind" type="button">Find &amp; select</button>
       <p class="xnote res" id="fbres">Nothing searched yet.</p>
       <h4>Then</h4>
+      <button class="b go" id="fbrep" type="button" title="Remove the grid structure but keep every pixel's own detail: tones down the stripe patterns and evens out the block borders" disabled>Repair (keep detail)</button>
+      <div class="xrow"><span>Repair strength</span><span class="qv"><input id="fbrepk" type="range" min="0" max="100" step="5" value="100" aria-label="Repair strength"><b id="fbrepv">100%</b></span></div>
       <div class="row4"><button class="b" id="fbsmooth" type="button" title="Blur the selected pixels into each other and their surroundings" disabled>Smooth</button><button class="b" id="fbfill" type="button" title="Replace the selected pixels using the fill source below" disabled>Fill</button><button class="b" id="fbdel" type="button" title="Delete the selected pixels" disabled>Remove</button><button class="b" id="fbrnd" type="button" title="Open Randomize for the selected pixels" disabled>Randomize…</button></div>
       <div class="xrow"><span>Smooth radius</span><span class="qv"><input id="fbsig" type="range" min="1" max="8" step="0.5" value="2" aria-label="Smooth radius"><b id="fbsigv">2 px</b></span></div>
       <div class="xrow"><span>Fill from</span><select id="fbsrc"><option value="near">surrounding colours</option><option value="colour">the current colour</option><option value="swatches">random swatches</option></select></div>
@@ -201,8 +203,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=18"></script>
-<script src="../v5/export.js?b=18"></script>
-<script src="pixels.js?b=18"></script>
+<script src="../v5/core.js?b=19"></script>
+<script src="../v5/export.js?b=19"></script>
+<script src="pixels.js?b=19"></script>
 </body>
 </html>

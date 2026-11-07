@@ -480,11 +480,127 @@ function smoothSel() {
   say(`smoothed ${n.toLocaleString()} pixels (radius ${sigma} px)`);
 }
 
+/* ---------------- repair JPEG blocks ---------------- */
+// Keeps every pixel's own detail. Only two things change:
+//  1. inside each selected 8×8 block, DCT patterns that are much stronger than in the clean blocks around it
+//     (the stripes / checkers) are turned down to the neighbourhood's level, keeping their sign;
+//  2. along each 8-pixel block border, the average jump (minus the natural slope) is removed with a 4 px ramp
+//     on both sides. It is an average over the whole border, so pixel-level grain stays; real edges are skipped.
+function repairSel() {
+  if (!sel.n || float || !loaded) return;
+  const t0 = performance.now(), k = fb.rep / 100;
+  const { ox, oy } = blockGrid();
+  const nbx = Math.floor((W - ox) / 8), nby = Math.floor((H - oy) / 8);
+  if (nbx < 1 || nby < 1) return;
+  // which blocks are selected (at least a quarter of their pixels) and fully non-empty
+  const NB = nbx * nby, tgt = new Uint8Array(NB), valid = new Uint8Array(NB);
+  for (let by = 0; by < nby; by++) for (let bx = 0; bx < nbx; bx++) {
+    const X0 = ox + bx * 8, Y0 = oy + by * 8; let ns = 0, ok = 1;
+    for (let j = 0; j < 8; j++) for (let i = 0, p = (Y0 + j) * W + X0; i < 8; i++, p++) { if (mask[p]) ns++; if (!data[p * 4 + 3]) ok = 0; }
+    valid[by * nbx + bx] = ok; if (ok && ns >= 16) tgt[by * nbx + bx] = 1;
+  }
+  let nt = 0, tb = [nbx, nby, -1, -1];
+  for (let b = 0; b < NB; b++) if (tgt[b]) { nt++; const bx = b % nbx, by = (b / nbx) | 0; tb[0] = Math.min(tb[0], bx); tb[1] = Math.min(tb[1], by); tb[2] = Math.max(tb[2], bx); tb[3] = Math.max(tb[3], by); }
+  if (!nt) { say('no whole 8×8 blocks in the selection to repair'); return; }
+  const r = { x: Math.max(0, ox + tb[0] * 8 - 4), y: Math.max(0, oy + tb[1] * 8 - 4) };
+  r.w = Math.min(W, ox + tb[2] * 8 + 12) - r.x; r.h = Math.min(H, oy + tb[3] * 8 + 12) - r.y;
+  const before = snap(r);
+  // 1. stripes: per channel, per band of block rows
+  const RB = 3, BAND = 48;
+  const blk = new Float32Array(64), tm = new Float32Array(64), Cb = new Float32Array(64), ref = new Float32Array(64);
+  let shrunk = 0;
+  for (let b0 = tb[1]; b0 <= tb[3]; b0 += BAND) {
+    const b1 = Math.min(tb[3], b0 + BAND - 1);
+    const wy0 = Math.max(0, b0 - RB), wy1 = Math.min(nby - 1, b1 + RB), wx0 = Math.max(0, tb[0] - RB), wx1 = Math.min(nbx - 1, tb[2] + RB);
+    const nwx = wx1 - wx0 + 1, nwy = wy1 - wy0 + 1, NW = nwx * nwy;
+    for (let c = 0; c < 3; c++) {
+      const coef = new Float32Array(NW * 64);
+      for (let wy = 0; wy < nwy; wy++) for (let wx = 0; wx < nwx; wx++) {
+        const b = (wy0 + wy) * nbx + wx0 + wx; if (!valid[b]) continue;
+        const X0 = ox + (wx0 + wx) * 8, Y0 = oy + (wy0 + wy) * 8;
+        for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) blk[j * 8 + i] = data[((Y0 + j) * W + X0 + i) * 4 + c];
+        dct8(blk, tm, coef, (wy * nwx + wx) * 64);
+      }
+      // fallback reference: median |coefficient| over the unselected blocks of this band
+      const glob = new Float32Array(64);
+      { const list = []; for (let wy = 0; wy < nwy; wy++) for (let wx = 0; wx < nwx; wx++) { const b = (wy0 + wy) * nbx + wx0 + wx; if (valid[b] && !tgt[b]) list.push(wy * nwx + wx); }
+        if (list.length < 4) for (let q = 0; q < NW; q++) { const b = (wy0 + ((q / nwx) | 0)) * nbx + wx0 + q % nwx; if (valid[b]) list.push(q); }
+        const step = Math.max(1, Math.floor(list.length / 1500)), tmp = [];
+        for (let u = 1; u < 64; u++) { tmp.length = 0; for (let q = 0; q < list.length; q += step) tmp.push(Math.abs(coef[list[q] * 64 + u])); tmp.sort((a, b) => a - b); glob[u] = tmp.length ? tmp[tmp.length >> 1] / 0.6745 : 1; } }
+      for (let by = b0; by <= b1; by++) for (let bx = tb[0]; bx <= tb[2]; bx++) {
+        const b = by * nbx + bx; if (!tgt[b]) continue;
+        // local reference: typical size of each pattern in the clean blocks nearby
+        let n = 0; ref.fill(0);
+        for (let R = 2; R <= RB && n < 4; R++) {
+          n = 0; ref.fill(0);
+          for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+            const X = bx + dx, Y = by + dy; if (X < wx0 || X > wx1 || Y < wy0 || Y > wy1) continue;
+            const nb = Y * nbx + X; if (!valid[nb] || tgt[nb]) continue;
+            const o = ((Y - wy0) * nwx + X - wx0) * 64; for (let u = 1; u < 64; u++) ref[u] += Math.abs(coef[o + u]); n++;
+          }
+        }
+        for (let u = 1; u < 64; u++) ref[u] = n >= 4 ? (ref[u] / n) * 1.2533 : glob[u];
+        const o = ((by - wy0) * nwx + bx - wx0) * 64; let ch = false;
+        for (let u = 0; u < 64; u++) Cb[u] = coef[o + u];
+        for (let u = 1; u < 64; u++) {
+          if (Math.max(u & 7, u >> 3) < 2) continue;                   // leave the block's shading / gradients alone
+          const a = Math.abs(Cb[u]), lim = 1.5 * ref[u] + 1;
+          if (a > lim) { const target = Math.max(ref[u], 0.5); Cb[u] *= 1 - k * (1 - target / a); ch = true; shrunk++; }
+        }
+        if (!ch) continue;
+        idct8(Cb, tm, blk);
+        const X0 = ox + bx * 8, Y0 = oy + by * 8;
+        for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) { const p = (Y0 + j) * W + X0 + i; if (mask[p]) data[p * 4 + c] = blk[j * 8 + i]; }
+      }
+    }
+  }
+  // 2. block borders: remove the average step along each border of a repaired block
+  const WT = [0.5, 0.375, 0.25, 0.125];
+  let borders = 0;
+  const fixBorder = (A, B, vert) => {
+    // vert: A left of B (border is a vertical line); else A above B
+    const ax = ox + (A % nbx) * 8, ay = oy + ((A / nbx) | 0) * 8;
+    const at = (t, d) => vert ? ((ay + t) * W + ax + 7 - d) : ((ay + 7 - d) * W + ax + t);       // pixel d steps inside A from the border
+    const bt = (t, d) => vert ? ((ay + t) * W + ax + 8 + d) : ((ay + 8 + d) * W + ax + t);       // pixel d steps inside B
+    let did = false;
+    for (let c = 0; c < 3; c++) {
+      let e = 0, e2 = 0, jump = 0;
+      for (let t = 0; t < 8; t++) {
+        const p0 = data[at(t, 0) * 4 + c], p1 = data[at(t, 1) * 4 + c], q0 = data[bt(t, 0) * 4 + c], q1 = data[bt(t, 1) * 4 + c];
+        const x = (q0 - p0) - ((p0 - p1) + (q1 - q0)) / 2; e += x; e2 += x * x; jump += Math.abs(q0 - p0);
+      }
+      e /= 8; jump /= 8;
+      const se = Math.sqrt(Math.max(0, e2 / 8 - e * e) / 7);          // how uncertain that average is (grain)
+      if (Math.abs(e) < 0.75 + 1.5 * se || jump > 22) continue;     // no real step (just grain), or a real edge
+      const d = e * k;
+      for (let t = 0; t < 8; t++) for (let s = 0; s < 4; s++) { const pa = at(t, s) * 4 + c, pb = bt(t, s) * 4 + c; data[pa] = data[pa] + d * WT[s]; data[pb] = data[pb] - d * WT[s]; }
+      did = true;
+    }
+    if (did) borders++;
+  };
+  for (let by = tb[1]; by <= tb[3]; by++) for (let bx = Math.max(0, tb[0] - 1); bx <= tb[2] && bx < nbx - 1; bx++) {
+    const a = by * nbx + bx, b = a + 1; if ((tgt[a] || tgt[b]) && valid[a] && valid[b]) fixBorder(a, b, true);
+  }
+  for (let by = Math.max(0, tb[1] - 1); by <= tb[3] && by < nby - 1; by++) for (let bx = tb[0]; bx <= tb[2]; bx++) {
+    const a = by * nbx + bx, b = a + nbx; if ((tgt[a] || tgt[b]) && valid[a] && valid[b]) fixBorder(a, b, false);
+  }
+  record(r, before, snap(r), 'repair blocks'); redraw(r); need();
+  say(`repaired ${nt.toLocaleString()} block${nt > 1 ? 's' : ''} · ${shrunk.toLocaleString()} stripe patterns toned down · ${borders.toLocaleString()} block borders evened out (${Math.round(performance.now() - t0)} ms)`);
+}
+function dct8(blk, tm, out, o) {
+  for (let j = 0; j < 8; j++) for (let u = 0; u < 8; u++) { let a = 0; for (let i = 0; i < 8; i++) a += DB[u * 8 + i] * blk[j * 8 + i]; tm[j * 8 + u] = a; }
+  for (let v = 0; v < 8; v++) for (let u = 0; u < 8; u++) { let a = 0; for (let j = 0; j < 8; j++) a += DB[v * 8 + j] * tm[j * 8 + u]; out[o + v * 8 + u] = a; }
+}
+function idct8(C, tm, blk) {
+  for (let j = 0; j < 8; j++) for (let u = 0; u < 8; u++) { let a = 0; for (let v = 0; v < 8; v++) a += DB[v * 8 + j] * C[v * 8 + u]; tm[j * 8 + u] = a; }
+  for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) { let a = 0; for (let u = 0; u < 8; u++) a += DB[u * 8 + i] * tm[j * 8 + u]; blk[j * 8 + i] = a; }
+}
+
 /* ---------------- find JPEG blocks ---------------- */
 // JPEG works on an 8×8 grid. Damaged blocks show up as either
 //  - "stripes": a block whose detail is carried by one or a few strong high-frequency DCT patterns (barcode / checker looks), or
 //  - "flat steps": blocks with no detail inside that jump in brightness exactly at the block border (staircase look).
-const fb = { sens: 50, kind: 'both', grow: 1, within: false, sigma: 2 };
+const fb = { sens: 50, kind: 'both', grow: 1, within: false, sigma: 2, rep: 100 };
 try { Object.assign(fb, JSON.parse(localStorage.getItem('ie2.pixels.blocks') || '{}')); } catch (e) { /* ignore */ }
 const DB = (() => { const b = new Float32Array(64); for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) b[u * 8 + x] = (u ? 1 : Math.SQRT1_2) * 0.5 * Math.cos((2 * x + 1) * u * Math.PI / 16); return b; })();
 const lumAt = (o) => 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
@@ -575,11 +691,11 @@ function findBlocks() {
 }
 function syncBlocks() {
   $('#fbsens').value = fb.sens; $('#fbsensv').textContent = fb.sens; $('#fbkind').value = fb.kind; $('#fbgrow').value = fb.grow; $('#fbgrowv').textContent = fb.grow + ' px';
-  $('#fbwithin').checked = fb.within; $('#fbsig').value = fb.sigma; $('#fbsigv').textContent = fb.sigma + ' px'; $('#fbsrc').value = fillSrc;
+  $('#fbwithin').checked = fb.within; $('#fbsig').value = fb.sigma; $('#fbsigv').textContent = fb.sigma + ' px'; $('#fbrepk').value = fb.rep; $('#fbrepv').textContent = fb.rep + '%'; $('#fbsrc').value = fillSrc;
   const f = lastFind;
   $('#fbres').textContent = !f ? 'Nothing searched yet.' : !f.blocks ? 'No block patterns found. Raise Sensitivity to catch fainter ones.'
     : `${f.blocks.toLocaleString()} of ${f.scanned.toLocaleString()} blocks (${(100 * f.blocks / f.scanned).toFixed(1)}%) · ${f.stripes.toLocaleString()} striped, ${f.steps.toLocaleString()} flat steps` + (f.strength < 1.15 ? ' · no clear JPEG grid in this image, results are a best guess' : '');
-  ['#fbsmooth', '#fbfill', '#fbdel', '#fbrnd'].forEach(q => { $(q).disabled = !sel.n; });
+  ['#fbrep', '#fbsmooth', '#fbfill', '#fbdel', '#fbrnd'].forEach(q => { $(q).disabled = !sel.n; });
   try { localStorage.setItem('ie2.pixels.blocks', JSON.stringify(fb)); } catch (e) { /* ignore */ }
 }
 
@@ -826,6 +942,8 @@ $('#fbsig').addEventListener('input', (e) => { fb.sigma = +e.target.value; syncB
 $('#fbsrc').addEventListener('change', (e) => { fillSrc = e.target.value; $('#fsrc').value = fillSrc; });
 $('#fbfind').addEventListener('click', findBlocks);
 $('#fbsmooth').addEventListener('click', smoothSel);
+$('#fbrep').addEventListener('click', repairSel);
+$('#fbrepk').addEventListener('input', (e) => { fb.rep = +e.target.value; syncBlocks(); });
 $('#fbfill').addEventListener('click', fillSel);
 $('#fbdel').addEventListener('click', del);
 $('#fbrnd').addEventListener('click', () => { $('#fbpop').hidden = true; $('#rpop').hidden = false; syncRandom(); });
