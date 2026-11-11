@@ -9,8 +9,13 @@
  *     The local difference between the two is a direct measurement of the grid (≈0 on clean photos).
  *  3. tone steps that sit exactly on the cell borders are ramped out of the structure layer.
  *  4. long lines (creases, edges) are found by averaging along 8 directions over more than one cell and are kept.
- *  5. where the grid is, the stamped texture is replaced by continuous grain of the same local strength and grain
- *     size, so the area stays exactly as busy as before. Nothing is copied from elsewhere, nothing is blurred.
+ *  5. noise profile: how much fine grain the photo has at each brightness (16 levels) and how coarse it is, measured
+ *     on calm tiles of the whole photo. Where the grid is, the stamped texture is replaced by continuous grain at the
+ *     profile's level; detail above that level is real texture and stays. Elsewhere, areas JPEG left quieter than
+ *     the profile get grain added and nothing else changes, so the noise ends up even across the photo. All levels
+ *     are matched on what the eye reads as grain (the fine band), and the fill-in is variance-matched, so partly
+ *     treated areas don't dip. Nothing is copied from elsewhere, nothing is blurred.
+ *  The same profile drives addGrain(), which the editor's fill and randomize tools use for the pixels they make.
  *
  * Runs as a Web Worker (message {data, W, H, sel, opts}) or as a plain script / node module (Degrid.run).
  */
@@ -86,9 +91,67 @@
     h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d); h = Math.imul(h ^ (h >>> 12), 0x297a2d39); h ^= h >>> 15;
     return h >>> 0;
   }
+  // near-gaussian, unit variance: the sum of the four bytes of one hash (cheap; it feeds a blur, so the cut tails at
+  // ±3.5 sigma never show)
+  const GN = 1 / Math.sqrt(4 * (256 * 256 - 1) / 12);
   function gnoise(x, y, c, seed) {
-    const u1 = (hash(x, y, c, seed) + 0.5) / 4294967296, u2 = (hash(x, y, c + 7, seed ^ 0x5bd1e995) + 0.5) / 4294967296;
-    return Math.sqrt(-2 * Math.log(u1)) * Math.cos(6.283185307179586 * u2);
+    const h = hash(x, y, c, seed);
+    return ((h & 255) + (h >>> 8 & 255) + (h >>> 16 & 255) + (h >>> 24) - 510) * GN;
+  }
+
+  // camera-like grain: per-pixel gaussian noise (fixed by image position and seed), blurred to grain size `size`,
+  // unit variance. Computed with padding, so any rectangle gives the same values as the whole image would.
+  function grainField(x0, y0, w, h, c, seed, size) {
+    const R = size > 0.25 ? Math.max(1, Math.ceil(3 * size)) : 0, pw = w + 2 * R, ph = h + 2 * R, G = new Float32Array(pw * ph);
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) G[y * pw + x] = gnoise(x0 + x - R, y0 + y - R, c, seed);
+    if (!R) return G;
+    const kk = gaussSmall(G, pw, ph, size, new Float32Array(pw * ph)); let s2 = 0; for (const v of kk) s2 += v * v;
+    const out = new Float32Array(w * h), norm = 1 / s2;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[y * w + x] = G[(y + R) * pw + x + R] * norm;
+    return out;
+  }
+  // the fine band of a detail plane: what the eye reads as grain (detail minus a small blur of it)
+  const FB = 1.5;
+  function fine(d, w, h) { const f = d.slice(); gauss(f, w, h, FB, new Float32Array(w * h)); for (let i = 0; i < f.length; i++) f[i] = d[i] - f[i]; return f; }
+  // share of a unit grain field that lands in the fine band (depends on grain size only)
+  const phiCache = new Map();
+  function phi(size) {
+    const k = Math.round(size * 100); if (phiCache.has(k)) return phiCache.get(k);
+    const G = grainField(0, 0, 96, 96, 0, 12345, k / 100), F = fine(G, 96, 96); let a = 0, b = 0;
+    for (let y = 8; y < 88; y++) for (let x = 8; x < 88; x++) { const i = y * 96 + x; a += F[i] * F[i]; b += G[i] * G[i]; }
+    const v = Math.sqrt(a / b); phiCache.set(k, v); return v;
+  }
+  const NBINS = 16;
+  // the image's noise level (fine band, per channel) at luma Yv, from the profile measured by stats()
+  function noiseAt(nl, Yv) { const f = Math.min(NBINS - 1.001, Math.max(0, Yv / (256 / NBINS) - 0.5)), b0 = f | 0; return nl[b0] + (nl[b0 + 1] - nl[b0]) * (f - b0); }
+  // grain size (gaussian sigma) that gives a measured neighbour correlation r1
+  const sizeOf = (r1) => Math.sqrt(-1 / (4 * Math.log(r1)));
+  /* Add the photo's own grain to chosen pixels (their current colour is the base): the same level per brightness and
+   * the same grain size as the rest of the photo, so filled / recoloured pixels sit in the image like the rest of it.
+   * data: RGBA of the whole image (changed in place), r: rectangle {x,y,w,h}, pick(i): pixel index -> amount 0..1
+   * (0 = leave), g: profile from stats(), seed: grain seed. Works in row bands, so whole-image calls stay small.
+   * scattered: the picked pixels are scattered among untouched ones (Randomize). Their grain can't line up with the
+   * neighbours' grain, so it reads as pixel-sized noise; it gets plain per-pixel noise scaled to look as strong as the
+   * photo's grain does at pixel scale (0.6 × its fine-grain level, measured), instead of the full grain swing. */
+  function addGrain(data, W, r, pick, g, seed, amount = 1, scattered = false) {
+    const sizes = g.r1.map(sizeOf), norms = sizes.map(s => scattered ? 0.6 * amount : amount / phi(s)), BAND = 128;
+    let n = 0;
+    for (let y0 = r.y; y0 < r.y + r.h; y0 += BAND) {
+      const bh = Math.min(BAND, r.y + r.h - y0); let bx0 = r.x + r.w, bx1 = -1;     // columns with picked pixels
+      for (let y = y0; y < y0 + bh; y++) for (let x = r.x, i = y * W + x; x < r.x + r.w; x++, i++) if (data[i * 4 + 3] && pick(i)) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; }
+      if (bx1 < 0) continue;
+      const bw = bx1 - bx0 + 1, G = scattered ? null : [0, 1, 2].map(c => grainField(bx0, y0, bw, bh, c, seed, sizes[c]));
+      for (let y = y0; y < y0 + bh; y++) for (let x = bx0; x <= bx1; x++) {
+        const i = y * W + x, o = i * 4; if (!data[o + 3]) continue;
+        const a = pick(i); if (!a) continue;
+        const q = (y - y0) * bw + (x - bx0), R = data[o], Gc = data[o + 1], B = data[o + 2];
+        const Yv = KR * R + KG * Gc + KB * B, cb = -0.168736 * R - 0.331264 * Gc + 0.5 * B, cr = 0.5 * R - 0.418688 * Gc - 0.081312 * B;
+        const g0 = G ? G[0][q] : gnoise(x, y, 0, seed), g1 = G ? G[1][q] : gnoise(x, y, 1, seed), g2 = G ? G[2][q] : gnoise(x, y, 2, seed);
+        const y2 = Yv + a * norms[0] * noiseAt(g.nlf[0], Yv) * g0, cb2 = cb + a * norms[1] * noiseAt(g.nlf[1], Yv) * g1, cr2 = cr + a * norms[2] * noiseAt(g.nlf[2], Yv) * g2;
+        data[o] = y2 + 1.402 * cr2; data[o + 1] = y2 - 0.344136 * cb2 - 0.714136 * cr2; data[o + 2] = y2 + 1.772 * cb2; n++;
+      }
+    }
+    return n;
   }
 
   /* ---------- per-window building blocks ---------- */
@@ -111,11 +174,11 @@
   // guided filter with guide I (luma) for the three channels; returns bases
   function guided(P, w, h, r, eps) {
     const I = P[0], n = w * h, tmp = new Float32Array(n);
-    const mI = box(Float32Array.from(I), w, h, r, tmp);
+    const mI = box(I.slice(), w, h, r, tmp);
     const vI = new Float32Array(n); for (let i = 0; i < n; i++) vI[i] = I[i] * I[i];
     box(vI, w, h, r, tmp); for (let i = 0; i < n; i++) vI[i] -= mI[i] * mI[i];
     return P.map(p => {
-      const mp = box(Float32Array.from(p), w, h, r, tmp), a = new Float32Array(n);
+      const mp = box(p.slice(), w, h, r, tmp), a = new Float32Array(n);
       for (let i = 0; i < n; i++) a[i] = I[i] * p[i];
       box(a, w, h, r, tmp);
       const b = new Float32Array(n);
@@ -225,7 +288,8 @@
   }
 
   /* ---------- the whole thing ---------- */
-  const MG = 64;
+  const MG = 64, NB = NBINS, MB = 3;      // MB: bytes per pixel in the map (re-textured, kept, grain added)
+  let NLQ = 0.85, BETA = 1.2;
   // how the image is cut: strips of core rows, each processed with MG rows of context above and below
   function layout(W, H) {
     const CORE = Math.max(64, Math.min(1024, Math.floor(1.5e6 / W / 32) * 32));
@@ -235,56 +299,107 @@
     return { strips, samples };
   }
   const rowsOf = (data, W, w) => data.subarray(w.wy0 * W * 4, w.wy1 * W * 4);
-  function prep(rgba, W, h, wy0, eps) {
+  // small crops spread over the image, for measuring the photo's grain quickly: { wins, W } to pass to stats()
+  function profileWins(data, W, H) {
+    const cw = Math.min(W, 512), M = 16, core = Math.min(H, 96), nx = Math.max(1, Math.min(4, Math.round(W / cw))), ny = Math.max(1, Math.min(4, Math.round(H / (core + 2 * M)))), wins = [];
+    for (let j = 0; j < ny; j++) for (let k = 0; k < nx; k++) {
+      const x0 = Math.round((W - cw) * (nx > 1 ? k / (nx - 1) : 0.5)), c0 = Math.round((H - core) * (ny > 1 ? j / (ny - 1) : 0.5));
+      const wy0 = Math.max(0, c0 - M), wy1 = Math.min(H, c0 + core + M), rgba = new Uint8ClampedArray(cw * (wy1 - wy0) * 4);
+      for (let y = wy0; y < wy1; y++) rgba.set(data.subarray((y * W + x0) * 4, (y * W + x0 + cw) * 4), (y - wy0) * cw * 4);
+      wins.push({ rgba, c0: c0 - wy0, c1: c0 - wy0 + core, wy0: 0, wy1: wy1 - wy0 });
+    }
+    return { wins, W: cw };
+  }
+  function profile(data, W, H) { const p = profileWins(data, W, H); return stats(p.wins, p.W, H, { noiseOnly: true }); }
+  function prep(rgba, W, h, wy0, eps, needF) {
     const pl = planes(rgba, W, 0, h), P = [pl.Y, pl.Cb, pl.Cr], n = W * h;
     const B = guided(P, W, h, 4, eps), D = P.map((p, c) => { const d = new Float32Array(n), b = B[c]; for (let i = 0; i < n; i++) d[i] = p[i] - b[i]; return d; });
-    return { w: W, h, wy0, P, B, D, valid: pl.valid };
+    return { w: W, h, wy0, P, B, D, F: needF ? D.map(d => fine(d, W, h)) : null, FP: P.map(p => fine(p, W, h)), valid: pl.valid };
   }
   // 1. measurements from a few sample windows: texture level, grid position, line-response level, grain size
   function stats(wins, W, H, opts) {
     const o = Object.assign({ protect: 2.5, size: 1 }, opts || {});
     const samp = []; 
     for (const wn of wins) {
-      const h = wn.wy1 - wn.wy0, pl = planes(wn.rgba, W, 0, h), m = box(Float32Array.from(pl.Y), W, h, 4, new Float32Array(W * h));
+      const h = wn.wy1 - wn.wy0, pl = planes(wn.rgba, W, 0, h), m = box(pl.Y.slice(), W, h, 4, new Float32Array(W * h));
       for (let y = wn.c0 - wn.wy0; y < wn.c1 - wn.wy0; y += 3) for (let x = (y % 2); x < W; x += 3) { const i = y * W + x; if (pl.valid[i]) samp.push(Math.abs(pl.Y[i] - m[i])); }
     }
     const sa = Float32Array.from(samp), sn = Math.max(0.3, 1.4826 * median(sa, sa.length)), eps = (o.protect * sn) ** 2;
     const cx = new Float64Array(16), cy = new Float64Array(16), sS = [], sL = [], r1 = [[0, 0], [0, 0], [0, 0]];
+    const tiles = [[], [], []].map(() => Array.from({ length: NB }, () => []));
     for (const wn of wins) {
-      const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, eps), { w, h, wy0, D, B, valid } = st, DL = D[0], c0 = wn.c0 - wy0, c1 = wn.c1 - wy0;
+      const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, eps), { w, h, wy0, D, FP, B, valid } = st, DL = D[0], c0 = wn.c0 - wy0, c1 = wn.c1 - wy0;
       for (let y = c0; y < c1; y++) for (let x = 0; x < w; x++) {
         const i = y * w + x; if (!valid[i]) continue;
         if (x + 1 < w && valid[i + 1]) { const ph = x & 7; cx[ph * 2] += DL[i] * DL[i + 1]; cx[ph * 2 + 1] += (DL[i] * DL[i] + DL[i + 1] * DL[i + 1]) / 2; }
         if (y + 1 < h && valid[i + w]) { const ph = (y + wy0) & 7; cy[ph * 2] += DL[i] * DL[i + w]; cy[ph * 2 + 1] += (DL[i] * DL[i] + DL[i + w] * DL[i + w]) / 2; }
       }
-      const lm = lineMaps(DL, w, h);
-      for (let y = c0 >> 1; y < (c1 >> 1) && y < lm.H1.h; y++) for (let x = 0; x < lm.H1.w; x += 2) { let m = 0; const i = y * lm.H1.w + x; for (let d = 0; d < ND; d++) m = Math.max(m, lm.S[d][i]); sS.push(m); }
-      for (let y = c0 >> 2; y < (c1 >> 2) && y < lm.H2.h; y++) for (let x = 0; x < lm.H2.w; x++) { let m = 0; const i = y * lm.H2.w + x; for (let d = 0; d < ND; d++) m = Math.max(m, lm.L[d][i]); sL.push(m); }
+      const lm = o.noiseOnly ? null : lineMaps(DL, w, h);
+      if (lm) for (let y = c0 >> 1; y < (c1 >> 1) && y < lm.H1.h; y++) for (let x = 0; x < lm.H1.w; x += 2) { let m = 0; const i = y * lm.H1.w + x; for (let d = 0; d < ND; d++) m = Math.max(m, lm.S[d][i]); sS.push(m); }
+      if (lm) for (let y = c0 >> 2; y < (c1 >> 2) && y < lm.H2.h; y++) for (let x = 0; x < lm.H2.w; x++) { let m = 0; const i = y * lm.H2.w + x; for (let d = 0; d < ND; d++) m = Math.max(m, lm.L[d][i]); sL.push(m); }
       const BL = B[0];
       for (let y = Math.max(1, c0); y < Math.min(h - 1, c1); y++) for (let x = 1; x < w - 1; x++) {
         const i = y * w + x; if (!valid[i] || !valid[i + 1] || !valid[i + w]) continue;
         const gx = (BL[i + 1] - BL[i - 1]) / 2, gy = (BL[i + w] - BL[i - w]) / 2; if (gx * gx + gy * gy > 2.25 * sn * sn) continue;
         for (let c = 0; c < 3; c++) { const d = D[c]; r1[c][0] += d[i] * d[i + 1] + d[i] * d[i + w]; r1[c][1] += d[i] * d[i] + (d[i + 1] * d[i + 1] + d[i + w] * d[i + w]) / 2; }
       }
+      // noise level by brightness: RMS of the detail in calm 16×16 tiles, filed under the tile's mean luma
+      for (let ty = Math.max(1, c0); ty + 16 <= Math.min(h - 1, c1); ty += 16) for (let tx = 1; tx + 16 < w; tx += 16) {
+        let nc = 0, sy = 0; const s2 = [0, 0, 0], qs = [0, 0, 0, 0], qn = [0, 0, 0, 0];
+        for (let y = ty; y < ty + 16; y++) for (let x = tx; x < tx + 16; x++) {
+          const i = y * w + x; if (!valid[i]) continue;
+          const gx = (BL[i + 1] - BL[i - 1]) / 2, gy = (BL[i + w] - BL[i - w]) / 2; if (gx * gx + gy * gy > 2.25 * sn * sn) continue;
+          const qd = (y - ty >> 3) * 2 + (x - tx >> 3); qs[qd] += BL[i]; qn[qd]++;
+          nc++; sy += BL[i]; for (let c = 0; c < 3; c++) s2[c] += FP[c][i] * FP[c][i];
+        }
+        if (nc < 192) continue;
+        const qm = qs.map((v, k) => qn[k] ? v / qn[k] : sy / nc);
+        if (Math.max(...qm) - Math.min(...qm) > Math.max(6, 2 * sn)) continue;      // one surface only, not two sides of an edge
+        const b = Math.min(NB - 1, Math.max(0, Math.floor(sy / nc / (256 / NB))));
+        for (let c = 0; c < 3; c++) tiles[c][b].push(Math.sqrt(s2[c] / nc));
+      }
     }
+    // per bin: power average of the tiles (JPEG leaves some cells noisy and wipes others; what the eye sees is the
+    // average), leaving out the busiest share. A brightness that is mostly real texture (a patterned fabric, foliage)
+    // would still read high, so each bin is also held to its quiet end (30th percentile) times the ratio between the
+    // two that the photo shows where it is plain noise. Empty bins borrow from their neighbours.
+    const nlf = tiles.map((bins, ch) => {
+      const tp = [], lo = [];
+      bins.forEach((a, i) => {
+        if (a.length < 4) { tp[i] = lo[i] = -1; return; }
+        a.sort((p, q) => p - q);
+        const m = Math.max(2, Math.ceil((ch ? NLQ - 0.15 : NLQ) * a.length)); let s = 0; for (let k = 0; k < m; k++) s += a[k] * a[k];
+        tp[i] = Math.sqrt(s / m); lo[i] = a[Math.floor(0.3 * (a.length - 1))];
+      });
+      const rs = Float32Array.from(bins.map((a, i) => a.length >= 8 && lo[i] > 0.05 ? tp[i] / lo[i] : -1).filter(x => x > 0));
+      const kap = rs.length ? median(rs, rs.length) : 1.5;
+      const v = tp.map((t, i) => t < 0 ? -1 : Math.min(t, kap * lo[i]));
+      const have = v.map((x, i) => x >= 0 ? i : -1).filter(i => i >= 0);
+      if (!have.length) return new Array(NB).fill(sn);
+      for (let i = 0; i < NB; i++) if (v[i] < 0) {
+        let lo = -1, hi = -1; for (const j of have) { if (j < i) lo = j; else if (hi < 0) hi = j; }
+        v[i] = lo < 0 ? v[hi] : hi < 0 ? v[lo] : v[lo] + (v[hi] - v[lo]) * (i - lo) / (hi - lo);
+      }
+      return v.map((x, i) => (v[Math.max(0, i - 1)] + 4 * x + v[Math.min(NB - 1, i + 1)]) / 6);
+    });
     const corrX = [], corrY = []; for (let p = 0; p < 8; p++) { corrX.push(cx[p * 2] / Math.max(1e-9, cx[p * 2 + 1])); corrY.push(cy[p * 2] / Math.max(1e-9, cy[p * 2 + 1])); }
     const argmin = (a) => a.indexOf(Math.min(...a)), gapOf = (a, k) => a.reduce((s, v, i) => s + (i === k ? 0 : v), 0) / 7 - a[k];
     const kx = argmin(corrX), ky = argmin(corrY), gap = Math.min(gapOf(corrX, kx), gapOf(corrY, ky));
     const fS = Float32Array.from(sS), fL = Float32Array.from(sL);
     const ss = Math.max(1e-3, median(fS, fS.length)), sl = Math.max(1e-3, median(fL, fL.length));
     const r1v = r1.map(([a, b]) => Math.min(0.95, Math.max(0.01, b > 0 ? a / b : 0.3)));
-    return { sn, eps, kx, ky, gap, ss, sl, r1: r1v, corrX, corrY };
+    return { sn, eps, kx, ky, gap, ss, sl, r1: r1v, corrX, corrY, nlf };
   }
   // 2. one strip: rgba holds rows wy0..wy1 of the image, sel (optional) the same rows of the selection mask
   function strip(wn, W, g, opts, sel) {
-    const o = Object.assign({ strength: 1, amount: 1, size: 1, seed: 1, onlySel: false }, opts || {});
-    const sizes = g.r1.map(r => Math.sqrt(-1 / (4 * Math.log(r))) * o.size);
-    const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, g.eps), { w, h, wy0, P, B, D, valid } = st, n = w * h, tmp = new Float32Array(n), sn = g.sn;
+    const o = Object.assign({ strength: 1, amount: 1, size: 1, seed: 1, even: 1, onlySel: false }, opts || {});
+    const sizes = g.r1.map(r => sizeOf(r) * o.size);
+    const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, g.eps, true), { w, h, wy0, P, B, D, F, FP, valid } = st, n = w * h, tmp = new Float32Array(n), sn = g.sn;
     const wgs = gridMap(D[0], valid, w, h, wy0, g.kx, g.ky, 10), wg = new Float32Array(n);
     for (let i = 0; i < n; i++) wg[i] = smooth(0.05, 0.18, wgs[i]);
     const lg = lineGate(lineMaps(D[0], w, h), w, h, g.ss, g.sl, 2.0, 3.2);
     deblock(B, wg, w, h, wy0, g.kx, g.ky, 4 * sn + 3);
-    const bl = Float32Array.from(B[0]); gaussSmall(bl, w, h, 0.7, tmp);
+    const bl = B[0].slice(); gaussSmall(bl, w, h, 0.7, tmp);
     const flat = new Float32Array(n), k2 = 1 / (2.25 * sn * sn);
     for (let y = 0; y < h; y++) {
       const ro = y * w, up = Math.max(0, y - 1) * w, dn = Math.min(h - 1, y + 1) * w;
@@ -298,51 +413,74 @@
     if (o.onlySel && sel) { selw = new Float32Array(n); for (let i = 0; i < n; i++) selw[i] = sel[i] ? 1 : 0; gauss(selw, w, h, 3, tmp); }
     const mix = new Float32Array(n);
     for (let i = 0; i < n; i++) { const m = o.strength * wg[i] * flat[i] * (selw ? selw[i] : 1); mix[i] = m < 0 ? 0 : m > 1 ? 1 : m; }
-    // local texture strength from the original detail (calm areas only, over more than a cell)
+    // how much change is allowed at all (strength, selection), for the even-out top-up outside the grid areas
+    const allow = new Float32Array(n);
+    for (let i = 0; i < n; i++) allow[i] = valid[i] ? o.strength * (selw ? selw[i] : 1) : 0;
+    // local fine-band energy of a plane, calm areas only (edges and lines left out so they don't count), over a few cells
     const WT = reduce4(flat, w, h), ltmp = new Float32Array(WT.p.length); gauss(WT.p, WT.w, WT.h, 2, ltmp);
-    const res = [];
+    const lw = WT.w, lh = WT.h;
+    const energy = (f) => {
+      const AL = { p: new Float32Array(lw * lh), w: lw, h: lh }, AU = { p: new Float32Array(lw * lh), w: lw, h: lh }, pl = AL.p, pu = AU.p;
+      for (let y = 0; y < h; y++) { const oy = (y >> 2) * lw, ro = y * w; for (let x = 0; x < w; x++) { const i = ro + x, e = f[i] * f[i], q = oy + (x >> 2); pl[q] += e * flat[i]; pu[q] += e; } }
+      gauss(pl, lw, lh, 2, ltmp); gauss(pu, lw, lh, 2, ltmp);
+      for (let i = 0; i < AL.p.length; i++) AL.p[i] = (AL.p[i] + 0.02 * AU.p[i]) / (WT.p[i] + 0.02);
+      return expand4(AL, w, h);
+    };
+    const res = [], top = new Float32Array(n), chg = new Uint8Array(n), BY = B[0];
     for (let c = 0; c < 3; c++) {
-      const d0 = D[c], A0 = new Float32Array(n);
-      for (let i = 0; i < n; i++) A0[i] = d0[i] * d0[i] * flat[i];
-      const AL = reduce4(A0, w, h); gauss(AL.p, AL.w, AL.h, 2, ltmp);
-      for (let i = 0; i < AL.p.length; i++) AL.p[i] = Math.sqrt(AL.p[i] / Math.max(WT.p[i], 16e-3));
-      const A = expand4(AL, w, h);
-      // new grain: deterministic per-pixel noise, blurred to the measured grain size, unit variance
-      const G = A0;
-      for (let y = 0; y < h; y++) { const gy = y + wy0, ro = y * w; for (let x = 0; x < w; x++) G[ro + x] = gnoise(x, gy, c, o.seed); }
-      let norm = 1;
-      if (sizes[c] > 0.25) { const kk = gaussSmall(G, w, h, sizes[c], tmp); let s2 = 0; for (const v of kk) s2 += v * v; norm = 1 / s2; }
-      const R = new Float32Array(n), Pc = P[c], Bc = B[c], amt = o.amount * norm;
-      for (let i = 0; i < n; i++) { const m = mix[i]; R[i] = m ? Pc[i] + m * (amt * A[i] * G[i] - (Pc[i] - Bc[i])) : Pc[i]; }
+      const nl = g.nlf[c], Pc = P[c], Bc = B[c], Fc = F[c], FPc = FP[c], Vp = energy(FPc);
+      // 1. per pixel: the noise level for this brightness, texture vs noise, how much of the original detail stays
+      const N = new Float32Array(n), K = new Float32Array(n), cK = new Float32Array(n), kT = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const Nv = noiseAt(nl, BY[i]), v = Vp[i];
+        const k = v > 1e-6 ? Math.max(0, 1 - BETA * BETA * Nv * Nv / v) : 0;   // share of the local detail that is texture
+        const c0 = 1 - mix[i] * (1 - k);
+        N[i] = Nv; kT[i] = k; cK[i] = c0;
+        K[i] = FPc[i] - (1 - c0) * Fc[i];                                     // fine band of what stays of the original
+      }
+      const VK = energy(K);
+      // 2. new grain (same field the fill tools use) fills the noise up to an even level: what was taken out, plus
+      //    what JPEG had already wiped. Levels are fine-band levels, so the field is scaled by its fine share.
+      const G = grainField(0, wy0, w, h, c, o.seed, sizes[c]), norm = 1 / phi(sizes[c]), R = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const u = allow[i]; if (!u) { R[i] = Pc[i]; continue; }
+        const m = mix[i]; if (m > 0) chg[i] = 1;
+        const v = Vp[i], k = kT[i], nz2 = (1 - k) * v, am = 1 + m * (o.amount - 1), eN = o.even * u * N[i];
+        // re-textured areas get the photo's level (Even out) instead of their own; elsewhere only too-quiet areas are topped up
+        const Ne = o.even * N[i] * N[i] + (1 - o.even) * nz2, want = am * am * ((1 - m) * Math.max(nz2, eN * eN) + m * Ne), kept = Math.max(0, VK[i] - k * v), s2 = want - kept, s = s2 > 0 ? Math.sqrt(s2) : 0;
+        R[i] = Bc[i] + cK[i] * (Pc[i] - Bc[i]) + s * norm * G[i];
+        if (s > 0.02) chg[i] = 1;
+        if (c === 0) top[i] = o.even > 0 && N[i] > 0.05 ? Math.min(1, (1 - m) * s / N[i]) : 0;
+      }
       res.push(R);
     }
-    const ch = wn.c1 - wn.c0, out = new Uint8ClampedArray(ch * W * 4), map = new Uint8Array(ch * W * 2);
-    let acted = 0;
+    const ch = wn.c1 - wn.c0, out = new Uint8ClampedArray(ch * W * 4), map = new Uint8Array(ch * W * MB);
+    let acted = 0, topped = 0;
     for (let y = wn.c0; y < wn.c1; y++) for (let x = 0; x < W; x++) {
       const i = (y - wy0) * w + x, q = (y - wn.c0) * W + x, oo = q * 4, so = i * 4;
       out[oo] = wn.rgba[so]; out[oo + 1] = wn.rgba[so + 1]; out[oo + 2] = wn.rgba[so + 2]; out[oo + 3] = wn.rgba[so + 3];
-      map[q * 2] = Math.round(mix[i] * 255); map[q * 2 + 1] = valid[i] ? Math.round((1 - flat[i]) * 255) : 0;
-      if (!valid[i] || mix[i] === 0) continue;
-      if (mix[i] > 0.5 * o.strength) acted++;
+      map[q * MB] = Math.round(mix[i] * 255); map[q * MB + 1] = valid[i] ? Math.round((1 - flat[i]) * 255) : 0; map[q * MB + 2] = Math.round(top[i] * 255);
+      if (!valid[i] || !allow[i] || !chg[i]) continue;
+      if (mix[i] > 0.5 * o.strength) acted++; else if (top[i] > 0.25) topped++;
       const Yv = res[0][i], cb = res[1][i], cr = res[2][i];
       out[oo] = Yv + 1.402 * cr; out[oo + 1] = Yv - 0.344136 * cb - 0.714136 * cr; out[oo + 2] = Yv + 1.772 * cb;
     }
-    return { c0: wn.c0, c1: wn.c1, out, map, acted };
+    return { c0: wn.c0, c1: wn.c1, out, map, acted, topped };
   }
   // the whole image in this thread (tests / fallback). The page uses a pool of workers instead (stats + strip jobs).
   async function run(data, W, H, sel, opts, progress) {
     const t0 = Date.now(), tick = progress || (() => {}), L = layout(W, H);
     const g = stats(L.samples.map(w => Object.assign({ rgba: rowsOf(data, W, w) }, w)), W, H, opts);
-    const out = new Uint8ClampedArray(W * H * 4), map = new Uint8Array(W * H * 2); let acted = 0;
+    const out = new Uint8ClampedArray(W * H * 4), map = new Uint8Array(W * H * MB); let acted = 0, topped = 0;
     for (let k = 0; k < L.strips.length; k++) {
       tick(k / L.strips.length, 'de-gridding'); await new Promise(r => setTimeout(r, 0));
       const w = L.strips[k], r = strip(Object.assign({ rgba: rowsOf(data, W, w) }, w), W, g, opts, sel ? sel.subarray(w.wy0 * W, w.wy1 * W) : null);
-      out.set(r.out, w.c0 * W * 4); map.set(r.map, w.c0 * W * 2); acted += r.acted;
+      out.set(r.out, w.c0 * W * 4); map.set(r.map, w.c0 * W * MB); acted += r.acted; topped += r.topped;
     }
-    return { out, map, info: Object.assign({}, g, { acted: acted / (W * H), ms: Date.now() - t0, sizes: g.r1.map(r => Math.sqrt(-1 / (4 * Math.log(r))) * ((opts && opts.size) || 1)) }) };
+    return { out, map, info: Object.assign({}, g, { acted: acted / (W * H), topped: topped / (W * H), ms: Date.now() - t0, sizes: g.r1.map(r => sizeOf(r) * ((opts && opts.size) || 1)) }) };
   }
 
-  const Degrid = { run, stats, strip, layout, MG };
+  const Degrid = { run, stats, strip, layout, addGrain, profile, profileWins, MG, MB, tune: (q, b) => { NLQ = q; BETA = b; } };
   if (typeof module !== 'undefined' && module.exports) module.exports = Degrid;
   root.Degrid = Degrid;
   // worker mode: { job: 'stats', wins, W, H, opts } -> stats ; { job: 'strip', wn, W, g, opts, sel } -> rows

@@ -58,10 +58,10 @@ function setImage(src, w0, h0, nm) {
   mask = new Uint8Array(W * H);
   sel.n = 0; sel.x1 = sel.y1 = -1; tint = null; float = null;
   hist.length = 0; future.length = 0; histBytes = 0;
-  name = nm; loaded = true; dropPreview();
+  name = nm; loaded = true; dropPreview(); newGrainProfile();
   $('#meta').textContent = `${nm} · ${W}×${H}` + (k < 1 ? ` (working copy of ${w0}×${h0})` : '');
   $('#drop').classList.add('gone');
-  ['#save', '#all', '#fillholes', '#swarea', '#rnd', '#dg'].forEach(s => { $(s).disabled = false; });
+  ['#save', '#all', '#fillholes', '#swarea', '#rnd', '#dg', '#grain'].forEach(s => { $(s).disabled = false; });
   sync(); fit(); say('ready');
 }
 function sample() {
@@ -245,7 +245,7 @@ function nearColour(x, y) {
 }
 // fill the empty pixels under the brush; existing pixels are never painted over
 function paint(cx, cy, list) {
-  const h = (brush - 1) >> 1, col = fillSrc === 'colour' ? pickCol() : null, sw = fillSrc === 'swatches';
+  const h = (brush - 1) >> 1, col = fillSrc === 'colour' ? pickCol() : null, sw = fillSrc === 'swatches', start = list.length;
   let x0 = W, y0 = H, x1 = -1, y1 = -1;
   for (let y = cy - h; y <= cy + h; y++) for (let x = cx - h; x <= cx + h; x++) {
     if (!inside(x, y)) continue;
@@ -254,7 +254,15 @@ function paint(cx, cy, list) {
     px32[i] = pack(c[0], c[1], c[2]); list.push(i);
     if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
   }
-  if (x1 >= 0) redraw({ x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 });
+  if (x1 < 0) return;
+  const r = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+  if (grain.on) {                                   // grain for this dab's pixels; the density counts the whole stroke
+    const fresh = new Set(list.slice(start));
+    if (paint.list !== list) { paint.list = list; paint.made = new Set(); }      // a new stroke
+    for (const i of fresh) paint.made.add(i);
+    grainMade(r, (i) => fresh.has(i), (i) => paint.made.has(i));
+  }
+  redraw(r);
 }
 function line(a, b, list) {   // paint along the drag so fast strokes leave no gaps
   let [x, y] = a; const [x1, y1] = b, dx = Math.abs(x1 - x), dy = -Math.abs(y1 - y), sx = x < x1 ? 1 : -1, sy = y < y1 ? 1 : -1;
@@ -332,11 +340,22 @@ function randomize() {
   const useSel = sel.n > 0, r = useSel ? bbox() : { x: 0, y: 0, w: W, h: H };
   const rnd = mulberry((Math.random() * 4294967296) >>> 0), R = Math.max(1, rx.reach | 0);
   // frozen copy of the area plus its reach, so replacements come from the original pixels
-  const fx0 = Math.max(0, r.x - R), fy0 = Math.max(0, r.y - R), fx1 = Math.min(W, r.x + r.w + R), fy1 = Math.min(H, r.y + r.h + R), fw = fx1 - fx0;
+  const fx0 = Math.max(0, r.x - R - 2), fy0 = Math.max(0, r.y - R - 2), fx1 = Math.min(W, r.x + r.w + R + 2), fy1 = Math.min(H, r.y + r.h + R + 2), fw = fx1 - fx0;
   const frozen = new Uint32Array(fw * (fy1 - fy0));
   for (let y = fy0; y < fy1; y++) frozen.set(px32.subarray(y * W + fx0, y * W + fx1), (y - fy0) * fw);
   const before = snap(r);
-  const pAmt = rx.amt / 100, pDel = rx.del / 100;
+  const pAmt = rx.amt / 100, pDel = rx.del / 100, fresh = grain.on ? new Uint8Array(r.w * r.h) : null;
+  // with photo grain on, a replacement is the smooth colour around the source pixel plus fresh grain at the photo's level,
+  // so recoloured pixels carry the same noise as their surroundings instead of a stray dot
+  const smoothAt = (X, Y) => {
+    let sr = 0, sg = 0, sb = 0, c = 0;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const xx = X + dx, yy = Y + dy; if (xx < fx0 || yy < fy0 || xx >= fx1 || yy >= fy1) continue;
+      const v = frozen[(yy - fy0) * fw + (xx - fx0)]; if (!(v >>> 24)) continue;
+      sr += v & 255; sg += (v >>> 8) & 255; sb += (v >>> 16) & 255; c++;
+    }
+    return pack(Math.round(sr / c), Math.round(sg / c), Math.round(sb / c));
+  };
   let changed = 0, deleted = 0;
   for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) {
     const i = y * W + x;
@@ -345,15 +364,18 @@ function randomize() {
     changed++;
     if (rnd() < pDel) { px32[i] = 0; deleted++; continue; }
     const fromSw = rx.src === 'swatches' || (rx.src === 'mix' && rnd() < 0.5);
-    if (fromSw && swatches.length) { const c = randSwatch(rnd); px32[i] = pack(c[0], c[1], c[2]); continue; }
+    if (fromSw && swatches.length) { const c = randSwatch(rnd); px32[i] = pack(c[0], c[1], c[2]); if (fresh) fresh[(y - r.y) * r.w + x - r.x] = 1; continue; }
     for (let t = 0; t < 8; t++) {                // a random non-empty pixel within reach
       const X = x + Math.round((rnd() * 2 - 1) * R), Y = y + Math.round((rnd() * 2 - 1) * R);
       if (X < fx0 || Y < fy0 || X >= fx1 || Y >= fy1) continue;
       const v = frozen[(Y - fy0) * fw + (X - fx0)];
-      if (v >>> 24) { px32[i] = v; break; }
+      if (v >>> 24) { if (fresh) { px32[i] = smoothAt(X, Y); fresh[(y - r.y) * r.w + x - r.x] = 1; } else px32[i] = v; break; }
     }
   }
   if (!changed) { say('nothing changed: raise Amount'); return; }
+  // scattered among untouched pixels, the swap itself already reads as grain; the denser the swap, the more fresh grain
+  // the replacements need (none at a light sprinkle, the photo's full level when every pixel is replaced)
+  if (fresh) { const q = pAmt * (1 - pDel), a = q * q; grain.seed++; regrain(r, (i) => a * fresh[(((i / W) | 0) - r.y) * r.w + (i % W) - r.x], true); }
   record(r, before, snap(r), 'randomize'); lastRandom = hist[hist.length - 1];
   redraw(r); need(); syncRandom();
   say(`randomized ${changed.toLocaleString()} pixels${useSel ? ' in the selection' : ''} · ${deleted.toLocaleString()} deleted, ${(changed - deleted).toLocaleString()} recoloured`);
@@ -371,43 +393,88 @@ function syncRandom() {
   try { localStorage.setItem('ie2.pixels.random', JSON.stringify(rx)); } catch (e) { /* ignore */ }
 }
 
-// onion peel: each round fills the holes touching real pixels with the average of those neighbours.
-// Returns how many holes had nothing around to borrow from.
-function peel(hole, n) {
-  const touches = (i) => { const x = i % W, y = (i / W) | 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if ((dx || dy) && X >= 0 && Y >= 0 && X < W && Y < H) { const j = Y * W + X; if (!hole[j] && !isEmpty(j)) return true; } } return false; };
-  const queued = new Uint8Array(W * H);
-  let front = [];
-  for (let i = 0; i < hole.length; i++) if (hole[i] && touches(i)) { front.push(i); queued[i] = 1; }
-  let left = n;
-  while (front.length) {
-    const cols = new Uint32Array(front.length);
-    for (let k = 0; k < front.length; k++) {
-      const i = front[k], x = i % W, y = (i / W) | 0; let sr = 0, sg = 0, sb = 0, c = 0;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const X = x + dx, Y = y + dy; if (!(dx || dy) || X < 0 || Y < 0 || X >= W || Y >= H) continue;
-        const j = Y * W + X; if (hole[j] || isEmpty(j)) continue;
-        const o = j * 4; sr += data[o]; sg += data[o + 1]; sb += data[o + 2]; c++;
-      }
-      cols[k] = c ? pack(Math.round(sr / c), Math.round(sg / c), Math.round(sb / c)) : 0;
-    }
-    const next = [];
-    for (let k = 0; k < front.length; k++) if (cols[k]) { px32[front[k]] = cols[k]; hole[front[k]] = 0; left--; }
-    for (const i of front) {
-      const x = i % W, y = (i / W) | 0;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
-        const j = Y * W + X; if (hole[j] && !queued[j]) { queued[j] = 1; next.push(j); }
-      }
-    }
-    front = next;
+// fill holes from their surroundings: every hole pixel is bridged along its row (between the nearest real pixels left
+// and right) and along its column (above and below), and the shorter bridge counts most. A line or edge that crosses
+// the hole is carried straight through instead of being smeared, and nothing is copied. For longer bridges the rim
+// colours are averaged outward along the bridge (and only ±2 pixels across it, so edges stay sharp) so single noisy
+// pixels don't streak across; the grain comes after (Photo grain). Memory stays proportional to the holes, so filling
+// millions of scattered holes in a big photo is fine. Returns how many holes had nothing around to borrow from.
+function bridgeFill(hole, n) {
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (let y = 0; y < H; y++) { const o = y * W; for (let x = 0; x < W; x++) if (hole[o + x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; y1 = y; } }
+  if (x1 < 0) return 0;
+  const pad = 8, wx0 = Math.max(0, x0 - pad), wy0 = Math.max(0, y0 - pad), w = Math.min(W, x1 + pad + 1) - wx0, h = Math.min(H, y1 + pad + 1) - wy0;
+  // window map: 1 = real pixel to borrow from, 2 = hole to fill, 0 = other empty pixel
+  const kind = new Uint8Array(w * h), rowStart = new Int32Array(h + 1);
+  for (let y = 0; y < h; y++) {
+    let c = 0;
+    for (let x = 0, i = (y + wy0) * W + wx0, q = y * w; x < w; x++, i++, q++) { if (hole[i]) { kind[q] = 2; c++; } else if (data[i * 4 + 3]) kind[q] = 1; }
+    rowStart[y + 1] = rowStart[y] + c;                 // hole pixels are numbered row by row
   }
-  return left;
+  const N = rowStart[h], acc = [new Float32Array(N), new Float32Array(N), new Float32Array(N)], wt = new Float32Array(N);
+  const ca = [0, 0, 0], cb = [0, 0, 0];
+  // rim colour into out: the rim pixel itself for short bridges; for longer ones the average of the real pixels
+  // outward along the bridge and ±2 across it
+  const rim = (out, x, y, dir, row, span) => {
+    if (span <= 3) { const o = ((y + wy0) * W + x + wx0) * 4; out[0] = data[o]; out[1] = data[o + 1]; out[2] = data[o + 2]; return; }
+    const r = clamp(Math.round(span / 6), 2, 12);
+    const xa = row ? (dir < 0 ? x - r : x) : x - 2, xe = row ? (dir < 0 ? x : x + r) : x + 2, ya = row ? y - 2 : (dir < 0 ? y - r : y), ye = row ? y + 2 : (dir < 0 ? y : y + r);
+    let R = 0, G = 0, B = 0, k = 0;
+    for (let yy = Math.max(0, ya); yy <= Math.min(h - 1, ye); yy++) for (let xx = Math.max(0, xa); xx <= Math.min(w - 1, xe); xx++) {
+      if (kind[yy * w + xx] !== 1) continue; const o = ((yy + wy0) * W + xx + wx0) * 4; R += data[o]; G += data[o + 1]; B += data[o + 2]; k++;
+    }
+    out[0] = R / k; out[1] = G / k; out[2] = B / k;
+  };
+  const add = (q, wq, t, A, B) => { const u = 1 - t; acc[0][q] += wq * (A[0] * u + B[0] * t); acc[1][q] += wq * (A[1] * u + B[1] * t); acc[2][q] += wq * (A[2] * u + B[2] * t); wt[q] += wq; };
+  // along rows
+  for (let y = 0; y < h; y++) {
+    let last = -1, id = rowStart[y]; const ro = y * w;
+    for (let k = 0; k <= w; k++) {
+      if (k < w && kind[ro + k] !== 1) continue;
+      if (k - last > 1) {
+        const hasA = last >= 0, hasB = k < w, span = k - last;
+        if (hasA) rim(ca, last, y, -1, true, span); if (hasB) rim(cb, k, y, 1, true, span);
+        for (let j = last + 1; j < k; j++) {
+          if (kind[ro + j] !== 2) continue; const q = id++;
+          if (hasA && hasB) add(q, 1 / (span * span), (j - last) / span, ca, cb);
+          else if (hasA || hasB) { const d = hasA ? j - last : k - j; add(q, 1 / (16 * d * d), 0, hasA ? ca : cb, hasA ? ca : cb); }
+        }
+      }
+      last = k;
+    }
+  }
+  // along columns
+  const cnt = new Int32Array(h);
+  for (let x = 0; x < w; x++) {
+    let last = -1;
+    for (let k = 0; k <= h; k++) {
+      if (k < h && kind[k * w + x] !== 1) continue;
+      if (k - last > 1) {
+        const hasA = last >= 0, hasB = k < h, span = k - last;
+        if (hasA) rim(ca, x, last, -1, false, span); if (hasB) rim(cb, x, k, 1, false, span);
+        for (let j = last + 1; j < k; j++) {
+          if (kind[j * w + x] !== 2) continue; const q = rowStart[j] + cnt[j]++;
+          if (hasA && hasB) add(q, 1 / (span * span), (j - last) / span, ca, cb);
+          else if (hasA || hasB) { const d = hasA ? j - last : k - j; add(q, 1 / (16 * d * d), 0, hasA ? ca : cb, hasA ? ca : cb); }
+        }
+      }
+      last = k;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    let id = rowStart[y];
+    for (let x = 0, i = (y + wy0) * W + wx0, q0 = y * w; x < w; x++, i++) {
+      if (kind[q0 + x] !== 2) continue; const q = id++; if (!wt[q]) continue;
+      px32[i] = pack(Math.round(acc[0][q] / wt[q]), Math.round(acc[1][q] / wt[q]), Math.round(acc[2][q] / wt[q])); hole[i] = 0; n--;
+    }
+  }
+  return n;
 }
 // give every marked pixel a colour from the current fill source
 function fillMarked(hole, n) {
   if (fillSrc === 'colour') { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; return; }
   if (fillSrc === 'swatches') { for (let i = 0; i < hole.length; i++) if (hole[i]) { const c = randSwatch(); px32[i] = pack(c[0], c[1], c[2]); } return; }
-  if (peel(hole, n) > 0) { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }   // nothing around to borrow from
+  if (bridgeFill(hole, n) > 0) { const c = pickCol(), w = pack(c[0], c[1], c[2]); for (let i = 0; i < hole.length; i++) if (hole[i]) px32[i] = w; }   // nothing around to borrow from
 }
 // fill every empty pixel in the selection (or the whole image) from the outside in
 function fillHoles() {
@@ -416,21 +483,56 @@ function fillHoles() {
   const hole = new Uint8Array(W * H); let n = 0;
   for (let y = r.y; y < r.y + r.h; y++) for (let i = y * W + r.x, e = i + r.w; i < e; i++) if (isEmpty(i) && (!useSel || mask[i])) { hole[i] = 1; n++; }
   if (!n) { say(useSel ? 'no empty pixels in the selection' : 'no empty pixels to fill'); return; }
-  const before = snap(r);
+  const before = snap(r), was = grain.on ? hole.slice() : null;
   fillMarked(hole, n);
+  if (was) { grain.seed++; grainMade(r, (i) => was[i] === 1); }
   record(r, before, snap(r), 'fill holes'); redraw(r); need();
   say(`filled ${n.toLocaleString()} empty pixel${n > 1 ? 's' : ''}` + (useSel ? ' in the selection' : ''));
 }
+/* ---------------- photo grain ----------------
+ * One noise profile per image (how much grain the photo has at each brightness, and how coarse it is), measured by
+ * degrid.js. Fill, Fill holes and Randomize add grain from it to the pixels they make, so new pixels carry the same
+ * noise as the rest of the photo: not smooth, not speckled. Toggle with the Photo grain button. */
+const grain = { on: true, prof: null, seed: 7919 };
+try { const v = JSON.parse(localStorage.getItem('ie2.pixels.grain') || '{}'); if ('on' in v) grain.on = !!v.on; } catch (e) { /* ignore */ }
+let imgId = 0;
+function newGrainProfile() {
+  const id = ++imgId; grain.prof = null;
+  setTimeout(() => {                                   // measure in the background right after opening
+    if (id !== imgId || grain.prof) return;
+    const P = getPool(); if (!P.length) return;
+    const pw = Degrid.profileWins(data, W, H);
+    call(P[0], { job: 'stats', wins: pw.wins, W: pw.W, H, opts: { noiseOnly: true } }).then(m => { if (id === imgId && !grain.prof) grain.prof = m.g; }).catch(() => { /* measured on demand instead */ });
+  }, 250);
+}
+function grainProfile() { if (!grain.prof) grain.prof = Degrid.profile(data, W, H); return grain.prof; }
+function regrain(r, pick, scattered) { return grain.on && loaded ? Degrid.addGrain(data, W, r, pick, grainProfile(), grain.seed, 1, !!scattered) : 0; }
+// grain for pixels that were just made (filled holes, painted pixels). Pixels in the middle of a made area get the
+// photo's grain field; scattered pin-holes sit between real pixels that already carry grain, so they get only a little
+// pixel noise (more the denser they are), or they'd read as dots. isNew(i): pixel i gets grain now; made(i): pixel i
+// counts as made for the density (e.g. the whole brush stroke so far).
+function grainMade(r, isNew, made = isNew) {
+  if (!grain.on || !loaded) return;
+  const x0 = Math.max(0, r.x - 2), y0 = Math.max(0, r.y - 2), w = Math.min(W, r.x + r.w + 2) - x0, h = Math.min(H, r.y + r.h + 2) - y0;
+  const hz = new Uint8Array(w * h), dn = new Uint8Array(w * h);              // made pixels in the 5×5 box around each
+  for (let y = 0; y < h; y++) { let c = 0; const o = (y0 + y) * W + x0; for (let x = -2; x < w; x++) { if (x + 2 < w && made(o + x + 2)) c++; if (x - 3 >= 0 && made(o + x - 3)) c--; if (x >= 0) hz[y * w + x] = c; } }
+  for (let x = 0; x < w; x++) { let c = 0; for (let y = -2; y < h; y++) { if (y + 2 < h) c += hz[(y + 2) * w + x]; if (y - 3 >= 0) c -= hz[(y - 3) * w + x]; if (y >= 0) dn[y * w + x] = c; } }
+  const at = (i) => dn[(((i / W) | 0) - y0) * w + (i % W) - x0] / 25, solid = (d) => { const t = clamp((d - 0.4) / 0.4, 0, 1); return t * t * (3 - 2 * t); };
+  regrain(r, (i) => isNew(i) ? solid(at(i)) : 0);
+  regrain(r, (i) => { if (!isNew(i)) return 0; const d = at(i); return (1 - solid(d)) * d * d; }, true);
+}
+function syncGrain() { $('#grain').classList.toggle('on', grain.on); $('#grain').setAttribute('aria-pressed', grain.on); try { localStorage.setItem('ie2.pixels.grain', JSON.stringify({ on: grain.on })); } catch (e) { /* ignore */ } }
+
 /* ---------------- de-grid (degrid.js does the work, in a pool of workers) ---------------- */
-const dg = { strength: 100, amount: 100, size: 100, protect: 2.5, onlySel: false, seed: 1, view: 'result', busy: false, res: null, peek: false, job: 0, timer: 0 };
-try { const v = JSON.parse(localStorage.getItem('ie2.pixels.degrid') || '{}'); for (const k of ['strength', 'amount', 'size', 'protect', 'onlySel']) if (k in v) dg[k] = v[k]; } catch (e) { /* ignore */ }
+const dg = { strength: 100, amount: 100, size: 100, protect: 2.5, even: 100, onlySel: false, seed: 1, view: 'result', busy: false, res: null, peek: false, job: 0, timer: 0 };
+try { const v = JSON.parse(localStorage.getItem('ie2.pixels.degrid') || '{}'); for (const k of ['strength', 'amount', 'size', 'protect', 'even', 'onlySel']) if (k in v) dg[k] = v[k]; } catch (e) { /* ignore */ }
 const pimg = document.createElement('canvas'), pctx = pimg.getContext('2d');      // result
 const mimg = document.createElement('canvas'), mctx = mimg.getContext('2d');      // map overlay
 let pool = null;
 function getPool() {
   if (pool) return pool;
   pool = [];
-  try { const n = clamp(navigator.hardwareConcurrency || 4, 2, 8); for (let i = 0; i < n; i++) pool.push(new Worker('degrid.js?b=20')); }
+  try { const n = clamp(navigator.hardwareConcurrency || 4, 2, 8); for (let i = 0; i < n; i++) pool.push(new Worker('degrid.js?b=21')); }
   catch (e) { pool = []; }                    // e.g. opened from file:// - fall back to this thread
   return pool;
 }
@@ -444,7 +546,7 @@ function call(w, msg, transfer) {
     w.postMessage(Object.assign({ id }, msg), transfer || []);
   });
 }
-function dgOpts() { return { strength: dg.strength / 100, amount: dg.amount / 100, size: dg.size / 100, protect: dg.protect, seed: dg.seed, onlySel: dg.onlySel && sel.n > 0 }; }
+function dgOpts() { return { strength: dg.strength / 100, amount: dg.amount / 100, size: dg.size / 100, protect: dg.protect, even: dg.even / 100, seed: dg.seed, onlySel: dg.onlySel && sel.n > 0 }; }
 async function runDegrid() {
   if (!loaded || float) return;
   clearTimeout(dg.timer);
@@ -452,8 +554,8 @@ async function runDegrid() {
   dg.busy = true; syncDegrid();
   const rows = (w) => data.slice(w.wy0 * W * 4, w.wy1 * W * 4);
   const selRows = (w) => opts.onlySel ? mask.slice(w.wy0 * W, w.wy1 * W) : null;
-  const out = new Uint8ClampedArray(data), map = new Uint8Array(W * H * 2);
-  let g = null, acted = 0;
+  const MB = Degrid.MB, out = new Uint8ClampedArray(data), map = new Uint8Array(W * H * MB);
+  let g = null, acted = 0, topped = 0;
   try {
     const P = getPool();
     if (P.length) {
@@ -466,13 +568,13 @@ async function runDegrid() {
           const w = L.strips[next++], rgba = rows(w), sm = selRows(w);
           const r = (await call(wk, { job: 'strip', wn: Object.assign({ rgba }, w), W, g, opts, sel: sm }, sm ? [rgba.buffer, sm.buffer] : [rgba.buffer])).r;
           if (job !== dg.job) return;
-          out.set(r.out, w.c0 * W * 4); map.set(r.map, w.c0 * W * 2); acted += r.acted;
+          out.set(r.out, w.c0 * W * 4); map.set(r.map, w.c0 * W * MB); acted += r.acted; topped += r.topped;
           say(`de-grid: ${Math.round(100 * ++done / L.strips.length)}%`);
         }
       }));
     } else {
       const r = await Degrid.run(data, W, H, opts.onlySel ? mask : null, opts, (p) => say(`de-grid: ${Math.round(100 * p)}%`));
-      out.set(r.out); map.set(r.map); g = r.info; acted = r.info.acted * W * H;
+      out.set(r.out); map.set(r.map); g = r.info; acted = r.info.acted * W * H; topped = r.info.topped * W * H;
     }
   } catch (e) {
     if (job === dg.job) { dg.busy = false; syncDegrid(); say('de-grid failed: ' + e.message, true); }
@@ -480,14 +582,15 @@ async function runDegrid() {
   }
   if (job !== dg.job) return;
   dg.busy = false;
-  dg.res = { out, map, g, acted: acted / (W * H), ms: Math.round(performance.now() - t0) };
+  dg.res = { out, map, g, acted: acted / (W * H), topped: topped / (W * H), ms: Math.round(performance.now() - t0) };
   pimg.width = W; pimg.height = H; pctx.putImageData(new ImageData(out, W, H), 0, 0);
-  // map: orange where it re-textures (grid found), blue where it keeps structure
+  // map: orange where it re-textures (grid found), yellow where it only adds grain (too quiet), blue where it keeps structure
   mimg.width = W; mimg.height = H;
   const md = new ImageData(W, H), q = md.data;
   for (let i = 0; i < W * H; i++) {
-    const m = map[i * 2], k = map[i * 2 + 1], o = i * 4;
+    const m = map[i * MB], k = map[i * MB + 1], t = map[i * MB + 2], o = i * 4;
     if (k > m && k > 40) { q[o] = 30; q[o + 1] = 170; q[o + 2] = 220; q[o + 3] = k * 0.75; }
+    else if (t > m) { q[o] = 245; q[o + 1] = 200; q[o + 2] = 40; q[o + 3] = t * 0.6; }
     else { q[o] = 228; q[o + 1] = 71; q[o + 2] = 27; q[o + 3] = m * 0.6; }
   }
   mctx.putImageData(md, 0, 0);
@@ -495,14 +598,14 @@ async function runDegrid() {
   say(g.gap < 0.06 ? 'de-grid: no clear JPEG grid in this image, little to change' : `de-grid preview ready: Apply to keep it, hold C to compare`);
 }
 function schedule() { if (dg.res || dg.busy) { clearTimeout(dg.timer); dg.timer = setTimeout(runDegrid, 350); } saveDg(); syncDegrid(); }
-function saveDg() { try { localStorage.setItem('ie2.pixels.degrid', JSON.stringify({ strength: dg.strength, amount: dg.amount, size: dg.size, protect: dg.protect, onlySel: dg.onlySel })); } catch (e) { /* ignore */ } }
+function saveDg() { try { localStorage.setItem('ie2.pixels.degrid', JSON.stringify({ strength: dg.strength, amount: dg.amount, size: dg.size, protect: dg.protect, even: dg.even, onlySel: dg.onlySel })); } catch (e) { /* ignore */ } }
 function dropPreview(msg) { dg.job++; clearTimeout(dg.timer); const had = dg.res || dg.busy; dg.res = null; dg.busy = false; dg.peek = false; pimg.width = pimg.height = mimg.width = mimg.height = 1; if (had) { syncDegrid(); need(); if (msg) say(msg); } }
 function applyDegrid() {
   if (!dg.res || float) return;
   const { out, map } = dg.res;
   // only the rows that change
   let y0 = H, y1 = -1;
-  for (let y = 0; y < H; y++) { const o = y * W * 2; for (let x = 0; x < W; x++) if (map[o + x * 2]) { if (y < y0) y0 = y; y1 = y; break; } }
+  for (let y = 0; y < H; y++) { const o = y * W * 4; for (let x = 0; x < W * 4; x++) if (out[o + x] !== data[o + x]) { if (y < y0) y0 = y; y1 = y; break; } }
   if (y1 < 0) { dropPreview('de-grid: nothing to change'); return; }
   const r = { x: 0, y: y0, w: W, h: y1 - y0 + 1 }, before = snap(r);
   data.set(out.subarray(y0 * W * 4, (y1 + 1) * W * 4), y0 * W * 4);
@@ -515,7 +618,7 @@ function selectGrid() {
   if (!dg.res) return;
   const mode = heldMode() || modeBtn, map = dg.res.map;
   if (mode === 'replace') mask.fill(0);
-  for (let i = 0; i < W * H; i++) { const on = map[i * 2] >= 128; if (mode === 'sub') { if (on) mask[i] = 0; } else if (mode === 'toggle') { if (on) mask[i] ^= 1; } else if (on) mask[i] = 1; }
+  for (let i = 0, MB = Degrid.MB; i < W * H; i++) { const on = map[i * MB] >= 128; if (mode === 'sub') { if (on) mask[i] = 0; } else if (mode === 'toggle') { if (on) mask[i] ^= 1; } else if (on) mask[i] = 1; }
   rescan(); need(); say(`selected where the grid was found · ${sel.n.toLocaleString()} pixels`);
 }
 function syncDegrid() {
@@ -524,6 +627,7 @@ function syncDegrid() {
   $('#dgstr').value = dg.strength; $('#dgstrv').textContent = dg.strength + '%';
   $('#dgamt').value = dg.amount; $('#dgamtv').textContent = dg.amount + '%';
   $('#dgsize').value = dg.size; $('#dgsizev').textContent = dg.size + '%';
+  $('#dgeven').value = dg.even; $('#dgevenv').textContent = dg.even + '%';
   $('#dgprot').value = dg.protect; $('#dgprotv').textContent = (+dg.protect).toFixed(2).replace(/0$/, '');
   $('#dgsel').checked = dg.onlySel; $('#dgsel').disabled = !sel.n;
   document.querySelectorAll('#dgview button').forEach(b => { b.classList.toggle('on', b.dataset.v === dg.view); b.disabled = !dg.res; });
@@ -532,7 +636,8 @@ function syncDegrid() {
   const r = dg.res;
   $('#dgres').textContent = dg.busy ? 'working… (big images take a few seconds)' : !r ? 'Not run yet. Preview shows the result before anything changes.'
     : r.g.gap < 0.06 ? `No clear JPEG grid found (strength ${r.g.gap.toFixed(2)}). Little will change.`
-    : `Grid found at offset ${r.g.kx + 1 & 7},${r.g.ky + 1 & 7} · strength ${r.g.gap.toFixed(2)} ${r.g.gap > 0.3 ? '(strong)' : r.g.gap > 0.15 ? '(clear)' : '(faint)'} · re-textures ${Math.round(100 * r.acted)}% of the image · ${(r.ms / 1000).toFixed(1)} s`;
+    : `Grid found at offset ${r.g.kx + 1 & 7},${r.g.ky + 1 & 7} · strength ${r.g.gap.toFixed(2)} ${r.g.gap > 0.3 ? '(strong)' : r.g.gap > 0.15 ? '(clear)' : '(faint)'} · re-textures ${Math.round(100 * r.acted)}% of the image`;
+  if (r && !dg.busy) $('#dgres').textContent += ` · adds grain to ${Math.round(100 * r.topped)}% that was too quiet · ${(r.ms / 1000).toFixed(1)} s`;
 }
 
 /* ---------------- view ---------------- */
@@ -660,7 +765,7 @@ view.addEventListener('pointerdown', (e) => {
   if (tool === 'hand' || spaceDown || e.button === 1 || e.button === 2) { drag = { mode: 'pan', cx, cy, tx, ty }; stage.classList.add('panning'); return; }
   if (e.button !== 0) return;
   const [x, y] = toImg(cx, cy);
-  if (tool === 'fill') { drag = { mode: 'fill', filled: [], last: [x, y] }; paint(x, y, drag.filled); need(); return; }
+  if (tool === 'fill') { grain.seed++; drag = { mode: 'fill', filled: [], last: [x, y] }; paint(x, y, drag.filled); need(); return; }
   if (tool === 'pick') { pickAt(x, y); return; }
   const mode = selMode(e);
   if (inside(x, y) && mask[y * W + x] && !heldMode(e) && modeBtn !== 'sub') { lift(); drag = { mode: 'move', cx, cy }; sync(); need(); return; }
@@ -777,6 +882,8 @@ $('#rapply').addEventListener('click', randomize);
 $('#rroll').addEventListener('click', reroll);
 document.addEventListener('pointerdown', (e) => { if (!$('#rpop').hidden && !e.target.closest('#rpop, #rnd')) $('#rpop').hidden = true; });
 $('#fillholes').addEventListener('click', fillHoles);
+$('#grain').addEventListener('click', () => { grain.on = !grain.on; syncGrain(); say(grain.on ? 'photo grain on: filled and recoloured pixels get the photo’s own grain' : 'photo grain off: filled and recoloured pixels are plain colours'); });
+syncGrain();
 function toggleDg(show) { const p = $('#dgpop'); p.hidden = show === undefined ? !p.hidden : !show; syncDegrid(); }
 $('#dg').addEventListener('click', () => toggleDg());
 $('#dgclose').addEventListener('click', () => toggleDg(false));
@@ -786,7 +893,7 @@ $('#dgapply').addEventListener('click', applyDegrid);
 $('#dgcancel').addEventListener('click', () => dropPreview('de-grid preview discarded'));
 $('#dgselect').addEventListener('click', selectGrid);
 document.querySelectorAll('#dgview button').forEach(b => b.addEventListener('click', () => { dg.view = b.dataset.v; syncDegrid(); need(); }));
-for (const [id, k] of [['#dgstr', 'strength'], ['#dgamt', 'amount'], ['#dgsize', 'size'], ['#dgprot', 'protect']]) $(id).addEventListener('input', (e) => { dg[k] = +e.target.value; schedule(); });
+for (const [id, k] of [['#dgstr', 'strength'], ['#dgamt', 'amount'], ['#dgsize', 'size'], ['#dgprot', 'protect'], ['#dgeven', 'even']]) $(id).addEventListener('input', (e) => { dg[k] = +e.target.value; schedule(); });
 $('#dgsel').addEventListener('change', (e) => { dg.onlySel = e.target.checked; schedule(); });
 // hold C to flip to the original while a preview is up
 window.addEventListener('keydown', (e) => { if (e.repeat || /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) || e.ctrlKey || e.metaKey || e.altKey) return; const k = (e.key || '').toLowerCase(); if (k === 'c' && dg.res) { dg.peek = true; need(); } else if (k === 'd' && loaded) toggleDg(); });

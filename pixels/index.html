@@ -67,7 +67,9 @@ kbd { font: 600 10px var(--mono); border: 1px solid currentColor; border-radius:
 .dock .wide { width: 100%; }
 .seg.full { display: flex; } .seg.full button { flex: 1; }
 .key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; }
-.key.k1 { background: rgba(228,71,27,.75); } .key.k2 { background: rgba(30,170,220,.85); }
+.key.k1 { background: rgba(228,71,27,.75); } .key.k2 { background: rgba(30,170,220,.85); } .key.k3 { background: rgba(245,200,40,.85); }
+.b.tg::before { content: ''; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid currentColor; }
+.b.tg.on { color: var(--ink); } .b.tg.on::before { background: var(--acc); border-color: var(--acc); }
 .meta { font: 12px var(--mono); color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .grow { flex: 1; }
 .stage { position: relative; overflow: hidden; background: var(--stage); touch-action: none; }
@@ -146,6 +148,7 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span class="sep"></span>
   <button class="b q" id="del" type="button" title="Delete selected pixels (Delete)" disabled>Delete</button>
   <button class="b q" id="fillholes" type="button" title="Fill every empty pixel in the selection (or the whole image) from its surroundings" disabled>Fill holes</button>
+  <button class="b q tg" id="grain" type="button" aria-pressed="true" title="Photo grain: Fill, Fill holes and Randomize give the pixels they make the photo’s own grain (same strength per brightness, same grain size), so they don’t look smooth or speckled. Click to turn off for plain colours." disabled>Photo grain</button>
   <div class="exp">
     <button class="b q" id="rnd" type="button" title="Randomly delete or replace pixels in the selection (or the whole image)" disabled>Randomize…</button>
     <div class="xpop left" id="rpop" hidden>
@@ -155,7 +158,7 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <div class="xrow"><span>Deleted</span><span class="qv"><input id="rdel" type="range" min="0" max="100" step="1" value="30" aria-label="Share of changed pixels deleted"><b id="rdelv">30%</b></span></div>
       <div class="xrow"><span>Replace with</span><select id="rsrc"><option value="near">nearby pixels</option><option value="swatches">swatches</option><option value="mix">nearby + swatches</option></select></div>
       <div class="xrow"><span>Reach</span><span class="qv"><input id="rreach" type="range" min="1" max="40" step="1" value="4" aria-label="How far replacement colours come from"><b id="rreachv">4</b></span></div>
-      <p class="xnote">Of the pixels it picks, “Deleted” become empty and the rest take a colour from a random pixel within “Reach”, or from your swatches.</p>
+      <p class="xnote">Of the pixels it picks, “Deleted” become empty and the rest take a colour from a random pixel within “Reach”, or from your swatches. With Photo grain on, a new colour is the smooth colour there plus grain matched to the photo, so it doesn’t leave stray dots.</p>
       <div class="row2"><button class="b go" id="rapply" type="button">Apply</button><button class="b" id="rroll" type="button" title="Undo the last randomize and roll new dice" disabled>Re-roll</button></div>
     </div>
   </div>
@@ -168,14 +171,15 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <canvas id="view" draggable="false"></canvas>
   <aside class="dock" id="dgpop" hidden>
     <div class="dhead"><h4>De-grid · JPEG blocks</h4><button class="b q sm" id="dgclose" type="button" title="Close (keeps the preview until you Apply or Cancel)">✕</button></div>
-    <p class="xnote">Finds the JPEG 8×8 grid and replaces the stamped texture inside each cell with continuous grain of the same strength and grain size. Light, shading, colour, lines and edges stay. Nothing is blurred and no pixels are copied.</p>
+    <p class="xnote">Finds the JPEG 8×8 grid and replaces the stamped texture inside each cell with continuous grain at the photo’s own level for that brightness. Areas JPEG left too quiet get grain added; areas that are already fine and real texture are left alone. Light, shading, colour, lines and edges stay. Nothing is blurred and no pixels are copied.</p>
     <button class="b go wide" id="dgrun" type="button">Preview</button>
     <p class="xnote res" id="dgres">Not run yet.</p>
     <div class="seg full" id="dgview" role="group" aria-label="Show"><button type="button" data-v="orig">Original</button><button type="button" data-v="result" class="on">Result</button><button type="button" data-v="map">Map</button></div>
-    <p class="xnote"><i class="key k1"></i> grid found, re-textured &nbsp; <i class="key k2"></i> kept (lines, edges). Hold <kbd>C</kbd> to flip to the original.</p>
+    <p class="xnote"><i class="key k1"></i> grid found, re-textured &nbsp; <i class="key k3"></i> too quiet, grain added &nbsp; <i class="key k2"></i> kept (lines, edges). Hold <kbd>C</kbd> to flip to the original.</p>
     <div class="xrow"><span>Strength</span><span class="qv"><input id="dgstr" type="range" min="0" max="100" step="5" value="100" aria-label="Strength"><b id="dgstrv">100%</b></span></div>
     <div class="xrow"><span>Grain amount</span><span class="qv"><input id="dgamt" type="range" min="50" max="150" step="5" value="100" aria-label="Grain amount"><b id="dgamtv">100%</b></span></div>
     <div class="xrow"><span>Grain size</span><span class="qv"><input id="dgsize" type="range" min="50" max="200" step="5" value="100" aria-label="Grain size"><b id="dgsizev">100%</b></span></div>
+    <div class="xrow"><span>Even out noise</span><span class="qv"><input id="dgeven" type="range" min="0" max="100" step="5" value="100" aria-label="Even out noise"><b id="dgevenv">100%</b></span></div>
     <div class="xrow"><span>Keep detail</span><span class="qv"><input id="dgprot" type="range" min="1" max="5" step="0.25" value="2.5" aria-label="Keep detail"><b id="dgprotv">2.5</b></span></div>
     <label class="xrow chk"><input id="dgsel" type="checkbox"><span>Only inside the selection (soft edge)</span></label>
     <div class="row2"><button class="b" id="dgseed" type="button" title="Same settings, new random grain" disabled>New grain</button><button class="b" id="dgselect" type="button" title="Select where the grid was found (New / Add / Remove apply)" disabled>Select grid areas</button></div>
@@ -194,7 +198,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
         <dt>F</dt><dd>Fill tool: click or paint over holes to fill them; Fill holes fills them all</dd>
         <dt>I</dt><dd>Pick: click to take a colour into the swatches</dd>
         <dt>Randomize</dt><dd>randomly delete or recolour pixels in an area</dd>
-        <dt>De-grid</dt><dd>remove the JPEG 8×8 grid look: preview, map, then apply</dd>
+        <dt>Photo grain</dt><dd>filled and recoloured pixels get the photo’s own grain (on by default)</dd>
+        <dt>De-grid</dt><dd>remove the JPEG 8×8 grid look and even out the noise: preview, map, then apply</dd>
         <dt>wheel / Space</dt><dd>zoom / pan</dd>
       </dl>
     </div>
@@ -208,9 +213,9 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=20"></script>
-<script src="../v5/export.js?b=20"></script>
-<script src="degrid.js?b=20"></script>
-<script src="pixels.js?b=20"></script>
+<script src="../v5/core.js?b=21"></script>
+<script src="../v5/export.js?b=21"></script>
+<script src="degrid.js?b=21"></script>
+<script src="pixels.js?b=21"></script>
 </body>
 </html>
