@@ -157,12 +157,14 @@ function undo() {
   dropPreview();
   const e = hist.pop(); future.push(e);
   unsnap(e.r, e.before); redraw(e.r); rescan(); need(); say('undid ' + e.label);
+  if (e.label === 'de-grid') newGrainProfile();      // the photo's grain changed: measure it again
 }
 function redo() {
   if (float || !future.length) return;
   dropPreview();
   const e = future.pop(); hist.push(e);
   unsnap(e.r, e.after); redraw(e.r); rescan(); need(); say('redid ' + e.label);
+  if (e.label === 'de-grid') newGrainProfile();
 }
 function bbox() { return { x: sel.x0, y: sel.y0, w: sel.x1 - sel.x0 + 1, h: sel.y1 - sel.y0 + 1 }; }
 function del() {
@@ -506,7 +508,7 @@ function newGrainProfile() {
   }, 250);
 }
 function grainProfile() { if (!grain.prof) grain.prof = Degrid.profile(data, W, H); return grain.prof; }
-function regrain(r, pick, scattered) { return grain.on && loaded ? Degrid.addGrain(data, W, r, pick, grainProfile(), grain.seed, 1, !!scattered) : 0; }
+function regrain(r, pick, scattered) { return grain.on && loaded ? Degrid.addGrain(data, W, r, pick, grainProfile(), grain.seed, 1, !!scattered, xs.q) : 0; }
 // grain for pixels that were just made (filled holes, painted pixels). Pixels in the middle of a made area get the
 // photo's grain field; scattered pin-holes sit between real pixels that already carry grain, so they get only a little
 // pixel noise (more the denser they are), or they'd read as dots. isNew(i): pixel i gets grain now; made(i): pixel i
@@ -525,14 +527,16 @@ function syncGrain() { $('#grain').classList.toggle('on', grain.on); $('#grain')
 
 /* ---------------- de-grid (degrid.js does the work, in a pool of workers) ---------------- */
 const dg = { strength: 100, amount: 100, size: 100, protect: 2.5, even: 100, onlySel: false, seed: 1, view: 'result', busy: false, res: null, peek: false, job: 0, timer: 0 };
-try { const v = JSON.parse(localStorage.getItem('ie2.pixels.degrid') || '{}'); for (const k of ['strength', 'amount', 'size', 'protect', 'even', 'onlySel']) if (k in v) dg[k] = v[k]; } catch (e) { /* ignore */ }
+try { const v = JSON.parse(localStorage.getItem('ie2.pixels.degrid') || '{}'); for (const k of ['strength', 'amount', 'size', 'protect', 'even', 'onlySel']) if (k in v) dg[k] = v[k];
+} catch (e) { /* ignore */ }
+dg.size = Math.max(100, dg.size);        // grain is never finer than what survives the JPEG target
 const pimg = document.createElement('canvas'), pctx = pimg.getContext('2d');      // result
 const mimg = document.createElement('canvas'), mctx = mimg.getContext('2d');      // map overlay
 let pool = null;
 function getPool() {
   if (pool) return pool;
   pool = [];
-  try { const n = clamp(navigator.hardwareConcurrency || 4, 2, 8); for (let i = 0; i < n; i++) pool.push(new Worker('degrid.js?b=21')); }
+  try { const n = clamp(navigator.hardwareConcurrency || 4, 2, 8); for (let i = 0; i < n; i++) pool.push(new Worker('degrid.js?b=22')); }
   catch (e) { pool = []; }                    // e.g. opened from file:// - fall back to this thread
   return pool;
 }
@@ -546,7 +550,7 @@ function call(w, msg, transfer) {
     w.postMessage(Object.assign({ id }, msg), transfer || []);
   });
 }
-function dgOpts() { return { strength: dg.strength / 100, amount: dg.amount / 100, size: dg.size / 100, protect: dg.protect, even: dg.even / 100, seed: dg.seed, onlySel: dg.onlySel && sel.n > 0 }; }
+function dgOpts() { return { strength: dg.strength / 100, amount: dg.amount / 100, size: dg.size / 100, protect: dg.protect, even: dg.even / 100, q: xs.q, seed: dg.seed, onlySel: dg.onlySel && sel.n > 0 }; }
 async function runDegrid() {
   if (!loaded || float) return;
   clearTimeout(dg.timer);
@@ -582,7 +586,7 @@ async function runDegrid() {
   }
   if (job !== dg.job) return;
   dg.busy = false;
-  dg.res = { out, map, g, acted: acted / (W * H), topped: topped / (W * H), ms: Math.round(performance.now() - t0) };
+  dg.res = { out, map, g, q: opts.q, acted: acted / (W * H), topped: topped / (W * H), ms: Math.round(performance.now() - t0) };
   pimg.width = W; pimg.height = H; pctx.putImageData(new ImageData(out, W, H), 0, 0);
   // map: orange where it re-textures (grid found), yellow where it only adds grain (too quiet), blue where it keeps structure
   mimg.width = W; mimg.height = H;
@@ -611,7 +615,7 @@ function applyDegrid() {
   data.set(out.subarray(y0 * W * 4, (y1 + 1) * W * 4), y0 * W * 4);
   const pct = Math.round(100 * dg.res.acted);
   dropPreview();
-  record(r, before, snap(r), 'de-grid'); redraw(r); need();
+  record(r, before, snap(r), 'de-grid'); redraw(r); need(); newGrainProfile();
   say(`de-gridded (${pct}% of the image re-textured) · Ctrl/Cmd+Z to undo`);
 }
 function selectGrid() {
@@ -627,6 +631,7 @@ function syncDegrid() {
   $('#dgstr').value = dg.strength; $('#dgstrv').textContent = dg.strength + '%';
   $('#dgamt').value = dg.amount; $('#dgamtv').textContent = dg.amount + '%';
   $('#dgsize').value = dg.size; $('#dgsizev').textContent = dg.size + '%';
+  $('#dgq').value = xs.q; $('#dgqv').textContent = 'q' + xs.q;
   $('#dgeven').value = dg.even; $('#dgevenv').textContent = dg.even + '%';
   $('#dgprot').value = dg.protect; $('#dgprotv').textContent = (+dg.protect).toFixed(2).replace(/0$/, '');
   $('#dgsel').checked = dg.onlySel; $('#dgsel').disabled = !sel.n;
@@ -637,7 +642,10 @@ function syncDegrid() {
   $('#dgres').textContent = dg.busy ? 'working… (big images take a few seconds)' : !r ? 'Not run yet. Preview shows the result before anything changes.'
     : r.g.gap < 0.06 ? `No clear JPEG grid found (strength ${r.g.gap.toFixed(2)}). Little will change.`
     : `Grid found at offset ${r.g.kx + 1 & 7},${r.g.ky + 1 & 7} · strength ${r.g.gap.toFixed(2)} ${r.g.gap > 0.3 ? '(strong)' : r.g.gap > 0.15 ? '(clear)' : '(faint)'} · re-textures ${Math.round(100 * r.acted)}% of the image`;
-  if (r && !dg.busy) $('#dgres').textContent += ` · adds grain to ${Math.round(100 * r.topped)}% that was too quiet · ${(r.ms / 1000).toFixed(1)} s`;
+  if (r && !dg.busy) {
+    const sv = Degrid.survival(r.g, r.q, dg.size / 100), lo = Math.min(...sv.sizes), hi = Math.max(...sv.sizes);
+    $('#dgres').textContent += ` · adds grain to ${Math.round(100 * r.topped)}% that was too quiet · grain ${lo.toFixed(1)}${hi - lo > 0.05 ? '–' + hi.toFixed(1) : ''} px, sized to survive JPEG q${r.q} · ${(r.ms / 1000).toFixed(1)} s`;
+  }
 }
 
 /* ---------------- view ---------------- */
@@ -893,6 +901,7 @@ $('#dgapply').addEventListener('click', applyDegrid);
 $('#dgcancel').addEventListener('click', () => dropPreview('de-grid preview discarded'));
 $('#dgselect').addEventListener('click', selectGrid);
 document.querySelectorAll('#dgview button').forEach(b => b.addEventListener('click', () => { dg.view = b.dataset.v; syncDegrid(); need(); }));
+$('#dgq').addEventListener('input', (e) => { xs.q = +e.target.value; syncX(); schedule(); });
 for (const [id, k] of [['#dgstr', 'strength'], ['#dgamt', 'amount'], ['#dgsize', 'size'], ['#dgprot', 'protect'], ['#dgeven', 'even']]) $(id).addEventListener('input', (e) => { dg[k] = +e.target.value; schedule(); });
 $('#dgsel').addEventListener('change', (e) => { dg.onlySel = e.target.checked; schedule(); });
 // hold C to flip to the original while a preview is up
@@ -922,13 +931,41 @@ try { Object.assign(xs, JSON.parse(localStorage.getItem('ie2.pixels.export') || 
 function syncX() {
   $('#xfmt').value = xs.fmt; $('#xq').value = xs.q; $('#xqv').textContent = xs.q; $('#xsub').value = xs.sub; $('#xbg').value = xs.bg;
   document.querySelectorAll('.xj').forEach(el => { el.hidden = xs.fmt !== 'jpg'; });
+  if (!$('#dgpop').hidden) { $('#dgq').value = xs.q; $('#dgqv').textContent = 'q' + xs.q; }
   try { localStorage.setItem('ie2.pixels.export', JSON.stringify(xs)); } catch (e) { /* ignore */ }
 }
-$('#xfmt').addEventListener('change', (e) => { xs.fmt = e.target.value; syncX(); });
-$('#xq').addEventListener('input', (e) => { xs.q = +e.target.value; syncX(); });
+/* Grain check: what a JPEG save at the chosen quality does to the grain, measured on crops of the image as it is now
+ * (degrid.js puts their brightness through JPEG's own rounding and back). Runs in a worker when the panel is open. */
+const xc = { job: 0, timer: 0, res: null, ver: -1 };
+function checkGrain() {
+  clearTimeout(xc.timer);
+  if (!loaded || $('#xpop').hidden) return;
+  xc.timer = setTimeout(async () => {
+    const job = ++xc.job, q = xs.q; $('#xchk').textContent = `checking what JPEG q${q} does to the grain…`; $('#xuse').hidden = true;
+    let r;
+    try {
+      const cw = Degrid.checkWins(data, W, H), P = getPool();
+      r = P.length ? (await call(P[0], { job: 'check', cw, q })).r : { at: Degrid.check(cw, q), intact: Degrid.lowestQ(cw, 0), faint: Degrid.lowestQ(cw, 1) };
+    } catch (e) { if (job === xc.job) $('#xchk').textContent = 'grain check failed: ' + e.message; return; }
+    if (job !== xc.job) return;
+    xc.res = r; showCheck();
+  }, 300);
+}
+function showCheck() {
+  const r = xc.res; if (!r) return;
+  const a = r.at, f = (v) => v.toFixed(2), verdict = ['grain survives intact ✓', 'grain survives, faint grid', 'the grid comes back ✗'][a.grade];
+  const where = [r.intact ? `intact from q${r.intact.q}` : 'not intact at any quality (PNG keeps it)', r.faint && (!r.intact || r.faint.q < r.intact.q) ? `faint grid from q${r.faint.q}` : ''].filter(Boolean).join(' · ');
+  $('#xchk').textContent = (a.gapBefore > 0.2 ? `This image already has a strong JPEG grid (${f(a.gapBefore)}): De-grid it first. ` : '') +
+    `At q${a.q}: grid ${f(a.gapBefore)} → ${f(a.gapAfter)}, grain kept ${Math.round(100 * a.kept)}% · ${verdict}. ${where[0].toUpperCase() + where.slice(1)}.`;
+  xc.lowest = r.intact && r.intact.q !== a.q ? r.intact.q : 0;
+  $('#xuse').hidden = !xc.lowest; if (xc.lowest) $('#xuse').textContent = `Use q${xc.lowest} (grain intact)`;
+}
+$('#xfmt').addEventListener('change', (e) => { xs.fmt = e.target.value; syncX(); checkGrain(); });
+$('#xq').addEventListener('input', (e) => { xs.q = +e.target.value; syncX(); checkGrain(); });
+$('#xuse').addEventListener('click', () => { if (xc.lowest) { xs.q = xc.lowest; syncX(); checkGrain(); } });
 $('#xsub').addEventListener('change', (e) => { xs.sub = e.target.value; syncX(); });
 $('#xbg').addEventListener('input', (e) => { xs.bg = e.target.value; syncX(); });
-$('#save').addEventListener('click', () => { const p = $('#xpop'); p.hidden = !p.hidden; });
+$('#save').addEventListener('click', () => { const p = $('#xpop'); p.hidden = !p.hidden; if (!p.hidden && xs.fmt === 'jpg') checkGrain(); });
 document.addEventListener('pointerdown', (e) => { if (!$('#xpop').hidden && !e.target.closest('#xpop, #save')) $('#xpop').hidden = true; });
 $('#xsave').addEventListener('click', save);
 
@@ -963,6 +1000,23 @@ function jpegSource(q, sub, bg) {
       }
     }
   }
+  // brightness is rounded boundary-aware (degrid.js seamQuant): each cell's patterns may round either way where
+  // that makes its left and top edges continue the already-saved neighbours like the original does, so the cells
+  // don't step against each other. Still a standard JPEG. Rows come in save order (twice: once per encoder pass).
+  const sq = { blk: new Float64Array(64), Q: new Int32Array(64), rec: new Float64Array(64), C: new Float64Array(64), T: new Float64Array(64),
+    L: { rec: new Float64Array(8), orig: new Float64Array(8) }, Tp: { rec: new Float64Array(8), orig: new Float64Array(8) },
+    cur: new Float32Array(Wp * 8), recRow: new Float32Array(Wp), origRow: new Float32Array(Wp) };
+  function lumaBand(Y, out, outRow0, top) {
+    const { blk, Q, rec, C, T, L, Tp, cur } = sq;
+    for (let bx = 0; bx < Wp; bx += 8) {
+      for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) blk[j * 8 + i] = Y[j * Wp + bx + i];
+      if (bx) for (let j = 0; j < 8; j++) { L.rec[j] = cur[j * Wp + bx - 1]; L.orig[j] = Y[j * Wp + bx - 1]; }
+      if (top) for (let i = 0; i < 8; i++) { Tp.rec[i] = sq.recRow[bx + i]; Tp.orig[i] = sq.origRow[bx + i]; }
+      Degrid.seamQuant(blk, qY, bx ? L : null, top ? Tp : null, Q, rec, C, T);
+      for (let v = 0; v < 8; v++) for (let u = 0; u < 8; u++) { out[((outRow0 + v) * Wp + bx + u) * 4] = Math.max(-1023, Math.min(1023, Q[v * 8 + u])); cur[v * Wp + bx + u] = rec[v * 8 + u]; }
+    }
+    sq.recRow.set(cur.subarray(7 * Wp, 8 * Wp)); sq.origRow.set(Y.subarray(7 * Wp, 8 * Wp));
+  }
   return {
     info: { W, H, Wp, Hp, hs, vs, qY, qC },
     readY(y0, rows) {
@@ -970,7 +1024,8 @@ function jpegSource(q, sub, bg) {
       for (let b = 0; b < rows; b += 8) {
         const Y = new Float32Array(Wp * 8), Cb = new Float32Array(Wp * 8), Cr = new Float32Array(Wp * 8);
         for (let j = 0; j < 8; j++) { const r = ycc(y0 + b + j); for (let x = 0; x < Wp; x++) { Y[j * Wp + x] = r[x * 3]; Cb[j * Wp + x] = r[x * 3 + 1]; Cr[j * Wp + x] = r[x * 3 + 2]; } }
-        if (hs * vs === 1) band([Y, Cb, Cr], Wp, [qY, qC, qC], out, b, [0, 1, 2]); else band([Y], Wp, [qY], out, b, [0]);
+        lumaBand(Y, out, b, y0 + b > 0);
+        if (hs * vs === 1) band([Cb, Cr], Wp, [qC, qC], out, b, [1, 2]);
       }
       return out;
     },
@@ -1005,7 +1060,8 @@ async function save() {
   const blob = new Blob([bytes], { type: ext === 'jpg' ? 'image/jpeg' : 'image/png' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${name}_pixels.${ext}`;
   document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-  say(`saved ${a.download} · ${W}×${H} · ${blob.size >= 1048576 ? (blob.size / 1048576).toFixed(2) + ' MB' : Math.round(blob.size / 1024) + ' KB'}`);
+  const ck = ext === 'jpg' && xc.res && xc.res.at.q === xs.q ? ` · grid ${xc.res.at.gapBefore.toFixed(2)} → ${xc.res.at.gapAfter.toFixed(2)}, grain kept ${Math.round(100 * xc.res.at.kept)}%` : '';
+  say(`saved ${a.download} · ${W}×${H} · ${blob.size >= 1048576 ? (blob.size / 1048576).toFixed(2) + ' MB' : Math.round(blob.size / 1024) + ' KB'}${ck}`);
 }
 
 /* ---------------- go ---------------- */

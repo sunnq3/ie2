@@ -15,6 +15,9 @@
  *     the profile get grain added and nothing else changes, so the noise ends up even across the photo. All levels
  *     are matched on what the eye reads as grain (the fine band), and the fill-in is variance-matched, so partly
  *     treated areas don't dip. Nothing is copied from elsewhere, nothing is blurred.
+ *  6. the new grain is brightness only and sized per brightness to survive a JPEG save at the target quality (see
+ *     survival()); the editor's JPG export rounds brightness boundary-aware (seamQuant), and check() measures what a
+ *     save does to the grain.
  *  The same profile drives addGrain(), which the editor's fill and randomize tools use for the pixels they make.
  *
  * Runs as a Web Worker (message {data, W, H, sel, opts}) or as a plain script / node module (Degrid.run).
@@ -126,32 +129,220 @@
   function noiseAt(nl, Yv) { const f = Math.min(NBINS - 1.001, Math.max(0, Yv / (256 / NBINS) - 0.5)), b0 = f | 0; return nl[b0] + (nl[b0 + 1] - nl[b0]) * (f - b0); }
   // grain size (gaussian sigma) that gives a measured neighbour correlation r1
   const sizeOf = (r1) => Math.sqrt(-1 / (4 * Math.log(r1)));
-  /* Add the photo's own grain to chosen pixels (their current colour is the base): the same level per brightness and
-   * the same grain size as the rest of the photo, so filled / recoloured pixels sit in the image like the rest of it.
+  /* ---------- grain that survives JPEG ----------
+   * JPEG stores each 8×8 cell as 64 patterns and rounds each one to a step that grows with the pattern's fineness and
+   * shrinks with quality. Grain whose patterns are smaller than their steps is wiped or rounded into stamps, which is
+   * the grid look all over again. For a target quality, every brightness level gets the smallest grain size whose
+   * patterns mostly clear their steps (at most RT of the grain's energy wiped or rounded off), at the photo's own
+   * grain strength there. Coarser grain keeps the same overall strength, so it reads coarser, not heavier. Size grows
+   * at most to 1.7× the photo's own (beyond that it turns into blotches); where that isn't enough (quiet, dark areas
+   * at lower qualities) the strength is raised a little (≤ 15%) and the rest is reported by the export check.
+   * Grain goes in brightness only: colour grain is halved by colour subsampling and reads as speckle. */
+  const QBY = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99];
+  function qtab(q) { q = Math.min(100, Math.max(1, Math.round(q))); const s = q < 50 ? 5000 / q : 200 - 2 * q; return QBY.map(v => Math.min(255, Math.max(1, Math.floor((v * s + 50) / 100)))); }
+  const DB = new Float64Array(64);                      // orthonormal 8-point DCT basis (the one JPEG uses)
+  for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) DB[u * 8 + x] = (u ? 1 : Math.SQRT1_2) * 0.5 * Math.cos((2 * x + 1) * u * Math.PI / 16);
+  function dct8(src, w, x0, y0, out, T) {                // 8×8 block at (x0, y0) of plane src (width w) -> out[v*8+u]
+    for (let j = 0; j < 8; j++) for (let u = 0; u < 8; u++) { let a = 0; for (let i = 0; i < 8; i++) a += DB[u * 8 + i] * src[(y0 + j) * w + x0 + i]; T[j * 8 + u] = a; }
+    for (let v = 0; v < 8; v++) for (let u = 0; u < 8; u++) { let a = 0; for (let j = 0; j < 8; j++) a += DB[v * 8 + j] * T[j * 8 + u]; out[v * 8 + u] = a; }
+  }
+  function idct8(c, out, T) {                            // inverse of dct8 for one block
+    for (let v = 0; v < 8; v++) for (let x = 0; x < 8; x++) { let a = 0; for (let u = 0; u < 8; u++) a += DB[u * 8 + x] * c[v * 8 + u]; T[v * 8 + x] = a; }
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) { let a = 0; for (let v = 0; v < 8; v++) a += DB[v * 8 + y] * T[v * 8 + x]; out[y * 8 + x] = a; }
+  }
+  // spread of each of the 64 patterns for unit grain of a given size (measured once per size)
+  const csCache = new Map();
+  function coefStd(size) {
+    const key = Math.round(size * 100); if (csCache.has(key)) return csCache.get(key);
+    const N = 128, G = grainField(0, 0, N, N, 0, 4242, key / 100), acc = new Float64Array(64), c = new Float64Array(64), T = new Float64Array(64);
+    for (let by = 0; by < N; by += 8) for (let bx = 0; bx < N; bx += 8) { dct8(G, N, bx, by, c, T); for (let k = 0; k < 64; k++) acc[k] += c[k] * c[k]; }
+    const out = acc.map(v => Math.sqrt(v / (N * N / 64))); csCache.set(key, out); return out;
+  }
+  // share of a pattern's energy lost to rounding, for spread / step = rho (gaussian), tabulated
+  const QE = (() => {
+    const t = new Float64Array(301);
+    for (let k = 1; k <= 300; k++) {
+      const rho = k / 50; let e = 0, ps = 0;
+      for (let z = -6; z <= 6; z += 0.01) { const x = z * rho, p = Math.exp(-z * z / 2), d = x - Math.round(x); e += p * d * d; ps += p; }
+      t[k] = (e / ps) / (rho * rho);
+    }
+    t[0] = 1; return t;
+  })();
+  const qerr = (rho) => rho >= 6 ? 1 / (12 * rho * rho) : (() => { const f = rho * 50, k = Math.floor(f); return QE[k] + (QE[k + 1] - QE[k]) * (f - k); })();
+  // share of the grain's energy JPEG wipes or rounds off (the cell's average, DC, is left out: it is the same for any grain)
+  function mangled(size, amp, qt) {
+    const cs = coefStd(size); let e = 0, t = 0;
+    for (let k = 1; k < 64; k++) { const sd = amp * cs[k], v = sd * sd; t += v; e += v * qerr(sd / qt[k]); }
+    return t > 0 ? e / t : 0;
+  }
+  let RT = 0.08, MAXMUL = 1.7, MAXBOOST = 1.15; const SSTEP = 1.12, SMAX = 3.2;
+  const levelSize = (s0, k) => Math.min(SMAX, s0 * Math.pow(SSTEP, k));
+  // per brightness bin: grain size level (fractional, smoothed) and strength boost, for JPEG quality q
+  function survival(g, q, minMul = 1) {
+    const key = q + ':' + minMul + ':' + RT + ':' + MAXMUL; if (g.svMemo && g.svMemo.key === key) return g.svMemo.val;
+    const val = survival0(g, q, minMul); g.svMemo = { key, val }; return val;
+  }
+  function survival0(g, q, minMul) {
+    const s0 = Math.max(0.5, sizeOf(g.r1[0])), qt = qtab(q), ph0 = phi(s0), K = Math.max(0, Math.floor(Math.log(Math.min(SMAX, MAXMUL * s0) / s0) / Math.log(SSTEP) + 1e-9));
+    const kmin = Math.max(0, Math.log(Math.max(1, minMul)) / Math.log(SSTEP)), lev = new Float64Array(NBINS), boost = new Float64Array(NBINS);
+    for (let b = 0; b < NBINS; b++) {
+      const amp = g.nlf[0][b] / ph0; let k = Math.ceil(kmin - 1e-9), m = 1;
+      while (k < K && mangled(levelSize(s0, k), amp, qt) > RT) k++;
+      if (mangled(levelSize(s0, k), amp, qt) > RT) while (m < MAXBOOST && mangled(levelSize(s0, k), m * amp, qt) > RT) m += 0.05;
+      lev[b] = Math.max(kmin, k); boost[b] = Math.min(MAXBOOST, m);
+    }
+    const sm = (a) => a.map((x, i) => Math.max(x, (a[Math.max(0, i - 1)] + 2 * x + a[Math.min(NBINS - 1, i + 1)]) / 4));   // smooth, never below need
+    const L = sm(lev), Bo = sm(boost);
+    return { q, s0, ph0, K: Math.max(K, Math.ceil(Math.max(...L))), lev: L, boost: Bo, sizes: Array.from(L, k => levelSize(s0, k)) };
+  }
+  const binAt = (Yv) => Math.min(NBINS - 1.001, Math.max(0, Yv / (256 / NBINS) - 0.5));
+  const lerpBin = (a, Yv) => { const f = binAt(Yv), b0 = f | 0; return a[b0] + (a[b0 + 1] - a[b0]) * (f - b0); };
+  // luma grain over a rectangle whose size follows brightness: fields for the size levels in use (all from the same
+  // underlying noise, so neighbouring levels blend smoothly), mixed per pixel and kept at unit variance
+  function survField(x0, y0, w, h, seed, sv, lumaAt) {
+    const n = w * h, kf = new Float32Array(n); let lo = 1e9, hi = -1;
+    for (let i = 0; i < n; i++) { const k = lerpBin(sv.lev, lumaAt(i)); kf[i] = k; if (k < lo) lo = k; if (k > hi) hi = k; }
+    const k0 = Math.floor(lo), k1 = Math.min(sv.K, Math.ceil(hi)), F = new Map();
+    for (let k = k0; k <= k1; k++) F.set(k, grainField(x0, y0, w, h, 0, seed, levelSize(sv.s0, k)));
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const k = kf[i], a = Math.min(k1, Math.floor(k)), b = Math.min(k1, a + 1), t = k - a;
+      if (t < 1e-3 || a === b) { out[i] = F.get(a)[i]; continue; }
+      const sa = levelSize(sv.s0, a), sb = levelSize(sv.s0, b), rho = 2 * sa * sb / (sa * sa + sb * sb);
+      out[i] = ((1 - t) * F.get(a)[i] + t * F.get(b)[i]) / Math.sqrt((1 - t) * (1 - t) + t * t + 2 * t * (1 - t) * rho);
+    }
+    return out;
+  }
+
+  /* Add the photo's own grain to chosen pixels (their current colour is the base): the photo's strength for that
+   * brightness, sized to survive JPEG at quality q, brightness only. Used by the editor's fill and randomize tools.
    * data: RGBA of the whole image (changed in place), r: rectangle {x,y,w,h}, pick(i): pixel index -> amount 0..1
    * (0 = leave), g: profile from stats(), seed: grain seed. Works in row bands, so whole-image calls stay small.
    * scattered: the picked pixels are scattered among untouched ones (Randomize). Their grain can't line up with the
    * neighbours' grain, so it reads as pixel-sized noise; it gets plain per-pixel noise scaled to look as strong as the
    * photo's grain does at pixel scale (0.6 × its fine-grain level, measured), instead of the full grain swing. */
-  function addGrain(data, W, r, pick, g, seed, amount = 1, scattered = false) {
-    const sizes = g.r1.map(sizeOf), norms = sizes.map(s => scattered ? 0.6 * amount : amount / phi(s)), BAND = 128;
+  function addGrain(data, W, r, pick, g, seed, amount = 1, scattered = false, q = 85) {
+    const sv = survival(g, q), BAND = 128, lum = (o) => KR * data[o] + KG * data[o + 1] + KB * data[o + 2];
     let n = 0;
     for (let y0 = r.y; y0 < r.y + r.h; y0 += BAND) {
       const bh = Math.min(BAND, r.y + r.h - y0); let bx0 = r.x + r.w, bx1 = -1;     // columns with picked pixels
       for (let y = y0; y < y0 + bh; y++) for (let x = r.x, i = y * W + x; x < r.x + r.w; x++, i++) if (data[i * 4 + 3] && pick(i)) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; }
       if (bx1 < 0) continue;
-      const bw = bx1 - bx0 + 1, G = scattered ? null : [0, 1, 2].map(c => grainField(bx0, y0, bw, bh, c, seed, sizes[c]));
+      const bw = bx1 - bx0 + 1, G = scattered ? null : survField(bx0, y0, bw, bh, seed, sv, (q2) => lum(((y0 + (q2 / bw | 0)) * W + bx0 + q2 % bw) * 4));
       for (let y = y0; y < y0 + bh; y++) for (let x = bx0; x <= bx1; x++) {
         const i = y * W + x, o = i * 4; if (!data[o + 3]) continue;
         const a = pick(i); if (!a) continue;
-        const q = (y - y0) * bw + (x - bx0), R = data[o], Gc = data[o + 1], B = data[o + 2];
-        const Yv = KR * R + KG * Gc + KB * B, cb = -0.168736 * R - 0.331264 * Gc + 0.5 * B, cr = 0.5 * R - 0.418688 * Gc - 0.081312 * B;
-        const g0 = G ? G[0][q] : gnoise(x, y, 0, seed), g1 = G ? G[1][q] : gnoise(x, y, 1, seed), g2 = G ? G[2][q] : gnoise(x, y, 2, seed);
-        const y2 = Yv + a * norms[0] * noiseAt(g.nlf[0], Yv) * g0, cb2 = cb + a * norms[1] * noiseAt(g.nlf[1], Yv) * g1, cr2 = cr + a * norms[2] * noiseAt(g.nlf[2], Yv) * g2;
-        data[o] = y2 + 1.402 * cr2; data[o + 1] = y2 - 0.344136 * cb2 - 0.714136 * cr2; data[o + 2] = y2 + 1.772 * cb2; n++;
+        const Yv = lum(o), N = noiseAt(g.nlf[0], Yv);
+        const d = scattered ? a * 0.6 * amount * N * gnoise(x, y, 0, seed) : a * amount * N / sv.ph0 * lerpBin(sv.boost, Yv) * G[(y - y0) * bw + (x - bx0)];
+        data[o] += d; data[o + 1] += d; data[o + 2] += d; n++;     // brightness only: the same step on R, G and B
       }
     }
     return n;
+  }
+
+  /* What a JPEG save at quality q would do to the grain, measured on small crops (aligned to the 8×8 cells of a save
+   * from the top-left corner): brightness is put through JPEG's own rounding (cells, patterns, steps) and back, then
+   * grid strength and grain level are measured before and after. */
+  function checkWins(data, W, H) {
+    const cw = Math.min(256, W >> 3 << 3), ch = Math.min(256, H >> 3 << 3), nx = Math.max(1, Math.min(3, Math.floor(W / cw))), ny = Math.max(1, Math.min(3, Math.floor(H / ch))), wins = [];
+    for (let j = 0; j < ny; j++) for (let k = 0; k < nx; k++) {
+      const x0 = Math.round((W - cw) * (nx > 1 ? k / (nx - 1) : 0.5) / 8) * 8, y0 = Math.round((H - ch) * (ny > 1 ? j / (ny - 1) : 0.5) / 8) * 8;
+      const Y = new Float32Array(cw * ch), A = new Uint8Array(cw * ch);
+      for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) { const o = ((y0 + y) * W + x0 + x) * 4; Y[y * cw + x] = KR * data[o] + KG * data[o + 1] + KB * data[o + 2]; A[y * cw + x] = data[o + 3]; }
+      wins.push({ Y, A });
+    }
+    return { wins, w: cw, h: ch };
+  }
+  function greyWin(Y, A, w, h) {
+    const rgba = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) { const v = Y[i]; rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = A[i]; }
+    return { rgba, c0: 0, c1: h, wy0: 0, wy1: h };
+  }
+  /* Boundary-aware rounding (encoder side). Plain JPEG rounds every pattern of a cell to the nearest step on its
+   * own, and the rounding errors of neighbouring cells don't agree at their shared border: that mismatch is the grid.
+   * Each pattern can just as validly be rounded the other way (the file stays standard and decodes anywhere), so for
+   * every cell, in save order, the coarse-to-mid patterns that sit close to halfway are flipped where that makes the
+   * cell's left and top edge continue the already-saved neighbours the way the original image does, weighed against
+   * staying close to the original. Costs well under 1% in file size.
+   * blk: 64 values (Y - 128, row-major), qt: steps, left/top: { rec: 8 saved neighbour edge values, orig: 8 original }
+   * or null; writes the 64 rounded levels (row-major v*8+u) into Q and the decoded cell into rec. */
+  const SEAM = { lam: 2, maxf: 5, top: 24, minFrac: 0.2 };
+  const DQ = new Float64Array(64);
+  const dequant = (Q, qt) => { for (let k = 0; k < 64; k++) DQ[k] = Q[k] * qt[k]; return DQ; };
+  function seamQuant(blk, qt, left, top, Q, rec, C, T) {
+    dct8(blk, 8, 0, 0, C, T);
+    for (let k = 0; k < 64; k++) Q[k] = Math.round(C[k] / qt[k]);
+    if (left || top) {
+      // only the left column and top row of the decoded cell matter here
+      for (let j = 0; j < 8; j++) { let a = 0, b = 0; for (let k = 0; k < 64; k++) { if (!Q[k]) continue; const w = Q[k] * qt[k], v = k >> 3, u = k & 7; a += w * DB[v * 8 + j] * DB[u * 8]; b += w * DB[v * 8] * DB[u * 8 + j]; } rec[j * 8] = a; rec[j] = j ? b : a; }
+      const eL = new Float64Array(8), eT = new Float64Array(8);   // current edge mismatch against the target
+      for (let j = 0; j < 8; j++) {
+        if (left) eL[j] = rec[j * 8] - (left.rec[j] + blk[j * 8] - left.orig[j]);
+        if (top) eT[j] = rec[j] - (top.rec[j] + blk[j] - top.orig[j]);
+      }
+      const cand = [];
+      for (let v = 0; v < 8; v++) for (let u = 0; u + v <= SEAM.maxf && u < 8; u++) {
+        const k = v * 8 + u, f = C[k] / qt[k] - Q[k]; if (Math.abs(f) >= SEAM.minFrac) cand.push([Math.abs(f), k]);
+      }
+      cand.sort((a, b) => b[0] - a[0]);
+      for (let n = 0; n < Math.min(SEAM.top, cand.length); n++) {
+        const k = cand[n][1], v = k >> 3, u = k & 7, d = Math.sign(C[k] / qt[k] - Q[k]), st = d * qt[k];
+        let dc = 0;
+        if (left) for (let j = 0; j < 8; j++) { const dd = st * DB[v * 8 + j] * DB[u * 8]; dc += (eL[j] + dd) ** 2 - eL[j] ** 2; }
+        if (top) for (let i = 0; i < 8; i++) { const dd = st * DB[v * 8] * DB[u * 8 + i]; dc += (eT[i] + dd) ** 2 - eT[i] ** 2; }
+        const a0 = Q[k] * qt[k] - C[k], a1 = (Q[k] + d) * qt[k] - C[k]; dc += SEAM.lam * (a1 * a1 - a0 * a0) / 8;
+        if (dc < 0) {
+          Q[k] += d;
+          if (left) for (let j = 0; j < 8; j++) eL[j] += st * DB[v * 8 + j] * DB[u * 8];
+          if (top) for (let i = 0; i < 8; i++) eT[i] += st * DB[v * 8] * DB[u * 8 + i];
+        }
+      }
+    }
+    idct8(dequant(Q, qt), rec, T);
+  }
+  // a whole luma plane (values Y - 128, w × h multiples of 8) the way the export saves it: calls put(bx, by, Q) per
+  // cell in save order and returns the decoded plane
+  function seamPlane(Y, w, h, qt, put) {
+    const blk = new Float64Array(64), Q = new Int32Array(64), rec = new Float64Array(64), C = new Float64Array(64), T = new Float64Array(64);
+    const R = new Float32Array(w * h), L = { rec: new Float64Array(8), orig: new Float64Array(8) }, Tp = { rec: new Float64Array(8), orig: new Float64Array(8) };
+    for (let by = 0; by < h; by += 8) for (let bx = 0; bx < w; bx += 8) {
+      for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) blk[j * 8 + i] = Y[(by + j) * w + bx + i];
+      if (bx) for (let j = 0; j < 8; j++) { L.rec[j] = R[(by + j) * w + bx - 1]; L.orig[j] = Y[(by + j) * w + bx - 1]; }
+      if (by) for (let i = 0; i < 8; i++) { Tp.rec[i] = R[(by - 1) * w + bx + i]; Tp.orig[i] = Y[(by - 1) * w + bx + i]; }
+      seamQuant(blk, qt, bx ? L : null, by ? Tp : null, Q, rec, C, T);
+      if (put) put(bx, by, Q);
+      for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++) R[(by + j) * w + bx + i] = rec[j * 8 + i];
+    }
+    return R;
+  }
+  function jpegLuma(Y, w, h, q) {                        // brightness through the export's own JPEG rounding and back
+    const P = new Float32Array(w * h); for (let i = 0; i < w * h; i++) P[i] = Y[i] - 128;
+    const R = seamPlane(P, w, h, qtab(q));
+    for (let i = 0; i < w * h; i++) R[i] = Math.min(255, Math.max(0, Math.round(R[i] + 128)));
+    return R;
+  }
+  function measure(cw, w, h, Ys) {
+    const st = stats(cw.wins.map((x, k) => greyWin(Ys ? Ys[k] : x.Y, x.A, w, h)), w, h, { noiseOnly: true });
+    return { gap: Math.max(0, st.gap), fine: st.fine };
+  }
+  // grade: 0 = grain survives intact (grid within 0.04 of before), 1 = survives with a faint grid (within 0.10),
+  // 2 = the grid comes back (or the grain is lost)
+  function check(cw, q) {
+    cw.memo = cw.memo || {};
+    if (cw.memo[q]) return cw.memo[q];
+    const { w, h } = cw, before = cw.before || (cw.before = measure(cw, w, h)), after = measure(cw, w, h, cw.wins.map(x => jpegLuma(x.Y, w, h, q)));
+    const kept = before.fine > 0 ? after.fine / before.fine : 1, rise = after.gap - before.gap;
+    const grade = kept < 0.85 ? 2 : rise <= 0.04 ? 0 : rise <= 0.10 ? 1 : 2;
+    return (cw.memo[q] = { q, gapBefore: before.gap, gapAfter: after.gap, kept, grade, ok: grade === 0 });
+  }
+  // the lowest quality that reaches a grade (null if even 100 doesn't); quality only ever helps, so bisect
+  function lowestQ(cw, grade = 0) {
+    let lo = 60, hi = 100;
+    if (check(cw, hi).grade > grade) return null;
+    if (check(cw, lo).grade <= grade) return check(cw, lo);
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (check(cw, mid).grade <= grade) hi = mid; else lo = mid; }
+    return check(cw, hi);
   }
 
   /* ---------- per-window building blocks ---------- */
@@ -326,7 +517,7 @@
     }
     const sa = Float32Array.from(samp), sn = Math.max(0.3, 1.4826 * median(sa, sa.length)), eps = (o.protect * sn) ** 2;
     const cx = new Float64Array(16), cy = new Float64Array(16), sS = [], sL = [], r1 = [[0, 0], [0, 0], [0, 0]];
-    const tiles = [[], [], []].map(() => Array.from({ length: NB }, () => []));
+    const tiles = [[], [], []].map(() => Array.from({ length: NB }, () => [])); let fineS = 0, fineN = 0;
     for (const wn of wins) {
       const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, eps), { w, h, wy0, D, FP, B, valid } = st, DL = D[0], c0 = wn.c0 - wy0, c1 = wn.c1 - wy0;
       for (let y = c0; y < c1; y++) for (let x = 0; x < w; x++) {
@@ -357,6 +548,7 @@
         if (Math.max(...qm) - Math.min(...qm) > Math.max(6, 2 * sn)) continue;      // one surface only, not two sides of an edge
         const b = Math.min(NB - 1, Math.max(0, Math.floor(sy / nc / (256 / NB))));
         for (let c = 0; c < 3; c++) tiles[c][b].push(Math.sqrt(s2[c] / nc));
+        fineS += s2[0] / nc; fineN++;
       }
     }
     // per bin: power average of the tiles (JPEG leaves some cells noisy and wipes others; what the eye sees is the
@@ -388,12 +580,12 @@
     const fS = Float32Array.from(sS), fL = Float32Array.from(sL);
     const ss = Math.max(1e-3, median(fS, fS.length)), sl = Math.max(1e-3, median(fL, fL.length));
     const r1v = r1.map(([a, b]) => Math.min(0.95, Math.max(0.01, b > 0 ? a / b : 0.3)));
-    return { sn, eps, kx, ky, gap, ss, sl, r1: r1v, corrX, corrY, nlf };
+    return { sn, eps, kx, ky, gap, ss, sl, r1: r1v, corrX, corrY, nlf, fine: fineN ? Math.sqrt(fineS / fineN) : 0 };
   }
   // 2. one strip: rgba holds rows wy0..wy1 of the image, sel (optional) the same rows of the selection mask
   function strip(wn, W, g, opts, sel) {
-    const o = Object.assign({ strength: 1, amount: 1, size: 1, seed: 1, even: 1, onlySel: false }, opts || {});
-    const sizes = g.r1.map(r => sizeOf(r) * o.size);
+    const o = Object.assign({ strength: 1, amount: 1, size: 1, seed: 1, even: 1, q: 85, onlySel: false }, opts || {});
+    const sv = survival(g, o.q, o.size);
     const st = prep(wn.rgba, W, wn.wy1 - wn.wy0, wn.wy0, g.eps, true), { w, h, wy0, P, B, D, F, FP, valid } = st, n = w * h, tmp = new Float32Array(n), sn = g.sn;
     const wgs = gridMap(D[0], valid, w, h, wy0, g.kx, g.ky, 10), wg = new Float32Array(n);
     for (let i = 0; i < n; i++) wg[i] = smooth(0.05, 0.18, wgs[i]);
@@ -439,17 +631,19 @@
         K[i] = FPc[i] - (1 - c0) * Fc[i];                                     // fine band of what stays of the original
       }
       const VK = energy(K);
-      // 2. new grain (same field the fill tools use) fills the noise up to an even level: what was taken out, plus
-      //    what JPEG had already wiped. Levels are fine-band levels, so the field is scaled by its fine share.
-      const G = grainField(0, wy0, w, h, c, o.seed, sizes[c]), norm = 1 / phi(sizes[c]), R = new Float32Array(n);
+      // 2. new grain fills the noise up to an even level: what was taken out, plus what JPEG had already wiped.
+      //    Brightness only, sized per brightness to survive a JPEG save at quality o.q (survival()); its overall
+      //    strength is what the photo's own grain has (fine-band level / fine share of the natural size).
+      //    Colour gets no new grain: where stamps are replaced, the colour keeps its structure and real texture only.
+      const G = c === 0 ? survField(0, wy0, w, h, o.seed, sv, (i) => BY[i]) : null, R = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         const u = allow[i]; if (!u) { R[i] = Pc[i]; continue; }
         const m = mix[i]; if (m > 0) chg[i] = 1;
         const v = Vp[i], k = kT[i], nz2 = (1 - k) * v, am = 1 + m * (o.amount - 1), eN = o.even * u * N[i];
         // re-textured areas get the photo's level (Even out) instead of their own; elsewhere only too-quiet areas are topped up
         const Ne = o.even * N[i] * N[i] + (1 - o.even) * nz2, want = am * am * ((1 - m) * Math.max(nz2, eN * eN) + m * Ne), kept = Math.max(0, VK[i] - k * v), s2 = want - kept, s = s2 > 0 ? Math.sqrt(s2) : 0;
-        R[i] = Bc[i] + cK[i] * (Pc[i] - Bc[i]) + s * norm * G[i];
-        if (s > 0.02) chg[i] = 1;
+        R[i] = Bc[i] + cK[i] * (Pc[i] - Bc[i]) + (G ? s * lerpBin(sv.boost, BY[i]) / sv.ph0 * G[i] : 0);
+        if (G && s > 0.02) chg[i] = 1;
         if (c === 0) top[i] = o.even > 0 && N[i] > 0.05 ? Math.min(1, (1 - m) * s / N[i]) : 0;
       }
       res.push(R);
@@ -477,10 +671,10 @@
       const w = L.strips[k], r = strip(Object.assign({ rgba: rowsOf(data, W, w) }, w), W, g, opts, sel ? sel.subarray(w.wy0 * W, w.wy1 * W) : null);
       out.set(r.out, w.c0 * W * 4); map.set(r.map, w.c0 * W * MB); acted += r.acted; topped += r.topped;
     }
-    return { out, map, info: Object.assign({}, g, { acted: acted / (W * H), topped: topped / (W * H), ms: Date.now() - t0, sizes: g.r1.map(r => sizeOf(r) * ((opts && opts.size) || 1)) }) };
+    return { out, map, info: Object.assign({}, g, { acted: acted / (W * H), topped: topped / (W * H), ms: Date.now() - t0, sizes: g.r1.map(r => sizeOf(r) * ((opts && opts.size) || 1)), survival: survival(g, (opts && opts.q) || 85, (opts && opts.size) || 1) }) };
   }
 
-  const Degrid = { run, stats, strip, layout, addGrain, profile, profileWins, MG, MB, tune: (q, b) => { NLQ = q; BETA = b; } };
+  const Degrid = { run, stats, strip, layout, addGrain, profile, profileWins, survival, checkWins, check, lowestQ, seamPlane, seamQuant, qtab, MG, MB, tune: (q, b, rt, mm, mb) => { NLQ = q; BETA = b; if (rt) RT = rt; if (mm) MAXMUL = mm; if (mb) MAXBOOST = mb; } };
   if (typeof module !== 'undefined' && module.exports) module.exports = Degrid;
   root.Degrid = Degrid;
   // worker mode: { job: 'stats', wins, W, H, opts } -> stats ; { job: 'strip', wn, W, g, opts, sel } -> rows
@@ -489,6 +683,7 @@
       const m = e.data;
       try {
         if (m.job === 'stats') root.postMessage({ id: m.id, g: stats(m.wins, m.W, m.H, m.opts) });
+        else if (m.job === 'check') root.postMessage({ id: m.id, r: { at: check(m.cw, m.q), intact: lowestQ(m.cw, 0), faint: lowestQ(m.cw, 1) } });
         else { const r = strip(m.wn, m.W, m.g, m.opts, m.sel); root.postMessage({ id: m.id, r }, [r.out.buffer, r.map.buffer]); }
       } catch (err) { root.postMessage({ id: m.id, error: String(err && err.stack || err) }); }
     };

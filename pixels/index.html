@@ -128,6 +128,8 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
       <div class="xrow xj"><span>Colour</span><select id="xsub"><option value="444">4:4:4 · full colour (best)</option><option value="422">4:2:2 · half colour</option><option value="420">4:2:0 · quarter colour</option></select></div>
       <div class="xrow xj"><span>Hole fill</span><input id="xbg" type="color" value="#ffffff" aria-label="Colour for deleted pixels"></div>
       <p class="xnote xj" id="xnote">JPG can't store transparency, so deleted pixels are filled with this colour.</p>
+      <p class="xnote res xj" id="xchk">Grain check runs when you pick JPG.</p>
+      <button class="b sm xj" id="xuse" type="button" hidden>Use q—</button>
       <button class="b go" id="xsave" type="button">Save file</button>
     </div>
   </div>
@@ -171,14 +173,15 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <canvas id="view" draggable="false"></canvas>
   <aside class="dock" id="dgpop" hidden>
     <div class="dhead"><h4>De-grid · JPEG blocks</h4><button class="b q sm" id="dgclose" type="button" title="Close (keeps the preview until you Apply or Cancel)">✕</button></div>
-    <p class="xnote">Finds the JPEG 8×8 grid and replaces the stamped texture inside each cell with continuous grain at the photo’s own level for that brightness. Areas JPEG left too quiet get grain added; areas that are already fine and real texture are left alone. Light, shading, colour, lines and edges stay. Nothing is blurred and no pixels are copied.</p>
+    <p class="xnote">Finds the JPEG 8×8 grid and replaces the stamped texture inside each cell with continuous grain at the photo’s own level for that brightness, sized so it survives a JPEG save at the quality below (the same as the export’s JPG quality). Areas JPEG left too quiet get grain added; areas that are already fine and real texture are left alone. Light, shading, colour, lines and edges stay. Nothing is blurred and no pixels are copied.</p>
     <button class="b go wide" id="dgrun" type="button">Preview</button>
     <p class="xnote res" id="dgres">Not run yet.</p>
     <div class="seg full" id="dgview" role="group" aria-label="Show"><button type="button" data-v="orig">Original</button><button type="button" data-v="result" class="on">Result</button><button type="button" data-v="map">Map</button></div>
     <p class="xnote"><i class="key k1"></i> grid found, re-textured &nbsp; <i class="key k3"></i> too quiet, grain added &nbsp; <i class="key k2"></i> kept (lines, edges). Hold <kbd>C</kbd> to flip to the original.</p>
     <div class="xrow"><span>Strength</span><span class="qv"><input id="dgstr" type="range" min="0" max="100" step="5" value="100" aria-label="Strength"><b id="dgstrv">100%</b></span></div>
     <div class="xrow"><span>Grain amount</span><span class="qv"><input id="dgamt" type="range" min="50" max="150" step="5" value="100" aria-label="Grain amount"><b id="dgamtv">100%</b></span></div>
-    <div class="xrow"><span>Grain size</span><span class="qv"><input id="dgsize" type="range" min="50" max="200" step="5" value="100" aria-label="Grain size"><b id="dgsizev">100%</b></span></div>
+    <div class="xrow"><span>Survives JPEG</span><span class="qv"><input id="dgq" type="range" min="50" max="100" step="1" value="92" aria-label="JPEG quality the grain is built to survive"><b id="dgqv">q92</b></span></div>
+    <div class="xrow"><span>Grain size</span><span class="qv"><input id="dgsize" type="range" min="100" max="200" step="5" value="100" aria-label="Grain size (at least what survives)"><b id="dgsizev">100%</b></span></div>
     <div class="xrow"><span>Even out noise</span><span class="qv"><input id="dgeven" type="range" min="0" max="100" step="5" value="100" aria-label="Even out noise"><b id="dgevenv">100%</b></span></div>
     <div class="xrow"><span>Keep detail</span><span class="qv"><input id="dgprot" type="range" min="1" max="5" step="0.25" value="2.5" aria-label="Keep detail"><b id="dgprotv">2.5</b></span></div>
     <label class="xrow chk"><input id="dgsel" type="checkbox"><span>Only inside the selection (soft edge)</span></label>
@@ -198,8 +201,9 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
         <dt>F</dt><dd>Fill tool: click or paint over holes to fill them; Fill holes fills them all</dd>
         <dt>I</dt><dd>Pick: click to take a colour into the swatches</dd>
         <dt>Randomize</dt><dd>randomly delete or recolour pixels in an area</dd>
-        <dt>Photo grain</dt><dd>filled and recoloured pixels get the photo’s own grain (on by default)</dd>
-        <dt>De-grid</dt><dd>remove the JPEG 8×8 grid look and even out the noise: preview, map, then apply</dd>
+        <dt>Photo grain</dt><dd>filled and recoloured pixels get the photo’s own grain, in brightness, sized to survive JPEG (on by default)</dd>
+        <dt>De-grid</dt><dd>remove the JPEG 8×8 grid look and even out the noise, with grain sized to survive the JPEG quality you save at</dd>
+        <dt>Export</dt><dd>JPG shows a grain check: what that quality does to the grain, and the lowest quality that keeps it</dd>
         <dt>wheel / Space</dt><dd>zoom / pan</dd>
       </dl>
     </div>
@@ -213,9 +217,9 @@ input[type=range] { accent-color: var(--acc); width: 100%; }
   <span id="status">ready</span>
 </footer>
 
-<script src="../v5/core.js?b=21"></script>
-<script src="../v5/export.js?b=21"></script>
-<script src="degrid.js?b=21"></script>
-<script src="pixels.js?b=21"></script>
+<script src="../v5/core.js?b=22"></script>
+<script src="../v5/export.js?b=22"></script>
+<script src="degrid.js?b=22"></script>
+<script src="pixels.js?b=22"></script>
 </body>
 </html>
