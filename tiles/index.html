@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tile Luma — local brightness-pattern editor</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- top bar -->
+  <header id="menubar">
+    <span class="brand">Tile&nbsp;Luma</span>
+    <button id="openBtn" class="menu">Open image…</button>
+    <input type="file" id="fileInput" accept="image/*" hidden />
+    <span class="sep"></span>
+    <button id="fitBtn" class="menu" title="Fit to window">Fit</button>
+    <button id="oneToOneBtn" class="menu" title="100%">100%</button>
+    <span class="sep"></span>
+    <button id="gridBtn" class="menu toggle" title="Show the tile lattice">Grid</button>
+    <button id="beforeBtn" class="menu" title="Hold to see the original">Hold: original</button>
+    <span class="spacer"></span>
+    <label class="qlabel">JPEG&nbsp;q<span id="qVal">92</span></label>
+    <input type="range" id="quality" min="60" max="100" value="92" />
+    <button id="exportBtn" class="menu primary">Export JPG</button>
+  </header>
+
+  <div id="body">
+    <!-- left tool rail -->
+    <nav id="tools">
+      <button class="tool" data-tool="move" title="Pan (drag the image)">✣</button>
+      <button class="tool" data-tool="zoomin" title="Zoom in">+</button>
+      <button class="tool" data-tool="zoomout" title="Zoom out">−</button>
+    </nav>
+
+    <!-- canvas stage -->
+    <main id="stage">
+      <div id="viewport">
+        <div id="canvasWrap">
+          <canvas id="view"></canvas>
+          <canvas id="overlay"></canvas>
+        </div>
+        <div id="dropHint">Open or drop an image to begin</div>
+      </div>
+      <div id="statusbar">
+        <span id="dims">—</span>
+        <span id="zoomReadout">100%</span>
+        <span id="procTime"></span>
+      </div>
+    </main>
+
+    <!-- right properties panel -->
+    <aside id="panel">
+      <section class="group">
+        <h3>Tiles</h3>
+        <div class="row">
+          <label>Pieces</label>
+          <input type="number" id="pieces" min="1" max="4096" value="64" />
+          <button id="piecesApply" class="mini">set</button>
+        </div>
+        <div class="row">
+          <label>Grid&nbsp;X</label>
+          <input type="range" id="gridX" min="1" max="64" value="8" />
+          <output id="gridXv">8</output>
+        </div>
+        <div class="row">
+          <label>Grid&nbsp;Y</label>
+          <input type="range" id="gridY" min="1" max="64" value="6" />
+          <output id="gridYv">6</output>
+        </div>
+        <div class="row">
+          <label>Blend</label>
+          <select id="blend">
+            <option value="smooth">Smooth (C1, seamless)</option>
+            <option value="bilinear">Bilinear (C0)</option>
+            <option value="nearest">Hard tiles (show seams)</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="group">
+        <h3>Per-tile luma edit</h3>
+        <div class="row">
+          <label>Gain&nbsp;±</label>
+          <input type="range" id="gain" min="0" max="0.4" step="0.005" value="0.08" />
+          <output id="gainv">0.080</output>
+        </div>
+        <div class="row">
+          <label>Offset&nbsp;±</label>
+          <input type="range" id="offset" min="0" max="40" step="0.5" value="8" />
+          <output id="offsetv">8.0</output>
+        </div>
+        <div class="row">
+          <label>Mode</label>
+          <select id="mode">
+            <option value="random">Randomized per tile</option>
+            <option value="uniform">Uniform (same everywhere)</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>Seed</label>
+          <input type="number" id="seed" min="0" max="999999" value="1234" />
+          <button id="reseed" class="mini" title="New random seed">⟳</button>
+        </div>
+        <p class="hint">Gain scales contrast about mid-grey (128); offset lifts brightness. Randomized draws each tile within ± the range from a seeded generator, so a seed reproduces exactly.</p>
+      </section>
+
+      <section class="group metrics">
+        <h3>Measurements <span class="sub">luma, vs original</span></h3>
+        <div class="metric"><span>Y-SSIM</span><b id="mSsim">—</b></div>
+        <div class="metric"><span>PSNR</span><b id="mPsnr">—</b></div>
+        <div class="metric"><span>mean |ΔY|</span><b id="mMean">—</b></div>
+        <div class="metric"><span>max |ΔY|</span><b id="mMax">—</b></div>
+        <div class="metric delivered"><span>delivered SSIM <span class="sub">after JPEG</span></span><b id="mDelivered">—</b></div>
+        <p class="hint">SSIM near 1 means it still looks like the same photo. mean/max&nbsp;|ΔY| is how far the brightness pattern actually moved — the thing SSIM is built to ignore. Push those up while keeping SSIM high. Delivered SSIM is measured on the re-decoded JPEG you export.</p>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script src="pipeline.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
