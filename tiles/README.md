@@ -1,118 +1,99 @@
-# Tile Luma
+# Tile Signal
 
-A browser tool that splits an image into a grid of tiles, applies a per-tile
-luma (brightness/contrast) edit, blends the tiles back together seamlessly, and
-measures in real time how far the result has moved from the original. Export is
-a JPEG.
+A browser tool that makes a **real, measurable change to an image's signature**
+while staying close to visually identical — and shows you both numbers side by
+side. It replaces an earlier version that only did a smooth brightness/contrast
+edit, which looks invisible precisely because it changes nothing a detector
+reads. This one moves the quantities detectors actually key on.
 
 **Live:** https://sunnq3.github.io/ie2/tiles/
 
-Everything runs in the page. Nothing is uploaded. No Python, no build step — it
-is three static files served by GitHub Pages.
+Everything runs in the page. Nothing is uploaded. No Python, no build step — four
+static files served by GitHub Pages.
 
-## What it does
+## Why luma gain/offset was pointless, and what changed
 
-- Cuts the image into a grid you set (by **Grid X / Grid Y**, or by a target
-  **piece count**).
-- Edits **luma only** — the image is taken to JFIF full-range YCbCr and only Y
-  is touched, so colour (Cb/Cr) is left exactly as it was.
-- Each tile gets its own **gain** (contrast about mid-grey) and **offset**
-  (brightness lift), either **randomized** per tile within a ± range or
-  **uniform** (one shared value everywhere). Randomization is seeded, so a seed
-  reproduces a run exactly.
-- Blends tile edges so the stitched image has **no visible seam** — see the math
-  below. A **Hard tiles** mode is included so you can see the seams a naive cut
-  would leave (and what the metrics think of them).
-- Shows four live measurements against the original, and the real SSIM of the
-  JPEG you actually export.
+A smooth gain/offset on luma is a point operation on the one channel most
+detectors normalise away, at low frequency where you must keep it tiny to stay
+invisible. The tell: it keeps SSIM pinned at ~1, which is the definition of *not
+changing structure*. "Invisible" and "real signal change" only coexist if you
+put the change where the eye is blind and a detector is not — **high spatial
+frequencies, phase/resampling, and noise structure**. These three transforms do
+that. The tile grid is kept as a smooth 0–1 strength map, so each transform can
+be strong in some regions and weak in others with no seam.
 
-## The math
+## The three transforms
 
-### Colour — edit luma, keep colour exact
+All operate on luma (JFIF full-range YCbCr; chroma recombined untouched). Each
+reports the quantity it actually moved, not just how different it looks.
 
-RGB is converted to YCbCr with the JFIF / full-range BT.601 transform (the one
-JPEG itself uses):
+### 1. Resample warp
+`Y'(x,y)` = bilinear sample of `Y` at `(x + ax·fx, y + ay·fy)`, with `fx,fy`
+smooth signed sub-pixel fields. Rewrites every pixel's provenance through
+interpolation. This **moves perceptual hashes** and **leaves a resampling trace**
+(the periodic correlation in the resampled signal's second difference that
+Popescu–Farid-style detectors look for) while disturbing any trace already
+present. *Readout:* mean displacement in px. *Limit:* it is not a geometric hide
+and does not remove content.
 
-```
-Y  = 0.299 R + 0.587 G + 0.114 B
-Cb = 128 − 0.168736 R − 0.331264 G + 0.5 B
-Cr = 128 + 0.5 R − 0.418688 G − 0.081312 B
-```
+### 2. DCT mid-band
+Blockwise 8×8 orthonormal DCT-II; coefficients with radial index `u+v` inside a
+band get a seeded additive perturbation scaled by the strength field; inverse
+DCT. This **shifts the block-DCT coefficient statistics** that JPEG-domain and
+double-compression forensics inspect. The perturbation energy stays in the
+chosen band (verified: >20× the energy outside it). *Readout:* mean |Δcoef| over
+the band. *Limits:* a very high band is quantised away by the JPEG you export; a
+low band becomes visible. Block-aligned, like JPEG itself.
 
-Only Y is edited; Cb/Cr are recombined untouched and converted back with the
-matching inverse. The whole pipeline is Float32 and quantises to 8-bit once, at
-the final write, so a zero edit is an identity round trip (verified: ≤1 LSB).
+### 3. PRNU-model noise
+`Y' = Y·(1 + k·N)`, `N` zero-mean unit white noise — the multiplicative
+photo-response model. **Changes the noise residual** a denoise-and-subtract
+extractor recovers. *Readout:* residual std (matches `k·Y` to measurement). *Hard
+limit:* this perturbs the residual; it does **not** forge any specific camera's
+PRNU fingerprint — that requires the reference fingerprint, which this tool does
+not have and does not use.
 
-### Seamless blending — the core result
+## Measurements
 
-A naive "cut, edit each tile, paste back" leaves a visible grid, and the eye is
-especially sensitive to those step edges. Instead of pasting hard tiles, the
-per-tile gain/offset values live on a coarse control lattice and are
-interpolated to a smooth per-pixel field `g(x,y)`, `b(x,y)`:
+- **Y-SSIM** — appearance guard (keep near 1).
+- **PSNR, mean / max |ΔY|** — overall change magnitude.
+- **DCT Δcoef / warp disp / noise residual** — the actual signal each enabled
+  transform moved. This is the point: these move while SSIM stays high.
+- **Delivered SSIM** — re-decodes the JPEG you export and measures *that*, since
+  JPEG re-quantises and 4:2:0-subsamples; it's the number that's really in the
+  file.
 
-```
-Y'(x,y) = g(x,y) · (Y(x,y) − 128) + 128 + b(x,y)
-```
+Verify the signal independently with your own detectors — the tool reports what
+it did, it does not grade itself.
 
-With smooth interpolation the fields vary slowly, so there is no seam anywhere.
+## Correctness
 
-Why this is the *right* way and not a shortcut: the honest alternative is
-overlapping tiles blended with a partition-of-unity window (`Σ w_i = 1`, e.g. a
-Hann window at 50% overlap). For a **linear** per-tile edit `g_i·Y + b_i`,
+All math is in `pipeline.js` (colour, SSIM, grid) and `signal.js` (the three
+transforms) as pure, DOM-free functions, validated in Node (34 checks total):
 
-```
-Σ_i w_i (g_i Y + b_i) = Y · (Σ_i w_i g_i) + (Σ_i w_i b_i) = g(x,y)·Y + b(x,y)
-```
-
-— the overlap-add of linear tiles *is* the interpolated field. So the field form
-is the exact closed form, with fewer passes and no border bookkeeping. (CLAHE
-solves the identical seam problem the same way, bilinearly interpolating its
-per-tile maps between tile centres.)
-
-Blend modes: **Smooth** (smoothstep bilinear, continuous slope), **Bilinear**
-(continuous value), **Hard tiles** (nearest node — visible seams, for
-comparison).
-
-### SSIM — and the metric that actually matters here
-
-SSIM is the standard Wang et al. 2004 index on luma: 11×11 Gaussian window
-(σ = 1.5), `k1 = 0.01`, `k2 = 0.03`, dynamic range `L = 255`, averaged over the
-valid region (5-px border cropped). It is computed with a separable Gaussian and
-matches a brute-force 2-D reference to 1e-4.
-
-The catch, and the point worth understanding: **SSIM is built to be insensitive
-to a luminance shift.** A pure offset leaves the variance and covariance terms
-unchanged, so SSIM stays near 1 even for a clearly different brightness — e.g. a
-flat +10 offset measures SSIM ≈ 0.996 while every pixel moved by 10. So SSIM
-answers *"does it still look like the same photo?"* but not *"how much did the
-brightness pattern move?"* — which is the actual goal. The panel therefore shows
-both:
-
-- **Y-SSIM** — structure/appearance preserved (keep high).
-- **PSNR** and **mean / max |ΔY|** — the magnitude of the luma-pattern change
-  (push these up while SSIM stays high).
-
-The live SSIM is computed on a small proxy while you drag (shown with `≈`) and
-replaced by the exact full-resolution value a moment after you stop. **Delivered
-SSIM** re-decodes the JPEG you export and measures *that*, since the JPEG
-re-quantises and 4:2:0-subsamples — so the number you report is the one actually
-in the file.
+- 8×8 DCT matrix orthonormal to 1e-6; DCT→IDCT round-trip identity; Parseval
+  energy preserved; zero-amount is identity; residual energy concentrated in the
+  target band (>20× outside).
+- warp zero-amplitude is identity; displacement is sub-pixel as set.
+- noise zero is identity; residual std matches the `k·Y` model (2.555 vs 2.56
+  predicted).
+- RGB↔YCbCr round trip ≤1 LSB; separable-Gaussian SSIM matches a brute-force 2-D
+  reference to 1e-4.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `index.html` | Page shell and layout |
+| `index.html` | Shell and layout |
 | `style.css` | Dark, panel-based UI |
-| `pipeline.js` | All image math; pure functions, no DOM (runs in Node too) |
+| `pipeline.js` | Colour, SSIM, tile grid, luma stats — pure, no DOM |
+| `signal.js` | DCT-band, warp, PRNU-model noise, strength field — pure, no DOM |
 | `app.js` | Canvas, controls, preview, export |
-
-`pipeline.js` has no DOM dependencies on purpose, so the colour transforms,
-field interpolation and SSIM can be unit-tested directly in Node.
 
 ## Notes
 
-- Working images are capped at 3000 px on the longest side to keep memory and
-  interaction responsive; export is at that working resolution.
-- Loads via Open, drag-and-drop, or paste. Any format the browser can decode.
-- `Ctrl`/`Cmd` + scroll to zoom; **Hold: original** shows the unedited image.
+- Working images are capped at 3000 px on the longest side; export is at that
+  resolution.
+- Transforms apply in order warp → DCT → noise; each is an independent toggle.
+- Load via Open, drag-and-drop, or paste. `Ctrl`/`Cmd` + scroll to zoom;
+  **Hold: original** shows the unedited image.

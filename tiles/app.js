@@ -1,148 +1,114 @@
-/* app.js — UI controller for Tile Luma. DOM + canvas only; all math is in
- * pipeline.js (window.Pipeline). Nothing is uploaded; everything runs here. */
+/* app.js — UI for Tile Signal. DOM + canvas only; math is in pipeline.js
+ * (window.Pipeline) and signal.js (window.Signal). Nothing is uploaded. */
 (function () {
   'use strict';
-  var P = window.Pipeline;
-  if (!P) { alert('pipeline.js failed to load'); return; }
+  var P = window.Pipeline, Sg = window.Signal;
+  if (!P || !Sg) { alert('pipeline.js / signal.js failed to load'); return; }
 
-  var MAX_WORK = 3000;   // cap longest side of the working image (memory)
-  var PROXY = 480;       // longest side for the live (drag) SSIM estimate
-
-  // ----- element refs -----
+  var MAX_WORK = 3000;
   var $ = function (id) { return document.getElementById(id); };
   var view = $('view'), overlay = $('overlay');
   var vctx = view.getContext('2d'), octx = overlay.getContext('2d');
   var viewport = $('viewport'), wrap = $('canvasWrap'), dropHint = $('dropHint');
 
-  // ----- state -----
   var S = {
-    loaded: false,
-    W: 0, H: 0,
-    rgba: null,            // Uint8ClampedArray source pixels
+    loaded: false, W: 0, H: 0, rgba: null,
     Yorig: null, Cb: null, Cr: null,
-    Yout: null, gField: null, bField: null,
-    // proxy
-    pW: 0, pH: 0, YorigP: null, gFieldP: null, bFieldP: null, YoutP: null,
-    scale: 1,
-    showGrid: false,
+    bufA: null, bufB: null, Yout: null,
+    scale: 1, showGrid: false,
   };
 
   var ctrl = {
-    gx: 8, gy: 6, blend: 'smooth',
-    gain: 0.08, offset: 8, mode: 'random', seed: 1234,
+    gx: 8, gy: 6, fieldMode: 'random', seed: 1234,
+    warpOn: false, warpX: 0.8, warpY: 0.8,
+    dctOn: true, dctAmt: 3, bandLo: 4, bandHi: 10,
+    noiseOn: false, noiseAmt: 0.012,
   };
 
-  // ============================================================= load image
+  // ---- load ----
   function loadFromImage(img) {
     var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
-    var scale = Math.min(1, MAX_WORK / Math.max(w, h));
-    var W = Math.max(1, Math.round(w * scale)), H = Math.max(1, Math.round(h * scale));
+    var sc = Math.min(1, MAX_WORK / Math.max(w, h));
+    var W = Math.max(1, Math.round(w * sc)), H = Math.max(1, Math.round(h * sc));
     var src = document.createElement('canvas'); src.width = W; src.height = H;
-    var sctx = src.getContext('2d');
-    sctx.drawImage(img, 0, 0, W, H);
+    var sctx = src.getContext('2d'); sctx.drawImage(img, 0, 0, W, H);
     var id = sctx.getImageData(0, 0, W, H);
-
     S.W = W; S.H = H; S.rgba = id.data;
     var ycc = P.rgbaToYCbCr(S.rgba, W, H);
     S.Yorig = ycc.Y; S.Cb = ycc.Cb; S.Cr = ycc.Cr;
-    S.Yout = new Float32Array(W * H);
-    S.gField = new Float32Array(W * H);
-    S.bField = new Float32Array(W * H);
-
-    // proxy luma (box-average downscale of original Y)
-    buildProxy();
-
-    view.width = W; view.height = H;
-    overlay.width = W; overlay.height = H;
-    S.loaded = true;
-    dropHint.classList.add('hidden');
-    $('dims').textContent = W + ' × ' + H + (scale < 1 ? ' (capped)' : '') + ' px';
-    fitToWindow();
-    render();
+    S.bufA = new Float32Array(W * H); S.bufB = new Float32Array(W * H);
+    view.width = W; view.height = H; overlay.width = W; overlay.height = H;
+    S.loaded = true; dropHint.classList.add('hidden');
+    $('dims').textContent = W + ' × ' + H + (sc < 1 ? ' (capped)' : '') + ' px';
+    fitToWindow(); render();
   }
 
-  function buildProxy() {
-    var W = S.W, H = S.H;
-    var s = Math.min(1, PROXY / Math.max(W, H));
-    var pW = Math.max(1, Math.round(W * s)), pH = Math.max(1, Math.round(H * s));
-    S.pW = pW; S.pH = pH;
-    S.YorigP = new Float32Array(pW * pH);
-    S.gFieldP = new Float32Array(pW * pH);
-    S.bFieldP = new Float32Array(pW * pH);
-    S.YoutP = new Float32Array(pW * pH);
-    // area-average box downscale
-    for (var py = 0; py < pH; py++) {
-      var y0 = Math.floor(py * H / pH), y1 = Math.max(y0 + 1, Math.floor((py + 1) * H / pH));
-      for (var px = 0; px < pW; px++) {
-        var x0 = Math.floor(px * W / pW), x1 = Math.max(x0 + 1, Math.floor((px + 1) * W / pW));
-        var acc = 0, cnt = 0;
-        for (var y = y0; y < y1; y++) { var rb = y * W; for (var x = x0; x < x1; x++) { acc += S.Yorig[rb + x]; cnt++; } }
-        S.YorigP[py * pW + px] = acc / cnt;
-      }
-    }
-  }
-
-  // ============================================================= core render
+  // ---- core render: apply enabled transforms in order ----
   var rafPending = false;
-  function scheduleRender() {
-    if (rafPending) return;
-    rafPending = true;
-    requestAnimationFrame(function () { rafPending = false; render(); });
-  }
+  function scheduleRender() { if (rafPending) return; rafPending = true; requestAnimationFrame(function () { rafPending = false; render(); }); }
+
+  var sig = { dct: null, warp: null, noise: null };
 
   function render() {
     if (!S.loaded) return;
     var t0 = performance.now();
-    var W = S.W, H = S.H;
-    var grid = P.buildControlGrid(ctrl.gx, ctrl.gy, {
-      seed: ctrl.seed,
-      gainJitter: ctrl.gain,
-      offsetJitter: ctrl.offset,
-      uniform: ctrl.mode === 'uniform',
-      baseGain: 1, baseOffset: 0,
-    });
-    P.interpolateField(grid, W, H, ctrl.blend, S.gField, S.bField);
-    P.applyLumaEdit(S.Yorig, S.gField, S.bField, W, H, S.Yout, 128);
+    var W = S.W, H = S.H, n = W * H;
+
+    var anyMod = ctrl.warpOn || ctrl.dctOn || ctrl.noiseOn;
+    // strength field (unit) shared by dct + noise modulation
+    var strength = null;
+    if (ctrl.dctOn || ctrl.noiseOn) strength = Sg.smoothField(ctrl.gx, ctrl.gy, W, H, ctrl.seed, ctrl.fieldMode === 'uniform', 'unit');
+
+    // ping-pong buffers; src starts at the original (never overwritten)
+    var src = S.Yorig, bufs = [S.bufA, S.bufB], bi = 0;
+    function step(fn) { var dst = bufs[bi % 2]; fn(src, dst); src = dst; bi++; }
+
+    sig.warp = sig.dct = sig.noise = null;
+
+    if (ctrl.warpOn) {
+      var fx = Sg.smoothField(ctrl.gx, ctrl.gy, W, H, ctrl.seed + 101, ctrl.fieldMode === 'uniform', 'signed');
+      var fy = Sg.smoothField(ctrl.gx, ctrl.gy, W, H, ctrl.seed + 202, ctrl.fieldMode === 'uniform', 'signed');
+      step(function (s, d) { sig.warp = Sg.warp(s, W, H, d, { ampX: ctrl.warpX, ampY: ctrl.warpY, fieldX: fx, fieldY: fy }); });
+    }
+    if (ctrl.dctOn) {
+      step(function (s, d) { sig.dct = Sg.dctBand(s, W, H, d, { amount: ctrl.dctAmt, bandLo: ctrl.bandLo, bandHi: ctrl.bandHi, seed: ctrl.seed + 303, strength: strength }); });
+    }
+    if (ctrl.noiseOn) {
+      step(function (s, d) { sig.noise = Sg.noise(s, W, H, d, { amount: ctrl.noiseAmt, seed: ctrl.seed + 404, strength: strength }); });
+    }
+
+    S.Yout = src; // final (= Yorig if nothing enabled)
     var out = P.yCbCrToRgba(S.Yout, S.Cb, S.Cr, W, H, S.rgba);
     vctx.putImageData(new ImageData(out, W, H), 0, 0);
+    drawOverlay();
 
-    drawOverlay(grid);
-
-    // cheap exact metrics every frame
-    var st = P.lumaStats(S.Yorig, S.Yout, W * H);
+    // cheap exact readouts
+    var st = P.lumaStats(S.Yorig, S.Yout, n);
     $('mPsnr').textContent = isFinite(st.psnr) ? st.psnr.toFixed(2) + ' dB' : '∞';
     $('mMean').textContent = st.meanAbs.toFixed(2);
     $('mMax').textContent = st.maxAbs.toFixed(1);
-    $('mDelivered').textContent = '—'; // stale until next export
+    $('mDct').textContent = sig.dct ? sig.dct.meanAbsDeltaCoef.toFixed(2) : '—';
+    $('mWarp').textContent = sig.warp ? sig.warp.meanDisp.toFixed(3) : '—';
+    $('mNoise').textContent = sig.noise ? sig.noise.residualStd.toFixed(3) : '—';
+    $('mDelivered').textContent = '—';
 
-    // live (proxy) SSIM immediately, exact full-res SSIM when settled
-    liveSSIM(grid);
-    scheduleExactSSIM();
-
+    scheduleExactSSIM(anyMod);
     $('procTime').textContent = (performance.now() - t0).toFixed(0) + ' ms';
   }
 
-  function liveSSIM(grid) {
-    var pW = S.pW, pH = S.pH;
-    P.interpolateField(grid, pW, pH, ctrl.blend, S.gFieldP, S.bFieldP);
-    P.applyLumaEdit(S.YorigP, S.gFieldP, S.bFieldP, pW, pH, S.YoutP, 128);
-    var r = P.ssim(S.YorigP, S.YoutP, pW, pH);
-    $('mSsim').textContent = '≈ ' + r.mssim.toFixed(4);
-    $('mSsim').style.color = r.mssim >= 0.97 ? 'var(--ok)' : r.mssim >= 0.9 ? '#fff' : 'var(--warn)';
-  }
-
   var exactTimer = null;
-  function scheduleExactSSIM() {
+  function scheduleExactSSIM(anyMod) {
+    $('mSsim').textContent = '…';
     if (exactTimer) clearTimeout(exactTimer);
     exactTimer = setTimeout(function () {
+      if (!anyMod) { $('mSsim').textContent = '1.0000'; $('mSsim').style.color = 'var(--ok)'; return; }
       var r = P.ssim(S.Yorig, S.Yout, S.W, S.H);
       $('mSsim').textContent = r.mssim.toFixed(4);
       $('mSsim').style.color = r.mssim >= 0.97 ? 'var(--ok)' : r.mssim >= 0.9 ? '#fff' : 'var(--warn)';
-    }, 170);
+    }, 150);
   }
 
-  // ============================================================= overlay grid
-  function drawOverlay(grid) {
+  function drawOverlay() {
     octx.clearRect(0, 0, S.W, S.H);
     if (!S.showGrid) return;
     octx.lineWidth = Math.max(1, 1 / S.scale);
@@ -153,12 +119,10 @@
     octx.stroke();
   }
 
-  // ============================================================= zoom / pan
+  // ---- zoom ----
   function applyScale() {
-    wrap.style.width = (S.W * S.scale) + 'px';
-    wrap.style.height = (S.H * S.scale) + 'px';
-    view.style.width = overlay.style.width = (S.W * S.scale) + 'px';
-    view.style.height = overlay.style.height = (S.H * S.scale) + 'px';
+    wrap.style.width = view.style.width = overlay.style.width = (S.W * S.scale) + 'px';
+    wrap.style.height = view.style.height = overlay.style.height = (S.H * S.scale) + 'px';
     $('zoomReadout').textContent = Math.round(S.scale * 100) + '%';
   }
   function fitToWindow() {
@@ -169,37 +133,29 @@
   }
   function zoomBy(f) { S.scale = Math.min(8, Math.max(0.05, S.scale * f)); applyScale(); }
 
-  // ============================================================= export
+  // ---- export + delivered SSIM ----
   function exportJpg() {
     if (!S.loaded) return;
     var q = (+$('quality').value) / 100;
     view.toBlob(function (blob) {
       if (!blob) { alert('Export failed'); return; }
       var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url; a.download = 'tile-luma-' + Date.now() + '.jpg';
+      var a = document.createElement('a'); a.href = url; a.download = 'tile-signal-' + Date.now() + '.jpg';
       document.body.appendChild(a); a.click(); a.remove();
-      // delivered SSIM: re-decode the actual JPEG and measure against the original
       var im = new Image();
       im.onload = function () {
         var c = document.createElement('canvas'); c.width = S.W; c.height = S.H;
         var cx = c.getContext('2d'); cx.drawImage(im, 0, 0);
         var d = cx.getImageData(0, 0, S.W, S.H).data;
         var yj = P.rgbaToYCbCr(d, S.W, S.H).Y;
-        var r = P.ssim(S.Yorig, yj, S.W, S.H);
-        $('mDelivered').textContent = r.mssim.toFixed(4);
+        $('mDelivered').textContent = P.ssim(S.Yorig, yj, S.W, S.H).mssim.toFixed(4);
         URL.revokeObjectURL(url);
       };
       im.src = url;
     }, 'image/jpeg', q);
   }
 
-  // ============================================================= wiring
-  function syncPieces() {
-    $('gridXv').value = ctrl.gx; $('gridYv').value = ctrl.gy;
-    $('gridX').value = ctrl.gx; $('gridY').value = ctrl.gy;
-  }
-
+  // ---- wiring ----
   function bindRange(id, outId, key, fmt, isInt) {
     var el = $(id), out = $(outId);
     el.addEventListener('input', function () {
@@ -208,86 +164,62 @@
       scheduleRender();
     });
   }
-  bindRange('gain', 'gainv', 'gain', function (v) { return v.toFixed(3); });
-  bindRange('offset', 'offsetv', 'offset', function (v) { return v.toFixed(1); });
   bindRange('gridX', 'gridXv', 'gx', null, true);
   bindRange('gridY', 'gridYv', 'gy', null, true);
+  bindRange('warpX', 'warpXv', 'warpX', function (v) { return v.toFixed(2); });
+  bindRange('warpY', 'warpYv', 'warpY', function (v) { return v.toFixed(2); });
+  bindRange('dctAmt', 'dctAmtv', 'dctAmt', function (v) { return v.toFixed(1); });
+  bindRange('bandLo', 'bandLov', 'bandLo', null, true);
+  bindRange('bandHi', 'bandHiv', 'bandHi', null, true);
+  bindRange('noiseAmt', 'noiseAmtv', 'noiseAmt', function (v) { return v.toFixed(3); });
 
-  $('blend').addEventListener('change', function () { ctrl.blend = this.value; scheduleRender(); });
-  $('mode').addEventListener('change', function () { ctrl.mode = this.value; scheduleRender(); });
+  function bindToggle(id, key) { $(id).addEventListener('change', function () { ctrl[key] = this.checked; scheduleRender(); }); }
+  bindToggle('warpOn', 'warpOn'); bindToggle('dctOn', 'dctOn'); bindToggle('noiseOn', 'noiseOn');
+
+  $('fieldMode').addEventListener('change', function () { ctrl.fieldMode = this.value; scheduleRender(); });
   $('seed').addEventListener('input', function () { ctrl.seed = parseInt(this.value, 10) || 0; scheduleRender(); });
-  $('reseed').addEventListener('click', function () {
-    ctrl.seed = (Math.random() * 1e6) | 0; $('seed').value = ctrl.seed; scheduleRender();
-  });
+  $('reseed').addEventListener('click', function () { ctrl.seed = (Math.random() * 1e6) | 0; $('seed').value = ctrl.seed; scheduleRender(); });
   $('quality').addEventListener('input', function () { $('qVal').textContent = this.value; });
-
   $('piecesApply').addEventListener('click', function () {
-    var n = parseInt($('pieces').value, 10) || 1;
-    var g = P.piecesToGrid(n, S.W || 16, S.H || 9);
+    var g = P.piecesToGrid(parseInt($('pieces').value, 10) || 1, S.W || 16, S.H || 9);
     ctrl.gx = Math.min(64, g.cols); ctrl.gy = Math.min(64, g.rows);
-    syncPieces(); scheduleRender();
+    $('gridX').value = ctrl.gx; $('gridXv').textContent = ctrl.gx;
+    $('gridY').value = ctrl.gy; $('gridYv').textContent = ctrl.gy;
+    scheduleRender();
   });
-
-  $('gridBtn').addEventListener('click', function () {
-    S.showGrid = !S.showGrid; this.classList.toggle('on', S.showGrid); render();
-  });
+  $('gridBtn').addEventListener('click', function () { S.showGrid = !S.showGrid; this.classList.toggle('on', S.showGrid); drawOverlay(); });
   $('fitBtn').addEventListener('click', fitToWindow);
   $('oneToOneBtn').addEventListener('click', function () { S.scale = 1; applyScale(); });
   $('exportBtn').addEventListener('click', exportJpg);
 
-  // before/after hold
   var beforeBtn = $('beforeBtn');
-  function showOriginal(on) {
-    if (!S.loaded) return;
-    if (on) vctx.putImageData(new ImageData(new Uint8ClampedArray(S.rgba), S.W, S.H), 0, 0);
-    else render();
-  }
+  function showOriginal(on) { if (!S.loaded) return; if (on) vctx.putImageData(new ImageData(new Uint8ClampedArray(S.rgba), S.W, S.H), 0, 0); else render(); }
   beforeBtn.addEventListener('mousedown', function () { showOriginal(true); });
   beforeBtn.addEventListener('mouseup', function () { showOriginal(false); });
   beforeBtn.addEventListener('mouseleave', function () { showOriginal(false); });
 
-  // tools (zoom)
   document.querySelectorAll('.tool').forEach(function (b) {
-    b.addEventListener('click', function () {
-      var t = b.dataset.tool;
-      if (t === 'zoomin') zoomBy(1.25);
-      else if (t === 'zoomout') zoomBy(0.8);
-    });
+    b.addEventListener('click', function () { var t = b.dataset.tool; if (t === 'zoomin') zoomBy(1.25); else if (t === 'zoomout') zoomBy(0.8); });
   });
-  viewport.addEventListener('wheel', function (e) {
-    if (!e.ctrlKey && !e.metaKey) return;
-    e.preventDefault(); zoomBy(e.deltaY < 0 ? 1.1 : 0.9);
-  }, { passive: false });
+  viewport.addEventListener('wheel', function (e) { if (!e.ctrlKey && !e.metaKey) return; e.preventDefault(); zoomBy(e.deltaY < 0 ? 1.1 : 0.9); }, { passive: false });
 
-  // ----- file input / drag-drop / paste -----
   function handleFile(file) {
     if (!file || !/^image\//.test(file.type)) return;
-    var url = URL.createObjectURL(file);
-    var img = new Image();
+    var url = URL.createObjectURL(file), img = new Image();
     img.onload = function () { loadFromImage(img); URL.revokeObjectURL(url); };
     img.onerror = function () { alert('Could not decode that image.'); URL.revokeObjectURL(url); };
     img.src = url;
   }
   $('openBtn').addEventListener('click', function () { $('fileInput').click(); });
   $('fileInput').addEventListener('change', function (e) { if (e.target.files[0]) handleFile(e.target.files[0]); });
-
-  ['dragenter', 'dragover'].forEach(function (ev) {
-    viewport.addEventListener(ev, function (e) { e.preventDefault(); view.classList.add('dragover'); });
-  });
-  ['dragleave', 'drop'].forEach(function (ev) {
-    viewport.addEventListener(ev, function (e) { e.preventDefault(); view.classList.remove('dragover'); });
-  });
-  viewport.addEventListener('drop', function (e) {
-    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
-  });
+  ['dragenter', 'dragover'].forEach(function (ev) { viewport.addEventListener(ev, function (e) { e.preventDefault(); view.classList.add('dragover'); }); });
+  ['dragleave', 'drop'].forEach(function (ev) { viewport.addEventListener(ev, function (e) { e.preventDefault(); view.classList.remove('dragover'); }); });
+  viewport.addEventListener('drop', function (e) { if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
   window.addEventListener('paste', function (e) {
-    var items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
+    var items = e.clipboardData && e.clipboardData.items; if (!items) return;
     for (var i = 0; i < items.length; i++) if (/^image\//.test(items[i].type)) { handleFile(items[i].getAsFile()); break; }
   });
-
   window.addEventListener('resize', function () { if (S.loaded) fitToWindow(); });
 
-  syncPieces();
   $('qVal').textContent = $('quality').value;
 })();
