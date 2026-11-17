@@ -31,8 +31,8 @@
 
   var ctrl = {
     gx: 8, gy: 6, fieldMode: 'random', seed: 1234,
-    warpOn: false, warpX: 0.8, warpY: 0.8,
-    dctOn: true, dctAmt: 6, bandLo: 4, bandHi: 10,
+    warpOn: true, warpX: 1, warpY: 1,
+    dctOn: false, dctAmt: 6, bandLo: 4, bandHi: 10,
     noiseOn: false, noiseAmt: 0.012,
   };
 
@@ -116,8 +116,24 @@
     $('mNoise').textContent = sig.noise ? sig.noise.residualStd.toFixed(3) : '—';
     $('mDelivered').textContent = '—';
 
-    scheduleSSIM(ctrl.warpOn || ctrl.dctOn || ctrl.noiseOn);
+    var anyMod = ctrl.warpOn || ctrl.dctOn || ctrl.noiseOn;
+    if (anyMod) {
+      var hd = Sg.hashDistances(S.pYorig, S.pYout, W, H);
+      setHash('mPhash', hd.p, 12);
+      $('mAhash').textContent = hd.a; $('mDhash').textContent = hd.d;
+    } else {
+      $('mPhash').textContent = '0'; $('mPhash').style.color = 'var(--ink-dim)';
+      $('mAhash').textContent = '0'; $('mDhash').textContent = '0';
+    }
+
+    scheduleSSIM(anyMod);
     $('procTime').textContent = (performance.now() - t0).toFixed(0) + ' ms';
+  }
+
+  function setHash(id, v, thresh) {
+    var el = $(id);
+    el.textContent = v;
+    el.style.color = v >= thresh ? 'var(--ok)' : v > 0 ? '#fff' : 'var(--warn)';
   }
 
   var ssimTimer = null;
@@ -178,7 +194,9 @@
           var cc = document.createElement('canvas'); cc.width = W; cc.height = H;
           var cx = cc.getContext('2d'); cx.drawImage(im, 0, 0);
           var yj = P.rgbaToYCbCr(cx.getImageData(0, 0, W, H).data, W, H).Y;
-          $('mDelivered').textContent = P.ssim(S.Yorig, yj, W, H).mssim.toFixed(4);
+          var dsm = P.ssim(S.Yorig, yj, W, H).mssim;
+          var dhd = Sg.hashDistances(S.Yorig, yj, W, H);
+          $('mDelivered').textContent = dsm.toFixed(3) + ' · Δ' + dhd.p;
           URL.revokeObjectURL(url);
         };
         im.src = url;
