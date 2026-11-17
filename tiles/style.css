@@ -104,6 +104,7 @@ body{
 .chk{display:flex;align-items:center;gap:7px;cursor:pointer;color:var(--ink);text-transform:none;letter-spacing:0;font-weight:600;font-size:12px}
 .chk input{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
 .metrics .metric.sig b{color:var(--accent)}
+.metrics .metric.big b{font-size:20px}
 
 /* metrics */
 .metrics .metric{

@@ -241,6 +241,66 @@ function noise(Y, width, height, Yout, opts) {
   return { residualStd: Math.sqrt(sse / n) };
 }
 
-var SignalAPI = { smoothField, DCTM, fdct8x8, idct8x8, dctBand, warp, noise };
+// ===========================================================================
+// Perceptual hashes — so the tool measures the actual matching signal, not a
+// proxy. pHash (DCT low-freq, 63-bit), aHash (mean, 64-bit), dHash (gradient,
+// 64-bit). All computed from a small downscale, so resolution barely matters.
+// ===========================================================================
+function _down(Y, W, H, NW, NH) {
+  var o = new Float64Array(NW * NH);
+  for (var py = 0; py < NH; py++) {
+    var y0 = Math.floor(py * H / NH), y1 = Math.max(y0 + 1, Math.floor((py + 1) * H / NH));
+    for (var px = 0; px < NW; px++) {
+      var x0 = Math.floor(px * W / NW), x1 = Math.max(x0 + 1, Math.floor((px + 1) * W / NW));
+      var a = 0, c = 0;
+      for (var y = y0; y < y1; y++) for (var x = x0; x < x1; x++) { a += Y[y * W + x]; c++; }
+      o[py * NW + px] = a / c;
+    }
+  }
+  return o;
+}
+var _M32 = (function () {
+  var N = 32, M = [];
+  for (var k = 0; k < N; k++) {
+    M[k] = new Float64Array(N);
+    var c = k === 0 ? Math.sqrt(1 / N) : Math.sqrt(2 / N);
+    for (var n = 0; n < N; n++) M[k][n] = c * Math.cos(Math.PI * (2 * n + 1) * k / (2 * N));
+  }
+  return M;
+})();
+function _dct2_32(img) {
+  var N = 32, t = [];
+  for (var k = 0; k < N; k++) { t[k] = new Float64Array(N); for (var j = 0; j < N; j++) { var s = 0; for (var n = 0; n < N; n++) s += _M32[k][n] * img[n * N + j]; t[k][j] = s; } }
+  var o = new Float64Array(N * N);
+  for (var r = 0; r < N; r++) for (var v = 0; v < N; v++) { var s2 = 0; for (var m = 0; m < N; m++) s2 += t[r][m] * _M32[v][m]; o[r * N + v] = s2; }
+  return o;
+}
+function pHash(Y, W, H) {
+  var c = _dct2_32(_down(Y, W, H, 32, 32)), vals = [];
+  for (var u = 0; u < 8; u++) for (var v = 0; v < 8; v++) { if (u === 0 && v === 0) continue; vals.push(c[u * 32 + v]); }
+  var med = vals.slice().sort(function (a, b) { return a - b; })[vals.length >> 1];
+  return vals.map(function (x) { return x > med ? 1 : 0; });
+}
+function aHash(Y, W, H) {
+  var d = _down(Y, W, H, 8, 8), m = 0; for (var i = 0; i < 64; i++) m += d[i]; m /= 64;
+  var b = []; for (var j = 0; j < 64; j++) b.push(d[j] > m ? 1 : 0); return b;
+}
+function dHash(Y, W, H) {
+  var g = _down(Y, W, H, 9, 8), b = [];
+  for (var y = 0; y < 8; y++) for (var x = 0; x < 8; x++) b.push(g[y * 9 + x] < g[y * 9 + x + 1] ? 1 : 0);
+  return b;
+}
+function hamming(a, b) { var d = 0; for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; }
+// distances between two luma buffers at once
+function hashDistances(Ya, Yb, W, H) {
+  return {
+    p: hamming(pHash(Ya, W, H), pHash(Yb, W, H)),
+    a: hamming(aHash(Ya, W, H), aHash(Yb, W, H)),
+    d: hamming(dHash(Ya, W, H), dHash(Yb, W, H)),
+  };
+}
+
+var SignalAPI = { smoothField, DCTM, fdct8x8, idct8x8, dctBand, warp, noise,
+  pHash, aHash, dHash, hamming, hashDistances };
 if (typeof module !== 'undefined' && module.exports) module.exports = SignalAPI;
 if (typeof window !== 'undefined') window.Signal = SignalAPI;
