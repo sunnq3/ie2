@@ -3,23 +3,22 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Tile Luma — local brightness-pattern editor</title>
+<title>Tile Signal — real signature changes on luma</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 <div id="app">
 
-  <!-- top bar -->
   <header id="menubar">
-    <span class="brand">Tile&nbsp;Luma</span>
+    <span class="brand">Tile&nbsp;Signal</span>
     <button id="openBtn" class="menu">Open image…</button>
     <input type="file" id="fileInput" accept="image/*" hidden />
     <span class="sep"></span>
-    <button id="fitBtn" class="menu" title="Fit to window">Fit</button>
-    <button id="oneToOneBtn" class="menu" title="100%">100%</button>
+    <button id="fitBtn" class="menu">Fit</button>
+    <button id="oneToOneBtn" class="menu">100%</button>
     <span class="sep"></span>
-    <button id="gridBtn" class="menu toggle" title="Show the tile lattice">Grid</button>
-    <button id="beforeBtn" class="menu" title="Hold to see the original">Hold: original</button>
+    <button id="gridBtn" class="menu toggle">Grid</button>
+    <button id="beforeBtn" class="menu">Hold: original</button>
     <span class="spacer"></span>
     <label class="qlabel">JPEG&nbsp;q<span id="qVal">92</span></label>
     <input type="range" id="quality" min="60" max="100" value="92" />
@@ -27,14 +26,11 @@
   </header>
 
   <div id="body">
-    <!-- left tool rail -->
     <nav id="tools">
-      <button class="tool" data-tool="move" title="Pan (drag the image)">✣</button>
       <button class="tool" data-tool="zoomin" title="Zoom in">+</button>
       <button class="tool" data-tool="zoomout" title="Zoom out">−</button>
     </nav>
 
-    <!-- canvas stage -->
     <main id="stage">
       <div id="viewport">
         <div id="canvasWrap">
@@ -50,76 +46,74 @@
       </div>
     </main>
 
-    <!-- right properties panel -->
     <aside id="panel">
       <section class="group">
-        <h3>Tiles</h3>
+        <h3>Tile strength field <span class="sub">where edits are strong</span></h3>
         <div class="row">
           <label>Pieces</label>
           <input type="number" id="pieces" min="1" max="4096" value="64" />
           <button id="piecesApply" class="mini">set</button>
         </div>
         <div class="row">
-          <label>Grid&nbsp;X</label>
-          <input type="range" id="gridX" min="1" max="64" value="8" />
-          <output id="gridXv">8</output>
+          <label>Grid&nbsp;X</label><input type="range" id="gridX" min="1" max="64" value="8" /><output id="gridXv">8</output>
         </div>
         <div class="row">
-          <label>Grid&nbsp;Y</label>
-          <input type="range" id="gridY" min="1" max="64" value="6" />
-          <output id="gridYv">6</output>
+          <label>Grid&nbsp;Y</label><input type="range" id="gridY" min="1" max="64" value="6" /><output id="gridYv">6</output>
         </div>
         <div class="row">
-          <label>Blend</label>
-          <select id="blend">
-            <option value="smooth">Smooth (C1, seamless)</option>
-            <option value="bilinear">Bilinear (C0)</option>
-            <option value="nearest">Hard tiles (show seams)</option>
+          <label>Field</label>
+          <select id="fieldMode">
+            <option value="random">Randomized per tile</option>
+            <option value="uniform">Uniform (full strength everywhere)</option>
           </select>
         </div>
+        <div class="row">
+          <label>Seed</label><input type="number" id="seed" min="0" max="999999" value="1234" /><button id="reseed" class="mini">⟳</button>
+        </div>
+        <p class="hint">A smooth 0–1 strength map from the grid. Every transform below is scaled by it, so edits vary by region with no seam. "Uniform" applies full strength everywhere.</p>
       </section>
 
       <section class="group">
-        <h3>Per-tile luma edit</h3>
-        <div class="row">
-          <label>Gain&nbsp;±</label>
-          <input type="range" id="gain" min="0" max="0.4" step="0.005" value="0.08" />
-          <output id="gainv">0.080</output>
+        <h3><label class="chk"><input type="checkbox" id="warpOn" /> Resample warp</label></h3>
+        <div class="row"><label>X&nbsp;±px</label><input type="range" id="warpX" min="0" max="3" step="0.05" value="0.8" /><output id="warpXv">0.80</output></div>
+        <div class="row"><label>Y&nbsp;±px</label><input type="range" id="warpY" min="0" max="3" step="0.05" value="0.8" /><output id="warpYv">0.80</output></div>
+        <p class="hint">Sub-pixel non-uniform resample (bilinear). Rewrites every pixel's provenance — moves perceptual hashes and leaves/erases resampling traces. Not a geometric hide.</p>
+      </section>
+
+      <section class="group">
+        <h3><label class="chk"><input type="checkbox" id="dctOn" checked /> DCT mid-band</label></h3>
+        <div class="row"><label>Amount</label><input type="range" id="dctAmt" min="0" max="12" step="0.25" value="3" /><output id="dctAmtv">3.0</output></div>
+        <div class="row"><label>Band</label>
+          <input type="range" id="bandLo" min="1" max="7" value="4" /><output id="bandLov">4</output>
+          <input type="range" id="bandHi" min="5" max="14" value="10" /><output id="bandHiv">10</output>
         </div>
-        <div class="row">
-          <label>Offset&nbsp;±</label>
-          <input type="range" id="offset" min="0" max="40" step="0.5" value="8" />
-          <output id="offsetv">8.0</output>
-        </div>
-        <div class="row">
-          <label>Mode</label>
-          <select id="mode">
-            <option value="random">Randomized per tile</option>
-            <option value="uniform">Uniform (same everywhere)</option>
-          </select>
-        </div>
-        <div class="row">
-          <label>Seed</label>
-          <input type="number" id="seed" min="0" max="999999" value="1234" />
-          <button id="reseed" class="mini" title="New random seed">⟳</button>
-        </div>
-        <p class="hint">Gain scales contrast about mid-grey (128); offset lifts brightness. Randomized draws each tile within ± the range from a seeded generator, so a seed reproduces exactly.</p>
+        <p class="hint">Perturbs 8×8 DCT coefficients with (u+v) in the band. Shifts the block-DCT coefficient statistics that JPEG-domain and double-compression forensics read. Low band = more visible; very high band is quantised away by JPEG.</p>
+      </section>
+
+      <section class="group">
+        <h3><label class="chk"><input type="checkbox" id="noiseOn" /> PRNU-model noise</label></h3>
+        <div class="row"><label>k</label><input type="range" id="noiseAmt" min="0" max="0.05" step="0.001" value="0.012" /><output id="noiseAmtv">0.012</output></div>
+        <p class="hint">Multiplicative Y·(1+k·N). Changes the noise residual a denoise-and-subtract extractor recovers. This perturbs the residual — it does not forge any specific camera's fingerprint.</p>
       </section>
 
       <section class="group metrics">
         <h3>Measurements <span class="sub">luma, vs original</span></h3>
-        <div class="metric"><span>Y-SSIM</span><b id="mSsim">—</b></div>
+        <div class="metric"><span>Y-SSIM <span class="sub">looks-same</span></span><b id="mSsim">—</b></div>
         <div class="metric"><span>PSNR</span><b id="mPsnr">—</b></div>
         <div class="metric"><span>mean |ΔY|</span><b id="mMean">—</b></div>
         <div class="metric"><span>max |ΔY|</span><b id="mMax">—</b></div>
+        <div class="metric sig"><span>DCT Δcoef <span class="sub">band</span></span><b id="mDct">—</b></div>
+        <div class="metric sig"><span>warp disp <span class="sub">mean px</span></span><b id="mWarp">—</b></div>
+        <div class="metric sig"><span>noise residual <span class="sub">std</span></span><b id="mNoise">—</b></div>
         <div class="metric delivered"><span>delivered SSIM <span class="sub">after JPEG</span></span><b id="mDelivered">—</b></div>
-        <p class="hint">SSIM near 1 means it still looks like the same photo. mean/max&nbsp;|ΔY| is how far the brightness pattern actually moved — the thing SSIM is built to ignore. Push those up while keeping SSIM high. Delivered SSIM is measured on the re-decoded JPEG you export.</p>
+        <p class="hint">SSIM near 1 means it still looks the same. The three signal rows are the actual quantities you moved — the thing a detector keys on, which SSIM is built to ignore. Delivered SSIM is measured on the re-decoded exported JPEG.</p>
       </section>
     </aside>
   </div>
 </div>
 
 <script src="pipeline.js"></script>
+<script src="signal.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
